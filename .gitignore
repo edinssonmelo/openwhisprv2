@@ -1,0 +1,29 @@
+.DS_Store
+node_modules/
+dist/
+dist-electron/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.*
+!.env.example
+
+# Local tooling and heavy vendored builds (whisper.cpp lives here after setup)
+.local/
+
+# Recordings and benchmarks (keep repo small)
+recordings/*.wav
+recordings/*.mp3
+recordings/*.m4a
+recordings/tmp/
+recordings/benchmarks/
+
+# Cursor / IDE (optional local state)
+.cursor/
+.vscode/*
+!.vscode/extensions.json
+
+# LLM session memory (not part of the product)
+memory-bank/

@@ -1,0 +1,37 @@
+{
+  "name": "local-meeting-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first Electron meeting assistant MVP focused on audio diagnostics.",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:main": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
+    "dev:electron": "wait-on http://127.0.0.1:5173 dist-electron/main.js dist-electron/preload.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build": "tsc -p tsconfig.electron.json && tsc -b && vite build",
+    "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -b --noEmit",
+    "whisper:setup": "node scripts/whisper-setup.mjs",
+    "whisper:setup:turbo": "node scripts/whisper-setup-turbo.mjs",
+    "whisper:check": "node scripts/whisper-check.mjs",
+    "whisper:benchmark": "node scripts/whisper-benchmark.mjs",
+    "polisher:setup": "node scripts/polisher-setup.mjs",
+    "polisher:check": "node scripts/polisher-check.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.32",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.6",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^30.5.1",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19",
+    "wait-on": "^7.2.0"
+  }
+}
