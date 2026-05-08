@@ -15,8 +15,7 @@
     "whisper:setup:turbo": "node scripts/whisper-setup-turbo.mjs",
     "whisper:check": "node scripts/whisper-check.mjs",
     "whisper:benchmark": "node scripts/whisper-benchmark.mjs",
-    "polisher:setup": "node scripts/polisher-setup.mjs",
-    "polisher:check": "node scripts/polisher-check.mjs"
+    "polisher:setup": "node scripts/polisher-setup.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

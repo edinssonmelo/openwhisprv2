@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('meetingAssistant', {
       glossary?: string;
       promptMode?: 'empty' | 'minimal' | 'contextual';
       mode?: 'preview' | 'final' | 'benchmark';
+      modelRole?: 'preview' | 'final';
       language?: 'es' | 'auto';
       verbatimOnly?: boolean;
     }) => ipcRenderer.invoke('transcription:transcribe-block', payload),

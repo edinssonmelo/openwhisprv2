@@ -455,7 +455,22 @@ h2 {
 
 .preview-draft {
   color: inherit;
-  opacity: 0.82;
+  transition: none;
+  animation: none;
+}
+
+.preview-optimistic {
+  opacity: 0.75;
+  color: inherit;
+  transition: none;
+  animation: none;
+}
+
+.preview-partial {
+  opacity: 0.55;
+  color: inherit;
+  transition: none;
+  animation: none;
 }
 
 .typing-cursor {

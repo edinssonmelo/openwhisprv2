@@ -62,7 +62,6 @@ declare global {
           modelRole?: 'preview' | 'final';
           language?: 'es' | 'auto';
           verbatimOnly?: boolean;
-          previewModelPolicy?: 'same-as-final' | 'fast';
         }) => Promise<{
           ok: boolean;
           blockId: string;

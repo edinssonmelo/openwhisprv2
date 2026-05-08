@@ -2,7 +2,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { encodeWav } from './audio/wav';
 import { createVadEndpointing, type VadClosedSegment } from './audio/vadEndpointing';
 import { createTranscriptCandidateLedger, type LedgerDebugGroup, type LedgerSnapshot } from './audio/transcriptCandidateLedger';
-
 type SourceKey = 'mic' | 'system' | 'mixed';
 type CaptureMode = 'mic' | 'system' | 'both';
 type CaptureStatus = 'idle' | 'requesting_permission' | 'capturing' | 'silence' | 'failed' | 'stopped';
@@ -134,36 +133,45 @@ const initialMeter: MeterState = {
   error: null,
 };
 
-/** Preview es UX. Final es verdad: ledger no gobierna committedText; Gemma fuera del ASR. */
+/** Baseline estable: solo segmentos VAD cerrados transcritos con whisper.cpp (`ggml-large-v3-turbo.bin`); sin preview en vivo. */
 const SAFE_BASELINE = true;
-/** Whisper preview rápido (descartable); final VAD sigue siendo la fuente oficial del transcript. */
-const ENABLE_LIVE_PREVIEW = true;
+/** Tamaño máximo de segmento VAD (final). No bajar por debajo de ~10s sin pruebas; opcional futuro 12_000 si el final se siente muy largo. */
 const MAX_FINAL_SEGMENT_MS = 15_000;
 
 const SILENCE_THRESHOLD = 0.01;
 const CLIPPING_THRESHOLD = 0.98;
 const WHISPER_PEAK_TARGET = 0.92;
-const PREVIEW_INTERVAL_MS = 2_000;
+const PREVIEW_INTERVAL_MS = 750;
 const MAX_PREVIEW_QUEUE = 1;
 /** Ventana mínima de audio por pasada de preview. */
-const MIN_PREVIEW_AUDIO_MS = 2_500;
+const MIN_PREVIEW_AUDIO_MS = 900;
 /**
  * Recorte de cola del segmento abierto para cada pasada de preview (velocidad).
- * Subir a 15_000 si la frase construida aún parece cola móvil; bajar a 8_000 si el rendimiento pesa.
+ * Subir si el preview sigue muy inestable; bajar si el rendimiento pesa.
  */
-const MAX_PREVIEW_AUDIO_MS = 12_000;
+const MAX_PREVIEW_AUDIO_MS = 2_500;
 const MIN_FINAL_AUDIO_MS = 5_000;
-/** Preview ASR: mismo ggml que el final (más lento, hipótese más alineada). Usar `'fast'` para small/base. */
-const PREVIEW_MODEL_POLICY: 'same-as-final' | 'fast' = 'same-as-final';
 /** Palabras del final de la hipótesis que no se encolan al usuario (zona inestable). */
-const PREVIEW_HIDDEN_TAIL_WORDS = 7;
-/** Mínimo de palabras en prefijo común (normalizado) para tratar prefijo como estable. */
-const PREVIEW_MIN_COMMON_PREFIX_WORDS = 4;
-const TYPEWRITER_WORD_INTERVAL_MS = 110;
+const PREVIEW_HIDDEN_TAIL_WORDS = 1;
+/** Mínimo de palabras en prefijo común draft↔final para fusionar revelado VAD (`planFinalRevealMerge`). */
+const PREVIEW_MIN_COMMON_PREFIX_WORDS = 1;
+/** Typewriter preview: un poco más vivo; visión estable anti-dup sigue con merge/dedupe. */
+const TYPEWRITER_WORD_INTERVAL_MS = 55;
 const TYPEWRITER_MAX_WORDS_PER_TICK = 1;
-/** Por encima de esto, el typewriter drena 2 palabras por tick hasta ponerse al día. */
-const TYPEWRITER_PENDING_CATCHUP_THRESHOLD = 14;
-const TYPEWRITER_CATCHUP_WORDS_PER_TICK = 2;
+const TYPEWRITER_PENDING_CATCHUP_THRESHOLD = 999;
+const TYPEWRITER_CATCHUP_WORDS_PER_TICK = 1;
+/** Máximo de palabras nuevas a encolar por cada merge de hipótesis. */
+const MAX_NEW_PREVIEW_WORDS_PER_MERGE = 4;
+/** Tope duro de la cola `pendingWords` para evitar rachas largas en pantalla. */
+const MAX_PENDING_PREVIEW_WORDS = 12;
+/** Revelado visual del texto final VAD (oficial ya está entero en `committedText`). */
+/** Revelado del final VAD hacia texto visible: un poco más ágil tras preview más frecuente. */
+const FINAL_REVEAL_WORD_INTERVAL_MS = 38;
+const FINAL_REVEAL_WORDS_PER_TICK = 2;
+const FINAL_REVEAL_CATCHUP_THRESHOLD = 40;
+const FINAL_REVEAL_CATCHUP_WORDS_PER_TICK = 3;
+/** Máx palabras solapadas a detectar al anexar texto visible (evita “cuál era cuál era”). */
+const VISIBLE_APPEND_MAX_OVERLAP = 12;
 /** Autoscroll al confirmar o actualizar preview solo si el usuario estaba cerca del fondo. */
 const SCROLL_STICK_THRESHOLD_PX = 72;
 const MIN_WHISPER_RMS = 0.018;
@@ -270,16 +278,46 @@ function joinWords(words: string[]): string {
   return words.join(' ');
 }
 
+function tailWords(text: string, maxWords: number): string {
+  const words = splitWords(text);
+  if (words.length <= maxWords) return text.trim();
+  return joinWords(words.slice(-maxWords));
+}
+
+/** Anexa palabras a texto existente eliminando solape inicial (preview + cola final). */
+function appendWordsDeduped(existingText: string, wordsToAppend: string[], maxOverlap = VISIBLE_APPEND_MAX_OVERLAP): string {
+  const existingWords = splitWords(existingText);
+  if (wordsToAppend.length === 0) return existingText.trim();
+
+  const max = Math.min(maxOverlap, existingWords.length, wordsToAppend.length);
+  let overlap = 0;
+  for (let n = max; n >= 1; n -= 1) {
+    const tail = existingWords.slice(-n).map(normalizeWord);
+    const head = wordsToAppend.slice(0, n).map(normalizeWord);
+    if (tail.every((w, i) => w === head[i])) {
+      overlap = n;
+      break;
+    }
+  }
+  const finalWords = wordsToAppend.slice(overlap);
+  if (finalWords.length === 0) return existingText.trim();
+  const base = existingText.trim();
+  return base ? `${base} ${joinWords(finalWords)}` : joinWords(finalWords);
+}
+
 function normalizeWord(word: string): string {
   return word.toLowerCase().replace(/^\p{P}+|\p{P}+$/gu, '');
 }
 
-function longestCommonPrefixLength(normA: string[], normB: string[]): number {
-  let i = 0;
-  while (i < normA.length && i < normB.length && normA[i] === normB[i]) {
-    i += 1;
+/** Cola de palabras ya visibles/pending vs inicio del nuevo preview (ventana móvil). */
+function findBestWordOverlap(leftWords: string[], rightWords: string[], maxOverlap = 12): number {
+  const max = Math.min(maxOverlap, leftWords.length, rightWords.length);
+  for (let n = max; n >= 1; n -= 1) {
+    const leftTail = leftWords.slice(leftWords.length - n).map(normalizeWord);
+    const rightHead = rightWords.slice(0, n).map(normalizeWord);
+    if (leftTail.every((w, i) => w === rightHead[i])) return n;
   }
-  return i;
+  return 0;
 }
 
 /** Cola oculta derivada solo para debug (no estado). */
@@ -289,48 +327,69 @@ function debugHiddenTailFromRaw(raw: string): string {
   return joinWords(words.slice(-PREVIEW_HIDDEN_TAIL_WORDS));
 }
 
-/** Encola solo palabras “maduras”; no borra ni reemplaza visibleDraft. */
+function capPendingPreviewWords(words: string[]): string[] {
+  if (words.length <= MAX_PENDING_PREVIEW_WORDS) return words;
+  return words.slice(0, MAX_PENDING_PREVIEW_WORDS);
+}
+
+/**
+ * Alinea revelado del final con el borrador preview: `previewWordsLine` suele ser
+ * visibleDraft + pendingWords (misma hipótesis aunque el typewriter aún no la pintó). Prefijo común ≥ MIN_COMMON_PREFIX_WORDS se fusiona ya; el resto va a la cola visual.
+ */
+function planFinalRevealMerge(
+  finalText: string,
+  previewWordsLine: string,
+): { mergePrefixWords: string[]; queueTailWords: string[] } {
+  const finalWords = splitWords(finalText);
+  if (finalWords.length === 0) return { mergePrefixWords: [], queueTailWords: [] };
+  const draftWords = splitWords(previewWordsLine.trim());
+  if (draftWords.length === 0) {
+    return { mergePrefixWords: [], queueTailWords: finalWords };
+  }
+  const nFinal = finalWords.map(normalizeWord);
+  const nDraft = draftWords.map(normalizeWord);
+  let k = 0;
+  while (k < nDraft.length && k < nFinal.length && nDraft[k] === nFinal[k]) {
+    k += 1;
+  }
+  if (k < PREVIEW_MIN_COMMON_PREFIX_WORDS) {
+    return { mergePrefixWords: [], queueTailWords: finalWords };
+  }
+  return {
+    mergePrefixWords: finalWords.slice(0, k),
+    queueTailWords: finalWords.slice(k),
+  };
+}
+
+/** Encola solo palabras nuevas tras solape cola↔cabeza; no borra visibleDraft (ventana móvil ASR). */
 function mergeLiveVisualDraft(prev: LiveVisualDraft, newPreview: string, segmentId: string): LiveVisualDraft {
   const wordsNew = splitWords(newPreview);
+  const candidateWords = wordsNew.slice(0, Math.max(0, wordsNew.length - PREVIEW_HIDDEN_TAIL_WORDS));
 
   if (segmentId !== prev.segmentId) {
-    const stableWords = wordsNew.slice(0, Math.max(0, wordsNew.length - PREVIEW_HIDDEN_TAIL_WORDS));
+    const initialWords = candidateWords.slice(0, MAX_NEW_PREVIEW_WORDS_PER_MERGE);
     return {
       segmentId,
       lastRawPreview: newPreview,
       visibleDraft: '',
-      pendingWords: stableWords,
+      pendingWords: capPendingPreviewWords(initialWords),
     };
   }
 
-  const normNew = wordsNew.map(normalizeWord);
-  const normOld = splitWords(prev.lastRawPreview).map(normalizeWord);
-  const L = longestCommonPrefixLength(normOld, normNew);
+  const alreadyWords = [...splitWords(prev.visibleDraft.trim()), ...prev.pendingWords];
+  const overlap = findBestWordOverlap(alreadyWords, candidateWords, VISIBLE_APPEND_MAX_OVERLAP);
 
-  if (L < PREVIEW_MIN_COMMON_PREFIX_WORDS) {
-    return {
-      ...prev,
-      lastRawPreview: newPreview,
-    };
+  let appendWords: string[] = [];
+  if (overlap > 0) {
+    appendWords = candidateWords.slice(overlap, overlap + MAX_NEW_PREVIEW_WORDS_PER_MERGE);
+  } else if (alreadyWords.length === 0) {
+    appendWords = candidateWords.slice(0, MAX_NEW_PREVIEW_WORDS_PER_MERGE);
   }
-
-  const stableCount = Math.max(0, L - PREVIEW_HIDDEN_TAIL_WORDS);
-  const stableWords = wordsNew.slice(0, stableCount);
-  const already = [...splitWords(prev.visibleDraft), ...prev.pendingWords];
-  let k = 0;
-  while (
-    k < already.length &&
-    k < stableWords.length &&
-    normalizeWord(already[k]) === normalizeWord(stableWords[k])
-  ) {
-    k += 1;
-  }
-  const newWords = stableWords.slice(k);
 
   return {
     ...prev,
     lastRawPreview: newPreview,
-    pendingWords: [...prev.pendingWords, ...newWords],
+    pendingWords: capPendingPreviewWords([...prev.pendingWords, ...appendWords]),
   };
 }
 
@@ -379,10 +438,15 @@ export default function App() {
     lastUpdatedAt: null,
   });
   const [liveVisualDraft, setLiveVisualDraft] = useState<LiveVisualDraft>(INITIAL_LIVE_VISUAL_DRAFT);
+  /** Texto confirmado ya mostrado en la vista principal (oficial = `liveTranscript.committedText`). */
+  const [visibleCommittedText, setVisibleCommittedText] = useState('');
+  const [finalRevealQueue, setFinalRevealQueue] = useState<string[]>([]);
   const [whisperSetup, setWhisperSetup] = useState<WhisperSetupState | null>(null);
   const [polisherSetup, setPolisherSetup] = useState<PolisherSetupState | null>(null);
   const [glossary, setGlossary] = useState(DEFAULT_GLOSSARY);
   const [showRawDebug, setShowRawDebug] = useState(false);
+  const showRawDebugRef = useRef(showRawDebug);
+  showRawDebugRef.current = showRawDebug;
   const [transcriptViewMode, setTranscriptViewMode] = useState<TranscriptViewMode>('verbatim');
   const [promptMode, setPromptMode] = useState<WhisperPromptMode>('empty');
   const [whisperLanguage, setWhisperLanguage] = useState<'es' | 'auto'>('es');
@@ -405,7 +469,11 @@ export default function App() {
   const transcriptionProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const transcriptionSampleCursorRef = useRef<number>(0);
   const transcriptionBusyRef = useRef<boolean>(false);
+  /** Cola unificada solo para `!SAFE_BASELINE`; en safeBaseline solo cola final (`pendingFinalWindowsRef`). */
   const pendingTranscriptionWindowsRef = useRef<TranscriptionWindow[]>([]);
+  const finalBusyRef = useRef(false);
+  const pendingFinalWindowsRef = useRef<TranscriptionWindow[]>([]);
+  const previewBlockedByFinalCountRef = useRef(0);
   const vadRef = useRef(createVadEndpointing(
     SAFE_BASELINE ? { maxSegmentMs: MAX_FINAL_SEGMENT_MS } : {},
   ));
@@ -428,8 +496,17 @@ export default function App() {
   const finalAcceptedCountRef = useRef(0);
   const previewSegmentOpenedAtRef = useRef<Map<string, number>>(new Map());
   const previewFirstSuccessRef = useRef<Set<string>>(new Set());
+  /** Segmentos VAD ya cerrados con final aceptado (o descartado). */
+  const finalizedSegmentIdsRef = useRef<Set<string>>(new Set());
   const liveTranscriptScrollRef = useRef<HTMLDivElement>(null);
   const stickNearBottomRef = useRef(true);
+  const liveVisualDraftRef = useRef<LiveVisualDraft>(INITIAL_LIVE_VISUAL_DRAFT);
+  const liveTranscriptRef = useRef<LiveTranscriptState>({
+    committedText: '',
+    unstableSuffix: '',
+    lastReason: 'waiting',
+    lastUpdatedAt: null,
+  });
 
   const [asrLiveStats, setAsrLiveStats] = useState({
     previewLatencyMs: null as number | null,
@@ -442,22 +519,31 @@ export default function App() {
     lastPreviewSegmentDurationMs: null as number | null,
     timeToFirstPreviewMs: null as number | null,
     lastCancelReason: null as string | null,
+    previewBusyLive: false,
+    finalBusyLive: false,
+    previewBlockedByFinalCount: 0,
   });
 
   const syncAsrLiveStats = useCallback((patch: Partial<typeof asrLiveStats>) => {
     setAsrLiveStats((prev) => {
       const p = pendingTranscriptionWindowsRef.current;
+      const fq = pendingFinalWindowsRef.current;
       return {
         ...prev,
         ...patch,
-        previewQueueSize: p.filter((w) => w.mode === 'preview').length,
-        finalQueueSize: p.filter((w) => w.mode === 'final').length,
+        previewQueueSize: SAFE_BASELINE ? 0 : p.filter((w) => w.mode === 'preview').length,
+        finalQueueSize: SAFE_BASELINE ? fq.length : p.filter((w) => w.mode === 'final').length,
         previewDroppedCount: previewDroppedCountRef.current,
         previewReplacedCount: previewReplacedCountRef.current,
         finalAcceptedCount: finalAcceptedCountRef.current,
+        previewBusyLive: SAFE_BASELINE ? false : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview'),
+        finalBusyLive: SAFE_BASELINE ? finalBusyRef.current : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final'),
+        previewBlockedByFinalCount: previewBlockedByFinalCountRef.current,
       };
     });
   }, []);
+
+
 
   const macSystemFallbackText =
     'Para capturar audio del sistema en este Mac cuando Electron loopback falla, instala BlackHole, enruta la salida del sistema hacia BlackHole y selecciona BlackHole como entrada virtual.';
@@ -582,10 +668,10 @@ export default function App() {
       const box = liveTranscriptScrollRef.current;
       if (box) box.scrollTop = box.scrollHeight;
     });
-  }, [liveTranscript.committedText, liveVisualDraft.visibleDraft, liveVisualDraft.pendingWords.length, liveVisualDraft.segmentId]);
+  }, [liveTranscript.committedText, visibleCommittedText, liveVisualDraft.visibleDraft, liveVisualDraft.pendingWords.length, liveVisualDraft.segmentId, finalRevealQueue.length]);
 
   useEffect(() => {
-    if (!SAFE_BASELINE || !ENABLE_LIVE_PREVIEW) return;
+    if (SAFE_BASELINE) return;
     if (liveVisualDraft.pendingWords.length === 0) return;
     const id = window.setInterval(() => {
       setLiveVisualDraft((p) => {
@@ -602,7 +688,37 @@ export default function App() {
       });
     }, TYPEWRITER_WORD_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [liveVisualDraft.pendingWords.length, SAFE_BASELINE, ENABLE_LIVE_PREVIEW]);
+  }, [liveVisualDraft.pendingWords.length, SAFE_BASELINE]);
+
+  useEffect(() => {
+    liveVisualDraftRef.current = liveVisualDraft;
+  }, [liveVisualDraft]);
+
+  useEffect(() => {
+    liveTranscriptRef.current = liveTranscript;
+  }, [liveTranscript]);
+
+  useEffect(() => {
+    if (SAFE_BASELINE) return;
+    if (finalRevealQueue.length === 0) return;
+    const id = window.setInterval(() => {
+      setFinalRevealQueue((q) => {
+        if (q.length === 0) return q;
+        const n =
+          q.length > FINAL_REVEAL_CATCHUP_THRESHOLD
+            ? FINAL_REVEAL_CATCHUP_WORDS_PER_TICK
+            : FINAL_REVEAL_WORDS_PER_TICK;
+        const take = q.slice(0, n);
+        const rest = q.slice(n);
+        const chunk = take.join(' ');
+        queueMicrotask(() => {
+          setVisibleCommittedText((vc) => appendWordsDeduped(vc, take));
+        });
+        return rest;
+      });
+    }, FINAL_REVEAL_WORD_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [finalRevealQueue.length, SAFE_BASELINE]);
 
   useEffect(() => () => {
     if (ledgerFlushTimerRef.current !== null) {
@@ -722,12 +838,18 @@ export default function App() {
     transcriptionBusyRef.current = false;
     transcriptionInFlightModeRef.current = null;
     pendingTranscriptionWindowsRef.current = [];
+    pendingFinalWindowsRef.current = [];
+    finalBusyRef.current = false;
+    previewBlockedByFinalCountRef.current = 0;
     vadRef.current.reset();
     vadShortAccumRef.current = null;
     activeSegmentIdRef.current = null;
     lastPreviewPerfMsRef.current = 0;
     previewSegmentOpenedAtRef.current.clear();
     previewFirstSuccessRef.current.clear();
+    finalizedSegmentIdsRef.current.clear();
+    setVisibleCommittedText(liveTranscriptRef.current.committedText);
+    setFinalRevealQueue([]);
     setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
     pendingPolishJobRef.current = null;
     void window.meetingAssistant.transcription.cancelPending().catch((error) => {
@@ -1061,26 +1183,7 @@ export default function App() {
   }, [maybePolishNotes, scheduleLedgerFlush]);
 
   const handlePreviewSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    if (SAFE_BASELINE) {
-      if (!ENABLE_LIVE_PREVIEW) return;
-      if (!shouldUseForLive(segment)) {
-        debug('transcription:preview-filtered', { segmentId, blockId: segment.id });
-        return;
-      }
-      const previewText = segment.text.trim();
-      if (!previewText) return;
-      setLiveTranscript((prev) => ({
-        ...prev,
-        unstableSuffix: '',
-        lastReason: 'preview-only',
-        lastUpdatedAt: Date.now(),
-      }));
-      setLiveVisualDraft((prev) => mergeLiveVisualDraft(prev, previewText, segmentId));
-      if (showRawDebug) {
-        setRawSegments((current) => [...current, { ...segment, asrMode: 'preview' as const, segmentId }].slice(-120));
-      }
-      return;
-    }
+    if (SAFE_BASELINE) return;
 
     if (!shouldUseForLive(segment)) {
       setRawSegments((current) => [...current, { ...segment, stabilizationReason: 'filtered' }].slice(-120));
@@ -1112,6 +1215,7 @@ export default function App() {
     if (SAFE_BASELINE) {
       const pk = segment.peak ?? 0;
       if (pk >= CLIPPING_THRESHOLD) {
+        finalizedSegmentIdsRef.current.add(segmentId);
         addLog(`${segment.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${pk.toFixed(3)})`);
         debug('transcription:final-audit', {
           startMs: segment.startMs,
@@ -1134,12 +1238,15 @@ export default function App() {
         segmentId,
         stabilizationReason: 'vad-final-direct',
       }].slice(-120));
+      finalizedSegmentIdsRef.current.add(segmentId);
       setLiveTranscript((prev) => ({
         committedText: `${prev.committedText} ${finalText}`.trim(),
         unstableSuffix: '',
         lastReason: 'vad-final-direct',
         lastUpdatedAt: Date.now(),
       }));
+      setVisibleCommittedText((vc) => appendWordsDeduped(vc, splitWords(finalText)));
+      setFinalRevealQueue([]);
       setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
       finalAcceptedCountRef.current += 1;
       syncAsrLiveStats({});
@@ -1199,7 +1306,171 @@ export default function App() {
     applyLedgerSnapshot(snapshot, segment.source);
   }, [addLog, applyLedgerSnapshot, syncAsrLiveStats]);
 
+
+  /** safeBaseline: whisper.cpp transcribe cada segmento VAD cerrado (solo final). */
+  const processNextFinalWindow = useCallback(() => {
+    if (!SAFE_BASELINE) return;
+    if (finalBusyRef.current) return;
+    const request = pendingFinalWindowsRef.current.shift();
+    if (!request) return;
+
+    finalBusyRef.current = true;
+
+    const effectiveVerbatimOnly = true;
+    const effectiveLanguage = 'es';
+
+    debug('transcription:window-send', {
+      blockId: request.blockId,
+      mode: request.mode,
+      segmentId: request.segmentId,
+      source: request.source,
+      startMs: request.startMs,
+      endMs: request.endMs,
+      rms: request.rms,
+      peak: request.peak,
+      verbatimOnly: effectiveVerbatimOnly,
+      language: effectiveLanguage,
+      promptMode: 'empty',
+      glossaryChars: 0,
+      safeBaseline: true,
+      lane: 'final',
+      sampleRate: request.sampleRate,
+      sampleCount: request.sampleCount,
+      bytes: request.wavBytes.byteLength,
+      coalesced: request.coalesced ?? false,
+      possibleClipping: request.possibleClipping ?? false,
+      whisperGain: request.whisperGain,
+      finalQueuePending: pendingFinalWindowsRef.current.length,
+    });
+
+    window.meetingAssistant.transcription.transcribeBlock({
+      blockId: request.blockId,
+      wavBytes: request.wavBytes,
+      startMs: request.startMs,
+      endMs: request.endMs,
+      rms: request.rms,
+      peak: request.peak,
+      source: request.source,
+      glossary: undefined,
+      promptMode: 'empty',
+      sampleRate: request.sampleRate,
+      sampleCount: request.sampleCount,
+      whisperGain: request.whisperGain,
+      mode: 'final',
+      modelRole: 'final',
+      language: effectiveLanguage,
+      verbatimOnly: effectiveVerbatimOnly,
+    }).then((result) => {
+      debug('transcription:whisper-invocation', result.whisperDebug ?? {
+        language: effectiveLanguage,
+        promptLength: 0,
+        verbatimOnly: effectiveVerbatimOnly,
+        translateEnabled: false,
+        argsSanitized: [],
+      });
+      debug('transcription:window-result', {
+        ...result,
+        mode: request.mode,
+        lane: 'final',
+      });
+      if (!result.ok) {
+        const err = result.error ?? 'error desconocido';
+        addLog(`transcription error: ${err}`);
+        debug('transcription:final-audit', {
+          startMs: request.startMs,
+          endMs: request.endMs,
+          durationMs: request.endMs - request.startMs,
+          rms: request.rms,
+          peak: request.peak,
+          whisperGain: request.whisperGain,
+          promptLength: 0,
+          language: effectiveLanguage,
+          acceptedFinal: false,
+          rejectReason: `whisper-error: ${result.error ?? 'unknown'}`,
+        });
+        return;
+      }
+
+      const text = (result.text ?? '').trim();
+      if (!text) {
+        addLog(`transcription: segmento final sin texto (${result.durationMs}ms)`);
+        debug('transcription:final-audit', {
+          startMs: request.startMs,
+          endMs: request.endMs,
+          durationMs: result.durationMs,
+          rms: request.rms,
+          peak: request.peak,
+          whisperGain: request.whisperGain,
+          promptLength: result.whisperPromptLength ?? 0,
+          language: effectiveLanguage,
+          acceptedFinal: false,
+          rejectReason: 'empty-transcript',
+        });
+        return;
+      }
+
+      if ((request.peak ?? 0) >= CLIPPING_THRESHOLD) {
+        addLog(`${request.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${(request.peak ?? 0).toFixed(3)})`);
+        debug('transcription:final-audit', {
+          startMs: request.startMs,
+          endMs: request.endMs,
+          durationMs: result.durationMs,
+          rms: request.rms,
+          peak: request.peak,
+          whisperGain: request.whisperGain,
+          promptLength: result.whisperPromptLength ?? 0,
+          language: effectiveLanguage,
+          acceptedFinal: false,
+          rejectReason: 'clipping',
+        });
+        return;
+      }
+
+      const queueWaitMs = request.enqueuedAtMs !== undefined ? Date.now() - request.enqueuedAtMs : 0;
+      const wallLatencyMs = queueWaitMs + result.durationMs;
+      syncAsrLiveStats({ finalLatencyMs: wallLatencyMs });
+      debug('transcription:latency-metrics', {
+        kind: 'final',
+        wallLatencyMs,
+        timeToFinalMs: wallLatencyMs,
+        modelName: result.modelName,
+      });
+
+      const baseSegment: TranscriptSegment = {
+        id: request.blockId,
+        startMs: request.startMs,
+        endMs: request.endMs,
+        text,
+        rawText: result.text,
+        status: 'final',
+        source: request.source,
+        rms: request.rms,
+        peak: request.peak,
+        durationMs: result.durationMs,
+        modelName: result.modelName,
+        suspicious: false,
+        sampleRate: request.sampleRate,
+        sampleCount: request.sampleCount,
+        possibleClipping: request.possibleClipping,
+        whisperGain: request.whisperGain,
+        whisperPromptLength: result.whisperPromptLength,
+        segmentId: request.segmentId,
+        asrMode: 'final',
+        language: effectiveLanguage,
+      };
+      handleFinalSegment(baseSegment, request.segmentId);
+    }).catch((error) => {
+      debug('transcription:window-error', String(error));
+      addLog(`transcription error: ${String(error)}`);
+    }).finally(() => {
+      finalBusyRef.current = false;
+      syncAsrLiveStats({});
+      processNextFinalWindow();
+    });
+  }, [addLog, handleFinalSegment, syncAsrLiveStats]);
+
   const processNextTranscriptionWindow = useCallback(() => {
+    if (SAFE_BASELINE) return;
     if (transcriptionBusyRef.current) return;
     const request = pendingTranscriptionWindowsRef.current.shift();
     if (!request) return;
@@ -1250,7 +1521,6 @@ export default function App() {
       whisperGain: request.whisperGain,
       mode: request.mode,
       modelRole: request.mode === 'preview' ? 'preview' as const : 'final' as const,
-      previewModelPolicy: SAFE_BASELINE && request.mode === 'preview' ? PREVIEW_MODEL_POLICY : undefined,
       language: effectiveLanguage,
       verbatimOnly: effectiveVerbatimOnly,
     }).then((result) => {
@@ -1267,7 +1537,15 @@ export default function App() {
         asrQueue: pendingTranscriptionWindowsRef.current.length,
       });
       if (!result.ok) {
-        addLog(`transcription error: ${result.error ?? 'error desconocido'}`);
+        const err = result.error ?? 'error desconocido';
+        if (request.mode === 'preview') {
+          debug('transcription:preview-error', { blockId: request.blockId, segmentId: request.segmentId, error: err });
+          if (/code null|exited with code|killed|SIGTERM|cancel/i.test(err)) {
+            debug('transcription:preview-cancelled-or-killed', { blockId: request.blockId, segmentId: request.segmentId });
+          }
+        } else {
+          addLog(`transcription error: ${err}`);
+        }
         if (SAFE_BASELINE && request.mode === 'final') {
           debug('transcription:final-audit', {
             startMs: request.startMs,
@@ -1386,16 +1664,17 @@ export default function App() {
         handlePreviewSegment(baseSegment, request.segmentId);
       }
     }).catch((error) => {
-      debug('transcription:whisper-invocation', {
-        language: effectiveLanguage,
-        promptLength: 0,
-        verbatimOnly: effectiveVerbatimOnly,
-        translateEnabled: false,
-        argsSanitized: [],
-        invokeError: String(error),
-      });
-      debug('transcription:window-error', String(error));
-      addLog(`transcription error: ${String(error)}`);
+      const msg = String(error);
+      if (request.mode === 'preview') {
+        debug('transcription:window-error-preview', {
+          blockId: request.blockId,
+          segmentId: request.segmentId,
+          invokeError: msg,
+        });
+      } else {
+        debug('transcription:window-error', msg);
+        addLog(`transcription error: ${msg}`);
+      }
     }).finally(() => {
       transcriptionBusyRef.current = false;
       transcriptionInFlightModeRef.current = null;
@@ -1410,14 +1689,30 @@ export default function App() {
       ? { ...request, verbatimOnly: true, language: 'es', enqueuedAtMs }
       : { ...request, enqueuedAtMs };
 
+    if (SAFE_BASELINE && r.mode === 'preview') {
+      return;
+    }
+
+    if (SAFE_BASELINE && r.mode === 'final') {
+      pendingFinalWindowsRef.current.push(r);
+      syncAsrLiveStats({});
+      debug('transcription:window-queued', {
+        blockId: r.blockId,
+        mode: r.mode,
+        segmentId: r.segmentId,
+        finalQueue: pendingFinalWindowsRef.current.length,
+      });
+      processNextFinalWindow();
+      return;
+    }
+
     if (r.mode === 'final') {
-      if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview') {
-        debug('transcription:cancel-preview-for-final', { cancelReason: 'final-arrived-while-preview-running' });
-        void window.meetingAssistant.transcription.cancelPending().catch(() => undefined);
-        syncAsrLiveStats({ lastCancelReason: 'final-arrived-while-preview-running' });
-      }
-      const withoutPreviews = pendingTranscriptionWindowsRef.current.filter((w) => w.mode !== 'preview');
-      pendingTranscriptionWindowsRef.current = [r, ...withoutPreviews];
+      pendingTranscriptionWindowsRef.current = [
+        r,
+        ...pendingTranscriptionWindowsRef.current.filter(
+          (w) => !(w.mode === 'preview' && w.segmentId === r.segmentId),
+        ),
+      ];
       syncAsrLiveStats({});
     } else {
       const pending = pendingTranscriptionWindowsRef.current;
@@ -1451,7 +1746,7 @@ export default function App() {
       asrQueue: pendingTranscriptionWindowsRef.current.length,
     });
     processNextTranscriptionWindow();
-  }, [processNextTranscriptionWindow, syncAsrLiveStats]);
+  }, [processNextFinalWindow, processNextTranscriptionWindow, syncAsrLiveStats]);
 
   const startLiveTranscription = useCallback((stream: MediaStream, source: SourceKey) => {
     const audioContext = ensureAudioContext();
@@ -1459,16 +1754,26 @@ export default function App() {
     transcriptionSampleCursorRef.current = 0;
     transcriptionBusyRef.current = false;
     pendingTranscriptionWindowsRef.current = [];
+    pendingFinalWindowsRef.current = [];
+    finalBusyRef.current = false;
+    previewBlockedByFinalCountRef.current = 0;
     vadRef.current.reset();
     vadShortAccumRef.current = null;
     activeSegmentIdRef.current = null;
     lastPreviewPerfMsRef.current = 0;
     transcriptionInFlightModeRef.current = null;
+    liveTranscriptionSourceRef.current = source;
+    polisherBusyRef.current = false;
+    pendingPolishJobRef.current = null;
+    cleanContextRef.current = '';
+    lastNotesPolishAtRef.current = 0;
+    lastNotesTextLengthRef.current = 0;
     previewDroppedCountRef.current = 0;
     previewReplacedCountRef.current = 0;
     finalAcceptedCountRef.current = 0;
     previewSegmentOpenedAtRef.current.clear();
     previewFirstSuccessRef.current.clear();
+    finalizedSegmentIdsRef.current.clear();
     setAsrLiveStats({
       previewLatencyMs: null,
       finalLatencyMs: null,
@@ -1480,13 +1785,10 @@ export default function App() {
       lastPreviewSegmentDurationMs: null,
       timeToFirstPreviewMs: null,
       lastCancelReason: null,
+      previewBusyLive: false,
+      finalBusyLive: false,
+      previewBlockedByFinalCount: 0,
     });
-    liveTranscriptionSourceRef.current = source;
-    polisherBusyRef.current = false;
-    pendingPolishJobRef.current = null;
-    cleanContextRef.current = '';
-    lastNotesPolishAtRef.current = 0;
-    lastNotesTextLengthRef.current = 0;
 
     const mediaSource = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -1580,25 +1882,35 @@ export default function App() {
         });
       }
 
-      if (SAFE_BASELINE && !ENABLE_LIVE_PREVIEW) return;
+      if (SAFE_BASELINE) return;
+
       if (!vadRef.current.isSegmentOpen()) return;
 
       const segmentId = activeSegmentIdRef.current;
       if (!segmentId) return;
 
-      const pendingQ = pendingTranscriptionWindowsRef.current;
-      if (pendingQ.some((w) => w.mode === 'final')) {
-        previewDroppedCountRef.current += 1;
-        syncAsrLiveStats({});
-        return;
-      }
-      if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final') {
-        previewDroppedCountRef.current += 1;
-        syncAsrLiveStats({});
-        return;
+      const now = performance.now();
+
+      if (!SAFE_BASELINE) {
+        const pendingQ = pendingTranscriptionWindowsRef.current;
+        if (pendingQ.some((w) => w.mode === 'final')) {
+          previewBlockedByFinalCountRef.current += 1;
+          previewDroppedCountRef.current += 1;
+          syncAsrLiveStats({});
+          return;
+        }
+        if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final') {
+          previewBlockedByFinalCountRef.current += 1;
+          previewDroppedCountRef.current += 1;
+          syncAsrLiveStats({});
+          return;
+        }
+        if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview') {
+          lastPreviewPerfMsRef.current = now;
+          return;
+        }
       }
 
-      const now = performance.now();
       if (now - lastPreviewPerfMsRef.current < PREVIEW_INTERVAL_MS) return;
 
       const snap = vadRef.current.getOpenSegmentSnapshot(audioContext.sampleRate);
@@ -1620,7 +1932,7 @@ export default function App() {
 
       lastPreviewPerfMsRef.current = now;
       const wavBytes = encodeWav(processedSamples, audioContext.sampleRate);
-      enqueueTranscription({
+      const previewPayload: TranscriptionWindow = {
         blockId: `preview-${segmentId}-${Math.round(now)}`,
         wavBytes,
         startMs: Math.round(tail.startMs),
@@ -1636,7 +1948,9 @@ export default function App() {
         segmentId,
         verbatimOnly,
         language,
-      });
+      };
+
+      enqueueTranscription(previewPayload);
     };
 
     mediaSource.connect(processor);
@@ -1644,8 +1958,9 @@ export default function App() {
     silentSink.connect(pullSink);
     transcriptionProcessorRef.current = processor;
     graphNodesRef.current.push(mediaSource, processor, silentSink, pullSink);
+
     addLog(SAFE_BASELINE
-      ? `transcripción: safeBaseline — final=VAD directo (≥5s, máx 15s), preview cada ~2s (cola ≤${MAX_PREVIEW_AUDIO_MS / 1000}s, modelo liviano si existe). Preview es UX; final es verdad.`
+      ? 'transcripción: baseline — segmentos VAD (~≥5 s, máx 15 s) → whisper.cpp (large-v3-turbo). Sin preview en vivo.'
       : 'transcripción: VAD + ledger; Whisper con calidad prioritaria si contexto activo');
   }, [addLog, enqueueTranscription, ensureAudioContext, syncAsrLiveStats, warnPossibleClipping]);
 
@@ -1658,7 +1973,13 @@ export default function App() {
       setLedgerDebugGroups([]);
       setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
       setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
+      setVisibleCommittedText('');
+      setFinalRevealQueue([]);
       pendingTranscriptionWindowsRef.current = [];
+      pendingFinalWindowsRef.current = [];
+      finalBusyRef.current = false;
+      previewBlockedByFinalCountRef.current = 0;
+      transcriptionBusyRef.current = false;
       vadRef.current.reset();
       vadShortAccumRef.current = null;
       candidateLedgerRef.current.reset();
@@ -1674,6 +1995,7 @@ export default function App() {
       finalAcceptedCountRef.current = 0;
       previewSegmentOpenedAtRef.current.clear();
       previewFirstSuccessRef.current.clear();
+      finalizedSegmentIdsRef.current.clear();
       setAsrLiveStats({
         previewLatencyMs: null,
         finalLatencyMs: null,
@@ -1685,6 +2007,9 @@ export default function App() {
         lastPreviewSegmentDurationMs: null,
         timeToFirstPreviewMs: null,
         lastCancelReason: null,
+        previewBusyLive: false,
+        finalBusyLive: false,
+        previewBlockedByFinalCount: 0,
       });
       pendingPolishJobRef.current = null;
       cleanContextRef.current = '';
@@ -1965,15 +2290,21 @@ export default function App() {
               <h2>Transcripción en vivo</h2>
               <p className="muted">
                 {SAFE_BASELINE && !showRawDebug ? (
-                  <span>Arriba: solo texto confirmado (VAD) y borrador visual con typewriter (~{TYPEWRITER_WORD_INTERVAL_MS} ms/palabra). Sin hipótesis cruda en pantalla. Cursor mientras capturás o hay cola pendiente.</span>
+                  <span>
+                    Segmentos cerrados por VAD (~≥{MIN_FINAL_AUDIO_MS / 1000}s, máximo {MAX_FINAL_SEGMENT_MS / 1000}s) se transcriben con whisper.cpp usando{' '}
+                    <strong>ggml-large-v3-turbo</strong>. Sin preview en vivo ni motores auxiliares.
+                    {whisperSetup?.ok && (
+                      <> Modelo: {whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'}.</>
+                    )}
+                  </span>
                 ) : (
                   <>
                     {SAFE_BASELINE && (
-                      <span><strong>Modo safeBaseline:</strong> vista verbatim, Whisper sin prompt, idioma es, sin Gemma en ASR; final=VAD directo; preview solo hipótesis en vivo (sin lista de alternativas). </span>
+                      <span><strong>Modo baseline:</strong> verbatim, Whisper sin prompt, idioma es, sin Gemma en ASR; solo transcripción final por segmento VAD. </span>
                     )}
                     {whisperSetup?.ok
                       ? (SAFE_BASELINE
-                        ? `Final: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'}. Preview ASR: ${PREVIEW_MODEL_POLICY === 'same-as-final' ? 'mismo modelo que el final' : `rápido (${whisperSetup.previewModelName ?? 'small/base'})`}. VAD ≥ ${MIN_FINAL_AUDIO_MS / 1000}s, máx ${MAX_FINAL_SEGMENT_MS / 1000}s; clipping ≥ ${CLIPPING_THRESHOLD} rechazado.`
+                        ? `Whisper large-v3-turbo (.local/models). VAD ≥ ${MIN_FINAL_AUDIO_MS / 1000}s, máx ${MAX_FINAL_SEGMENT_MS / 1000}s; clipping ≥ ${CLIPPING_THRESHOLD} rechazado.`
                         : `Whisper (${whisperSetup.activeModelName ?? 'modelo'}): VAD + ledger estabilizan frases; el preview va en cursiva. La vista principal muestra el texto refinado (Gemma) cuando está listo.`)
                       : whisperSetup?.message ?? 'Verificando whisper.cpp local...'}
                   </>
@@ -1986,6 +2317,8 @@ export default function App() {
               setLedgerDebugGroups([]);
               setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
               setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
+              setVisibleCommittedText('');
+              setFinalRevealQueue([]);
               pendingTranscriptionWindowsRef.current = [];
               vadRef.current.reset();
               vadShortAccumRef.current = null;
@@ -2002,6 +2335,10 @@ export default function App() {
               finalAcceptedCountRef.current = 0;
               previewSegmentOpenedAtRef.current.clear();
               previewFirstSuccessRef.current.clear();
+              finalizedSegmentIdsRef.current.clear();
+              pendingFinalWindowsRef.current = [];
+              finalBusyRef.current = false;
+              previewBlockedByFinalCountRef.current = 0;
               setAsrLiveStats({
                 previewLatencyMs: null,
                 finalLatencyMs: null,
@@ -2013,9 +2350,16 @@ export default function App() {
                 lastPreviewSegmentDurationMs: null,
                 timeToFirstPreviewMs: null,
                 lastCancelReason: null,
+                previewBusyLive: false,
+                finalBusyLive: false,
+                previewBlockedByFinalCount: 0,
               });
               pendingPolishJobRef.current = null;
               cleanContextRef.current = '';
+              transcriptionBusyRef.current = false;
+              void window.meetingAssistant.transcription.cancelPending().catch((error) => {
+                debug('transcription:cancel:error', String(error));
+              });
             }}>Limpiar</button>
           </div>
           <div className="setup-grid">
@@ -2023,7 +2367,7 @@ export default function App() {
               <div className={whisperSetup.ok ? 'setup-status setup-ready' : 'setup-status setup-missing'}>
                 <strong>{whisperSetup.ok ? 'Whisper listo' : 'Whisper no listo'}</strong>
                 <span>{whisperSetup.ok
-                  ? `final: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'} | preview: ${whisperSetup.previewModelName ?? '—'} — ${whisperSetup.modelPath}`
+                  ? `modelo: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'} — ${whisperSetup.modelPath}`
                   : 'Ejecuta npm run whisper:setup:turbo'}</span>
               </div>
             )}
@@ -2085,7 +2429,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className={SAFE_BASELINE || liveTranscript.committedText || liveVisualDraft.visibleDraft.trim() || liveVisualDraft.pendingWords.length > 0 || captureMode || liveCleanText ? 'live-transcript' : 'live-transcript empty-clean'}>
+          <div className={SAFE_BASELINE || liveTranscript.committedText || visibleCommittedText.trim() || finalRevealQueue.length > 0 || liveVisualDraft.visibleDraft.trim() || liveVisualDraft.pendingWords.length > 0 || captureMode || liveCleanText ? 'live-transcript' : 'live-transcript empty-clean'}>
             {!SAFE_BASELINE && transcriptViewMode === 'clean' ? (
               liveCleanText ? (
                 <p><span>{liveCleanText}</span></p>
@@ -2111,33 +2455,20 @@ export default function App() {
                 >
                   <div className="live-transcript-section-title">Transcripción</div>
                   <p className="live-transcript-text" aria-live="polite">
-                    {liveTranscript.committedText.trim() ? (
-                      <span>{liveTranscript.committedText}</span>
-                    ) : (
-                      <span className="live-transcript-placeholder">
-                        Aún no hay texto confirmado. Aparece aquí cuando el VAD cierra un segmento.
-                      </span>
-                    )}
-                    {ENABLE_LIVE_PREVIEW && liveVisualDraft.visibleDraft.trim() ? (
+                    {visibleCommittedText.trim() ? <span>{visibleCommittedText}</span> : null}
+                    {liveVisualDraft.visibleDraft.trim() ? (
                       <>
                         {' '}
                         <span className="preview-draft">{liveVisualDraft.visibleDraft}</span>
                       </>
                     ) : null}
-                    {ENABLE_LIVE_PREVIEW && (captureMode != null || liveVisualDraft.pendingWords.length > 0) ? (
-                      <span className="typing-cursor" aria-hidden="true">
-                        ▌
-                      </span>
-                    ) : null}
-                    {ENABLE_LIVE_PREVIEW
-                      && captureMode != null
-                      && !liveTranscript.committedText.trim()
-                      && !liveVisualDraft.visibleDraft.trim()
-                      && liveVisualDraft.pendingWords.length === 0 ? (
-                        <>
-                          {' '}
-                          <span className="live-transcript-placeholder">Esperando voz…</span>
-                        </>
+                    {(finalRevealQueue.length > 0
+                      || liveVisualDraft.pendingWords.length > 0
+                      || Boolean(liveVisualDraft.visibleDraft.trim())
+                      || Boolean(visibleCommittedText.trim())) ? (
+                        <span className="typing-cursor" aria-hidden="true">
+                          ▌
+                        </span>
                       ) : null}
                   </p>
                 </div>
@@ -2155,26 +2486,37 @@ export default function App() {
           <div className="live-meta">
             {SAFE_BASELINE && !showRawDebug ? (
               <span>
-                Borrador visual con typewriter (cola interna ~{PREVIEW_HIDDEN_TAIL_WORDS} palabras ocultas al usuario). Scroll al fondo solo si ya estabas cerca (~{SCROLL_STICK_THRESHOLD_PX}px). Cola audio preview ≤{MAX_PREVIEW_AUDIO_MS / 1000}s. Idioma es · preview modelo: {PREVIEW_MODEL_POLICY === 'same-as-final' ? 'igual al final' : 'rápido'}.
+                Solo transcribe segmentos cerrados por VAD; sin preview en vivo. whisper.cpp Large V3 Turbo
+                ({whisperSetup?.ok ? (whisperSetup.finalModelName ?? '—') : 'pendiente'})
+                {' '}· español fijo · scroll al fondo si estabas cerca (~{SCROLL_STICK_THRESHOLD_PX}px).
               </span>
             ) : (
               <>
                 <span>Estado: {liveTranscript.lastReason}</span>
-                <span>Preview: {SAFE_BASELINE && !ENABLE_LIVE_PREVIEW ? 'off' : `cada ~${(PREVIEW_INTERVAL_MS / 1000).toFixed(1)}s (cola ≤${MAX_PREVIEW_AUDIO_MS / 1000}s)`}</span>
-                <span>ASR: {SAFE_BASELINE ? 'VAD final directo (sin ledger en committed)' : 'ledger + VAD'}</span>
+                <span>Preview (!baseline): Whisper cada ~{(PREVIEW_INTERVAL_MS / 1000).toFixed(1)}s (cola ≤{MAX_PREVIEW_AUDIO_MS / 1000}s)</span>
+                <span>ASR: {SAFE_BASELINE ? 'VAD → Whisper solo final' : 'ledger + VAD'}</span>
                 <span>Idioma: {SAFE_BASELINE ? 'es (forzado)' : whisperLanguage}</span>
-                {SAFE_BASELINE && ENABLE_LIVE_PREVIEW && (
+                {!SAFE_BASELINE && (
                   <>
+                    {whisperSetup?.ok && <span>modelo: {whisperSetup.activeModelName ?? '—'}</span>}
                     <span>lat preview: {asrLiveStats.previewLatencyMs != null ? `${asrLiveStats.previewLatencyMs}ms` : '—'}</span>
                     <span>lat final: {asrLiveStats.finalLatencyMs != null ? `${asrLiveStats.finalLatencyMs}ms` : '—'}</span>
                     <span>1er preview: {asrLiveStats.timeToFirstPreviewMs != null ? `${asrLiveStats.timeToFirstPreviewMs}ms` : '—'}</span>
                     <span>cola pv/fin: {asrLiveStats.previewQueueSize}/{asrLiveStats.finalQueueSize}</span>
+                    <span>busy pv/fin: {asrLiveStats.previewBusyLive ? 'sí' : 'no'}/{asrLiveStats.finalBusyLive ? 'sí' : 'no'}</span>
+                    <span>pv bloq×fin: {asrLiveStats.previewBlockedByFinalCount}</span>
                     <span>pv drop/reempl: {asrLiveStats.previewDroppedCount}/{asrLiveStats.previewReplacedCount}</span>
                     <span>finales ok: {asrLiveStats.finalAcceptedCount}</span>
                     {asrLiveStats.lastCancelReason && <span>cancel: {asrLiveStats.lastCancelReason}</span>}
                   </>
                 )}
-                <span>Whisper contexto: {SAFE_BASELINE ? 'no (safeBaseline)' : (allowWhisperContext ? `sí (${promptMode})` : 'no')}</span>
+                {SAFE_BASELINE && (
+                  <>
+                    <span>lat última finalización: {asrLiveStats.finalLatencyMs != null ? `${asrLiveStats.finalLatencyMs}ms` : '—'}</span>
+                    <span>cola final pendiente: {asrLiveStats.finalQueueSize}</span>
+                  </>
+                )}
+                <span>Whisper contexto: {SAFE_BASELINE ? 'no (baseline)' : (allowWhisperContext ? `sí (${promptMode})` : 'no')}</span>
                 <span>Vista: {SAFE_BASELINE ? 'verbatim (forzado)' : (transcriptViewMode === 'clean' ? 'limpia' : 'ASR crudo')}</span>
                 <span>Gemma: {SAFE_BASELINE ? 'off' : (polisherSetup?.ok ? 'disponible' : 'no listo')}</span>
                 {liveTranscript.lastUpdatedAt && <span>Última actualización: {new Date(liveTranscript.lastUpdatedAt).toLocaleTimeString()}</span>}
@@ -2212,16 +2554,17 @@ export default function App() {
           {showRawDebug && (
             <>
               <p className="muted debug-advanced-hint">Debug avanzado: segmentos crudos, ledger y puntuaciones (no forma parte de la lectura principal).</p>
-              {SAFE_BASELINE && ENABLE_LIVE_PREVIEW && (
+              {SAFE_BASELINE && (
                 <details className="preview-visual-debug">
-                  <summary>Preview visual / interno (safeBaseline)</summary>
+                  <summary>Estado interno (baseline)</summary>
                   <div className="preview-visual-debug-body">
-                    <p><span className="muted">segmentId: </span><code>{liveVisualDraft.segmentId ?? '—'}</code></p>
-                    <p><span className="muted">lastRawPreview: </span><code>{liveVisualDraft.lastRawPreview.trim() || '—'}</code></p>
-                    <p><span className="muted">cola oculta (derivada): </span><code>{debugHiddenTailFromRaw(liveVisualDraft.lastRawPreview) || '—'}</code></p>
-                    <p><span className="muted">visibleDraft: </span><code>{liveVisualDraft.visibleDraft.trim() || '—'}</code></p>
+                    <p><span className="muted">committedText (oficial, completo): </span><code>{liveTranscript.committedText.trim() || '—'}</code></p>
+                    <p><span className="muted">visibleCommittedText (lectura): </span><code>{visibleCommittedText.trim() || '—'}</code></p>
+                    <p><span className="muted">finalRevealQueue ({finalRevealQueue.length}): </span><code>{finalRevealQueue.length > 0 ? finalRevealQueue.join(' ') : '—'}</code></p>
+                    <p><span className="muted">segmentId borrador ledger: </span><code>{liveVisualDraft.segmentId ?? '—'}</code></p>
+                    <p><span className="muted">visibleDraft (!baseline): </span><code>{liveVisualDraft.visibleDraft.trim() || '—'}</code></p>
                     <p><span className="muted">pendingWords: </span><code>{liveVisualDraft.pendingWords.length > 0 ? liveVisualDraft.pendingWords.join(' ') : '—'}</code></p>
-                    <p><span className="muted">unstableSuffix (transcript state): </span><code>{liveTranscript.unstableSuffix.trim() || '—'}</code></p>
+                    <p><span className="muted">unstableSuffix: </span><code>{liveTranscript.unstableSuffix.trim() || '—'}</code></p>
                   </div>
                 </details>
               )}

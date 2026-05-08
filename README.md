@@ -1,28 +1,61 @@
 # Openwhispr
 
-Asistente de reuniones **local-first** de código abierto: captura de audio (micrófono y/o sistema), transcripción en vivo con **whisper.cpp**, y opción de refinado local con Ollama/Gemma. Funciona en **macOS** y **Windows** mediante **Electron**.
+Aplicación de escritorio para **transcribir voz en tu propia máquina**. El audio no se envía a la nube: la transcripción la hace **Whisper** (vía whisper.cpp) de forma local.
 
-## Requisitos (resumen)
+**“Casi en tiempo real”** aquí significa: la app escucha el micrófono (y, si podés, el audio del sistema), detecta **cuándo termina un tramo de habla** (silencio / VAD) y entonces manda ese **segmento** al motor. No es subtitulado palabra a palabra al milisegundo; el retardo depende de la duración del segmento y del tiempo que tarde Whisper en procesarlo.
 
-- **Node.js** (LTS recomendado) y npm
-- **ffmpeg** instalado y en el `PATH`
-- **whisper.cpp**: binario `whisper-cli` construido localmente y al menos un modelo GGML (el proyecto incluye scripts de ayuda, p. ej. `npm run whisper:setup:turbo`)
-- **Permisos** de micrófono y, si aplica, captura de pantalla/audio del sistema según la plataforma
-- *(Opcional)* **Ollama** con un modelo compatible (p. ej. Gemma) para texto refinado fuera del modo safe-baseline
+```
+  Voz  ──▶  Openwhispr  ──▶  segmentos (pausas / VAD)  ──▶  whisper.cpp (local)  ──▶  texto en pantalla
+```
 
-Tras clonar: `npm install` → seguir los scripts `whisper:*` y `polisher:*` en `package.json` para verificar el entorno.
+---
 
-## Desarrollo
+## Instalación del proyecto
 
 ```bash
 npm install
 npm run dev
 ```
 
+**Importante:** al clonar el repo **no** tenés el modelo de Whisper ni el binario `whisper-cli`. Son archivos grandes y se generan en tu PC. Sin ese paso, la app no puede transcribir.
+
+### Modelo y motor (obligatorio para transcribir)
+
+1. **Herramientas en el sistema:** [Node.js](https://nodejs.org/) (LTS), **git**, **cmake**, compilador C++ acorde a tu OS, y **ffmpeg** en el `PATH`.
+2. **Compilar whisper.cpp y descargar un modelo base** (clona en `.local/whisper.cpp/` y arma `whisper-cli`):
+
+   ```bash
+   npm run whisper:setup
+   ```
+
+3. **Descargar el modelo grande usado por defecto** (Large V3 Turbo → `.local/models/ggml-large-v3-turbo.bin`):
+
+   ```bash
+   npm run whisper:setup:turbo
+   ```
+
+4. **Comprobar** que ffmpeg, CLI y modelo se ven bien:
+
+   ```bash
+   npm run whisper:check
+   ```
+
+Si algo falla, el propio comando indica qué falta.
+
+**Permisos:** micrófono y, si usás captura de sistema, lo que pida el SO para pantalla/audio.
+
+---
+
+## Desarrollo y build
+
 ```bash
 npm run typecheck
 npm run build
 ```
+
+En código existe un modo más experimental (`SAFE_BASELINE = false`) con refinado opcional por **Ollama** en local; el flujo habitual es baseline local sin eso.
+
+---
 
 ## Licencia
 

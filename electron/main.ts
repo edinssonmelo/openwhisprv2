@@ -7,10 +7,8 @@ import { pathToFileURL } from 'node:url';
 
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const POLISHER_MODEL = 'gemma3:4b';
-/** Prefer larger model for VAD-final blocks; preview uses small→base→turbo fallback for speed. */
-const WHISPER_MODEL_ORDER_FINAL = ['large-v3-turbo', 'small', 'base'] as const;
-const WHISPER_MODEL_ORDER_PREVIEW = ['small', 'base', 'large-v3-turbo'] as const;
-const WHISPER_MODEL_PRIORITY = WHISPER_MODEL_ORDER_FINAL;
+/** Baseline: único GGML esperado en `.local/models/ggml-large-v3-turbo.bin`. */
+const WHISPER_MODEL_ORDER = ['large-v3-turbo'] as const;
 const WHISPER_PROMPT_MAX_CHARS = 520;
 const FUZZY_REPLACEMENT_THRESHOLD = 0.88;
 const MINIMAL_TRANSCRIPTION_PROMPT = [
@@ -355,10 +353,9 @@ function getWhisperPaths() {
   };
 }
 
-function resolveWhisperModelForRole(role: 'preview' | 'final'): { name: string; path: string } | null {
+function resolveWhisperModel(): { name: string; path: string } | null {
   const paths = getWhisperPaths();
-  const order = role === 'preview' ? WHISPER_MODEL_ORDER_PREVIEW : WHISPER_MODEL_ORDER_FINAL;
-  for (const name of order) {
+  for (const name of WHISPER_MODEL_ORDER) {
     const modelPath = path.join(paths.modelsDir, `ggml-${name}.bin`);
     if (fsSync.existsSync(modelPath)) return { name, path: modelPath };
   }
@@ -369,7 +366,7 @@ function getWhisperSetupStatus() {
   const paths = getWhisperPaths();
   const ffmpegOk = commandExists('ffmpeg');
   const cliOk = fsSync.existsSync(paths.cliPath);
-  const candidates = WHISPER_MODEL_PRIORITY.map((name) => {
+  const candidates = WHISPER_MODEL_ORDER.map((name) => {
     const fp = path.join(paths.modelsDir, `ggml-${name}.bin`);
     return {
       name,
@@ -377,28 +374,26 @@ function getWhisperSetupStatus() {
       exists: fsSync.existsSync(fp),
     };
   });
-  const finalResolved = resolveWhisperModelForRole('final');
-  const previewResolved = resolveWhisperModelForRole('preview');
-  const activeModel = finalResolved ?? previewResolved;
-  const modelOk = Boolean(activeModel);
+  const resolved = resolveWhisperModel();
+  const modelOk = Boolean(resolved);
   const ok = ffmpegOk && cliOk && modelOk;
   const missing = [
     !ffmpegOk ? 'ffmpeg' : null,
     !cliOk ? 'whisper-cli' : null,
-    !modelOk ? 'ggml-large-v3-turbo.bin | ggml-small.bin | ggml-base.bin' : null,
+    !modelOk ? 'ggml-large-v3-turbo.bin' : null,
   ].filter(Boolean);
 
   return {
     ok,
     missing,
     cliPath: paths.cliPath,
-    modelPath: activeModel?.path ?? path.join(paths.modelsDir, 'ggml-large-v3-turbo.bin'),
-    activeModelName: activeModel?.name ?? null,
-    previewModelName: previewResolved?.name ?? null,
-    finalModelName: finalResolved?.name ?? null,
+    modelPath: resolved?.path ?? path.join(paths.modelsDir, 'ggml-large-v3-turbo.bin'),
+    activeModelName: resolved?.name ?? null,
+    previewModelName: null,
+    finalModelName: resolved?.name ?? null,
     modelCandidates: candidates,
     message: ok
-      ? `Whisper listo (final: ${finalResolved?.name ?? '—'}, preview: ${previewResolved?.name ?? '—'}).`
+      ? `Whisper listo (large-v3-turbo).`
       : `Whisper no está listo. Ejecuta npm run whisper:setup:turbo. Falta: ${missing.join(', ')}`,
   };
 }
@@ -706,16 +701,13 @@ async function transcribeBlock(payload: {
 
   const inferredRole: 'preview' | 'final' = payload.mode === 'preview' ? 'preview' : 'final';
   const role = payload.modelRole ?? inferredRole;
-  const previewPolicy = payload.previewModelPolicy ?? 'same-as-final';
-  const modelOrderKey: 'preview' | 'final' =
-    payload.mode === 'preview' && previewPolicy === 'fast' ? 'preview' : 'final';
-  const modelResolved = resolveWhisperModelForRole(modelOrderKey);
+  const modelResolved = resolveWhisperModel();
   if (!modelResolved) {
     return {
       ok: false,
       blockId: payload.blockId,
       durationMs: Date.now() - startedAt,
-      error: 'No hay modelo ggml instalado para este rol de transcripción.',
+      error: 'No hay ggml-large-v3-turbo.bin en .local/models (npm run whisper:setup:turbo).',
     };
   }
   const activeModelName = modelResolved.name;
@@ -730,14 +722,19 @@ async function transcribeBlock(payload: {
     ? ''
     : buildPromptForMode(promptMode, contextPack, payload.glossary);
 
+  const isLivePreview = payload.mode === 'preview';
+  /** Preview: greedy-ish (beam 1); final: beam 5 para mejor texto en segmentos largos. */
+  const bestOf = isLivePreview ? '1' : (activeModelName === 'base' ? '1' : '2');
+  const beamSize = isLivePreview ? '1' : '5';
+
   const args = [
     '-m', modelPathForRun,
     '-f', wavPath,
     '--no-timestamps',
     '-sns',
     '-t', '8',
-    '-bo', activeModelName === 'base' ? '1' : '2',
-    '-bs', '5',
+    '-bo', bestOf,
+    '-bs', beamSize,
     '-tp', '0',
     '-nf',
     '-np',
@@ -761,8 +758,6 @@ async function transcribeBlock(payload: {
     args,
     model: activeModelName,
     modelRole: role,
-    modelOrderKey,
-    previewModelPolicy: payload.mode === 'preview' ? previewPolicy : undefined,
     blockId: payload.blockId,
     mode: payload.mode,
     language,

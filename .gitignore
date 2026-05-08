@@ -20,6 +20,9 @@ recordings/*.m4a
 recordings/tmp/
 recordings/benchmarks/
 
+# Python bytecode (legacy scripts removed; prevents stray commits)
+**/__pycache__/
+
 # Cursor / IDE (optional local state)
 .cursor/
 .vscode/*
