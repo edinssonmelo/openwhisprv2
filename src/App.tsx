@@ -2,6 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { encodeWav } from './audio/wav';
 import { createVadEndpointing, type VadClosedSegment } from './audio/vadEndpointing';
 import { createTranscriptCandidateLedger, type LedgerDebugGroup, type LedgerSnapshot } from './audio/transcriptCandidateLedger';
+import { LiveTranscriptView } from './components/LiveTranscriptView';
+import { createTranscriptStore } from './transcription/transcriptStore';
+import type { AsrPipelineMode, TranscriptViewState } from './transcription/types';
 type SourceKey = 'mic' | 'system' | 'mixed';
 type CaptureMode = 'mic' | 'system' | 'both';
 type CaptureStatus = 'idle' | 'requesting_permission' | 'capturing' | 'silence' | 'failed' | 'stopped';
@@ -58,6 +61,9 @@ interface WhisperSetupState {
   activeModelName?: string | null;
   previewModelName?: string | null;
   finalModelName?: string | null;
+  pipelineMode?: AsrPipelineMode;
+  moonshineConfigured?: boolean;
+  qwenConfigured?: boolean;
   modelCandidates?: Array<{
     name: string;
     path: string;
@@ -135,6 +141,8 @@ const initialMeter: MeterState = {
 
 /** Baseline estable: solo segmentos VAD cerrados transcritos con whisper.cpp (`ggml-large-v3-turbo.bin`); sin preview en vivo. */
 const SAFE_BASELINE = true;
+/** Observa finales reales del baseline con el store visual v2, sin afectar la vista principal. */
+const V2_TRANSCRIPT_STORE_SHADOW = true;
 /** Tamaño máximo de segmento VAD (final). No bajar por debajo de ~10s sin pruebas; opcional futuro 12_000 si el final se siente muy largo. */
 const MAX_FINAL_SEGMENT_MS = 15_000;
 
@@ -451,11 +459,17 @@ export default function App() {
   const [promptMode, setPromptMode] = useState<WhisperPromptMode>('empty');
   const [whisperLanguage, setWhisperLanguage] = useState<'es' | 'auto'>('es');
   const [allowWhisperContext, setAllowWhisperContext] = useState(false);
+  const asrPipelineMode = whisperSetup?.pipelineMode ?? 'baseline-whisper';
+  const v2PipelineActive = asrPipelineMode === 'moonshine-qwen-v2';
 
   const allowWhisperContextRef = useRef(allowWhisperContext);
   const whisperLanguageRef = useRef(whisperLanguage);
+  const asrPipelineModeRef = useRef<AsrPipelineMode>(asrPipelineMode);
+  const moonshineConfiguredRef = useRef(Boolean(whisperSetup?.moonshineConfigured));
   allowWhisperContextRef.current = allowWhisperContext;
   whisperLanguageRef.current = whisperLanguage;
+  asrPipelineModeRef.current = asrPipelineMode;
+  moonshineConfiguredRef.current = Boolean(whisperSetup?.moonshineConfigured);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamsRef = useRef<Partial<Record<SourceKey, MediaStream>>>({});
@@ -507,6 +521,18 @@ export default function App() {
     lastReason: 'waiting',
     lastUpdatedAt: null,
   });
+  const v2DemoStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
+  if (v2DemoStoreRef.current === null) {
+    v2DemoStoreRef.current = createTranscriptStore();
+  }
+  const [v2DemoTranscript, setV2DemoTranscript] = useState<TranscriptViewState>(() => v2DemoStoreRef.current!.getState());
+  const v2ShadowStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
+  if (v2ShadowStoreRef.current === null) {
+    v2ShadowStoreRef.current = createTranscriptStore();
+  }
+  const [v2ShadowTranscript, setV2ShadowTranscript] = useState<TranscriptViewState>(() => v2ShadowStoreRef.current!.getState());
+  const [v2ShadowFinalCount, setV2ShadowFinalCount] = useState(0);
+  const [v2ShadowLastSegmentId, setV2ShadowLastSegmentId] = useState<string | null>(null);
 
   const [asrLiveStats, setAsrLiveStats] = useState({
     previewLatencyMs: null as number | null,
@@ -528,19 +554,99 @@ export default function App() {
     setAsrLiveStats((prev) => {
       const p = pendingTranscriptionWindowsRef.current;
       const fq = pendingFinalWindowsRef.current;
+      const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
       return {
         ...prev,
         ...patch,
-        previewQueueSize: SAFE_BASELINE ? 0 : p.filter((w) => w.mode === 'preview').length,
+        previewQueueSize: SAFE_BASELINE && !isV2Pipeline ? 0 : p.filter((w) => w.mode === 'preview').length,
         finalQueueSize: SAFE_BASELINE ? fq.length : p.filter((w) => w.mode === 'final').length,
         previewDroppedCount: previewDroppedCountRef.current,
         previewReplacedCount: previewReplacedCountRef.current,
         finalAcceptedCount: finalAcceptedCountRef.current,
-        previewBusyLive: SAFE_BASELINE ? false : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview'),
+        previewBusyLive: SAFE_BASELINE && !isV2Pipeline ? false : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview'),
         finalBusyLive: SAFE_BASELINE ? finalBusyRef.current : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final'),
         previewBlockedByFinalCount: previewBlockedByFinalCountRef.current,
       };
     });
+  }, []);
+
+  const updateV2DemoTranscript = useCallback((next: TranscriptViewState) => {
+    setV2DemoTranscript(next);
+  }, []);
+
+  const runV2DemoPreviewOne = useCallback(() => {
+    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
+      segmentId: 'demo-segment-1',
+      text: 'hola como estas ahora mismo',
+    }));
+  }, [updateV2DemoTranscript]);
+
+  const runV2DemoPreviewTwo = useCallback(() => {
+    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
+      segmentId: 'demo-segment-1',
+      text: 'hola como estas bien ahora',
+    }));
+  }, [updateV2DemoTranscript]);
+
+  const runV2DemoDifferentPreview = useCallback(() => {
+    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
+      segmentId: 'demo-segment-1',
+      text: 'esto cambio demasiado y no deberia reemplazar',
+    }));
+  }, [updateV2DemoTranscript]);
+
+  const runV2DemoFinal = useCallback(() => {
+    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptFinal({
+      segmentId: 'demo-segment-1',
+      text: 'hola como estas bien',
+    }));
+  }, [updateV2DemoTranscript]);
+
+  const resetV2Demo = useCallback(() => {
+    updateV2DemoTranscript(v2DemoStoreRef.current!.reset());
+  }, [updateV2DemoTranscript]);
+
+  const resetV2Shadow = useCallback(() => {
+    setV2ShadowTranscript(v2ShadowStoreRef.current!.reset());
+    setV2ShadowFinalCount(0);
+    setV2ShadowLastSegmentId(null);
+  }, []);
+
+  const acceptV2ShadowFinal = useCallback((segment: TranscriptSegment, segmentId: string) => {
+    if (!V2_TRANSCRIPT_STORE_SHADOW) return;
+    try {
+      const next = v2ShadowStoreRef.current!.acceptFinal({
+        segmentId,
+        text: segment.text,
+        engine: 'whisper-large-v3-turbo',
+      });
+      setV2ShadowTranscript(next);
+      setV2ShadowFinalCount((count) => count + 1);
+      setV2ShadowLastSegmentId(segmentId);
+    } catch (error) {
+      debug('v2-shadow:error', {
+        segmentId,
+        error: String(error),
+      });
+    }
+  }, []);
+
+  const acceptV2ShadowPreview = useCallback((segment: TranscriptSegment, segmentId: string) => {
+    if (!V2_TRANSCRIPT_STORE_SHADOW) return;
+    try {
+      const next = v2ShadowStoreRef.current!.acceptPreview({
+        segmentId,
+        text: segment.text,
+        engine: 'moonshine',
+      });
+      setV2ShadowTranscript(next);
+      setV2ShadowLastSegmentId(segmentId);
+    } catch (error) {
+      debug('v2-shadow-preview:error', {
+        segmentId,
+        error: String(error),
+      });
+    }
   }, []);
 
 
@@ -1183,13 +1289,18 @@ export default function App() {
   }, [maybePolishNotes, scheduleLedgerFlush]);
 
   const handlePreviewSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    if (SAFE_BASELINE) return;
+    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
+    if (SAFE_BASELINE && !isV2Pipeline) return;
 
     if (!shouldUseForLive(segment)) {
       setRawSegments((current) => [...current, { ...segment, stabilizationReason: 'filtered' }].slice(-120));
       return;
     }
     setRawSegments((current) => [...current, { ...segment, asrMode: 'preview' as const, segmentId }].slice(-120));
+    if (isV2Pipeline) {
+      acceptV2ShadowPreview(segment, segmentId);
+      return;
+    }
     const snapshot = candidateLedgerRef.current.addCandidate({
       id: segment.id,
       segmentId,
@@ -1206,7 +1317,7 @@ export default function App() {
       language: segment.language,
     });
     applyLedgerSnapshot(snapshot, segment.source);
-  }, [applyLedgerSnapshot, showRawDebug]);
+  }, [acceptV2ShadowPreview, applyLedgerSnapshot, showRawDebug]);
 
   const handleFinalSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
     const finalText = segment.text.trim();
@@ -1248,6 +1359,7 @@ export default function App() {
       setVisibleCommittedText((vc) => appendWordsDeduped(vc, splitWords(finalText)));
       setFinalRevealQueue([]);
       setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
+      acceptV2ShadowFinal(segment, segmentId);
       finalAcceptedCountRef.current += 1;
       syncAsrLiveStats({});
       const snapshot = candidateLedgerRef.current.addCandidate({
@@ -1304,7 +1416,7 @@ export default function App() {
       language: segment.language,
     });
     applyLedgerSnapshot(snapshot, segment.source);
-  }, [addLog, applyLedgerSnapshot, syncAsrLiveStats]);
+  }, [acceptV2ShadowFinal, addLog, applyLedgerSnapshot, syncAsrLiveStats]);
 
 
   /** safeBaseline: whisper.cpp transcribe cada segmento VAD cerrado (solo final). */
@@ -1470,7 +1582,8 @@ export default function App() {
   }, [addLog, handleFinalSegment, syncAsrLiveStats]);
 
   const processNextTranscriptionWindow = useCallback(() => {
-    if (SAFE_BASELINE) return;
+    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
+    if (SAFE_BASELINE && !isV2Pipeline) return;
     if (transcriptionBusyRef.current) return;
     const request = pendingTranscriptionWindowsRef.current.shift();
     if (!request) return;
@@ -1685,11 +1798,12 @@ export default function App() {
 
   const enqueueTranscription = useCallback((request: TranscriptionWindow) => {
     const enqueuedAtMs = Date.now();
+    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
     const r: TranscriptionWindow = SAFE_BASELINE
       ? { ...request, verbatimOnly: true, language: 'es', enqueuedAtMs }
       : { ...request, enqueuedAtMs };
 
-    if (SAFE_BASELINE && r.mode === 'preview') {
+    if (SAFE_BASELINE && !isV2Pipeline && r.mode === 'preview') {
       return;
     }
 
@@ -1805,6 +1919,7 @@ export default function App() {
 
       const { closed } = vadRef.current.pushFrame(input, audioContext.sampleRate, frameStartSample);
 
+      const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
       const verbatimOnly = SAFE_BASELINE ? true : !allowWhisperContextRef.current;
       const language = SAFE_BASELINE ? 'es' : whisperLanguageRef.current;
 
@@ -1882,7 +1997,8 @@ export default function App() {
         });
       }
 
-      if (SAFE_BASELINE) return;
+      if (SAFE_BASELINE && !isV2Pipeline) return;
+      if (isV2Pipeline && !moonshineConfiguredRef.current) return;
 
       if (!vadRef.current.isSegmentOpen()) return;
 
@@ -1891,8 +2007,14 @@ export default function App() {
 
       const now = performance.now();
 
-      if (!SAFE_BASELINE) {
+      if (!SAFE_BASELINE || isV2Pipeline) {
         const pendingQ = pendingTranscriptionWindowsRef.current;
+        if (isV2Pipeline && (finalBusyRef.current || pendingFinalWindowsRef.current.length > 0)) {
+          previewBlockedByFinalCountRef.current += 1;
+          previewDroppedCountRef.current += 1;
+          syncAsrLiveStats({});
+          return;
+        }
         if (pendingQ.some((w) => w.mode === 'final')) {
           previewBlockedByFinalCountRef.current += 1;
           previewDroppedCountRef.current += 1;
@@ -1975,6 +2097,7 @@ export default function App() {
       setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
       setVisibleCommittedText('');
       setFinalRevealQueue([]);
+      resetV2Shadow();
       pendingTranscriptionWindowsRef.current = [];
       pendingFinalWindowsRef.current = [];
       finalBusyRef.current = false;
@@ -2088,6 +2211,7 @@ export default function App() {
       stopCapture,
       systemPermission,
       outputDevices,
+      resetV2Shadow,
     ],
   );
 
@@ -2319,6 +2443,7 @@ export default function App() {
               setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
               setVisibleCommittedText('');
               setFinalRevealQueue([]);
+              resetV2Shadow();
               pendingTranscriptionWindowsRef.current = [];
               vadRef.current.reset();
               vadShortAccumRef.current = null;
@@ -2367,7 +2492,7 @@ export default function App() {
               <div className={whisperSetup.ok ? 'setup-status setup-ready' : 'setup-status setup-missing'}>
                 <strong>{whisperSetup.ok ? 'Whisper listo' : 'Whisper no listo'}</strong>
                 <span>{whisperSetup.ok
-                  ? `modelo: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'} — ${whisperSetup.modelPath}`
+                  ? `pipeline: ${asrPipelineMode} · final: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'} · preview: ${whisperSetup.previewModelName ?? 'off'} — ${whisperSetup.modelPath}`
                   : 'Ejecuta npm run whisper:setup:turbo'}</span>
               </div>
             )}
@@ -2429,7 +2554,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className={SAFE_BASELINE || liveTranscript.committedText || visibleCommittedText.trim() || finalRevealQueue.length > 0 || liveVisualDraft.visibleDraft.trim() || liveVisualDraft.pendingWords.length > 0 || captureMode || liveCleanText ? 'live-transcript' : 'live-transcript empty-clean'}>
+          <div className={SAFE_BASELINE || v2ShadowTranscript.visibleText.trim() || liveTranscript.committedText || visibleCommittedText.trim() || finalRevealQueue.length > 0 || liveVisualDraft.visibleDraft.trim() || liveVisualDraft.pendingWords.length > 0 || captureMode || liveCleanText ? 'live-transcript' : 'live-transcript empty-clean'}>
             {!SAFE_BASELINE && transcriptViewMode === 'clean' ? (
               liveCleanText ? (
                 <p><span>{liveCleanText}</span></p>
@@ -2446,6 +2571,14 @@ export default function App() {
               ) : (
                 'Sin transcripción todavía. Iniciá captura y hablá o reproducí audio.'
               )
+            ) : v2PipelineActive ? (
+              <LiveTranscriptView
+                committedText={v2ShadowTranscript.committedText}
+                previewSuffix={v2ShadowTranscript.previewSuffix}
+                rawPreview={v2ShadowTranscript.rawPreview}
+                showDebug={showRawDebug}
+                pipelineLabel="Transcripción v2"
+              />
             ) : SAFE_BASELINE ? (
               <div className="live-transcript-stack">
                 <div
@@ -2524,6 +2657,46 @@ export default function App() {
             )}
           </div>
 
+          <details className="v2-text-demo">
+            <summary>V2 text demo</summary>
+            <LiveTranscriptView
+              committedText={v2DemoTranscript.committedText}
+              previewSuffix={v2DemoTranscript.previewSuffix}
+              rawPreview={v2DemoTranscript.rawPreview}
+              showDebug={showRawDebug}
+              pipelineLabel="moonshine-qwen-v2 visual contract"
+            />
+            <div className="button-row v2-demo-buttons">
+              <button className="secondary" type="button" onClick={runV2DemoPreviewOne}>Simular preview 1</button>
+              <button className="secondary" type="button" onClick={runV2DemoPreviewTwo}>Simular preview 2</button>
+              <button className="secondary" type="button" onClick={runV2DemoDifferentPreview}>Simular preview diferente</button>
+              <button className="secondary" type="button" onClick={runV2DemoFinal}>Simular final</button>
+              <button className="secondary" type="button" onClick={resetV2Demo}>Reset demo</button>
+            </div>
+            <div className="v2-demo-meta">
+              <span>reason: {v2DemoTranscript.lastReason}</span>
+              <span>segment: {v2DemoTranscript.segmentId ?? '-'}</span>
+              <span>history: {v2DemoTranscript.previewHistory.length}</span>
+            </div>
+          </details>
+
+          <details className="v2-text-demo v2-shadow-transcript" open={v2PipelineActive}>
+            <summary>V2 shadow transcript</summary>
+            <LiveTranscriptView
+              committedText={v2ShadowTranscript.committedText}
+              previewSuffix={v2ShadowTranscript.previewSuffix}
+              rawPreview={v2ShadowTranscript.rawPreview}
+              showDebug={showRawDebug}
+              pipelineLabel="baseline-whisper finals through v2 store"
+            />
+            <div className="v2-demo-meta">
+              <span>enabled: {V2_TRANSCRIPT_STORE_SHADOW ? 'yes' : 'no'}</span>
+              <span>reason: {v2ShadowTranscript.lastReason}</span>
+              <span>finals: {v2ShadowFinalCount}</span>
+              <span>last segment: {v2ShadowLastSegmentId ?? '-'}</span>
+            </div>
+          </details>
+
           {(!SAFE_BASELINE || showRawDebug) && cleanSegments.length > 0 && (
             <details className="notes-panel">
               <summary>Fragmentos refinados ({cleanSegments.length})</summary>
@@ -2565,6 +2738,9 @@ export default function App() {
                     <p><span className="muted">visibleDraft (!baseline): </span><code>{liveVisualDraft.visibleDraft.trim() || '—'}</code></p>
                     <p><span className="muted">pendingWords: </span><code>{liveVisualDraft.pendingWords.length > 0 ? liveVisualDraft.pendingWords.join(' ') : '—'}</code></p>
                     <p><span className="muted">unstableSuffix: </span><code>{liveTranscript.unstableSuffix.trim() || '—'}</code></p>
+                    <p><span className="muted">v2 shadow reason: </span><code>{v2ShadowTranscript.lastReason}</code></p>
+                    <p><span className="muted">v2 shadow finales: </span><code>{v2ShadowFinalCount}</code></p>
+                    <p><span className="muted">v2 shadow último segmentId: </span><code>{v2ShadowLastSegmentId ?? '—'}</code></p>
                   </div>
                 </details>
               )}

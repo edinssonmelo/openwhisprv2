@@ -1,0 +1,3 @@
+# Moonshine preview wrapper dependencies.
+# Provides the moonshine_voice Python API used by scripts/asr_moonshine_preview.py.
+moonshine-voice>=0.0.59

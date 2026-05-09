@@ -552,6 +552,79 @@ h2 {
   background: #edf2ee;
 }
 
+.v2-text-demo {
+  margin-top: 14px;
+  border: 1px dashed #cbd8d1;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fbfdfb;
+}
+
+.v2-text-demo summary {
+  cursor: pointer;
+  color: #40534d;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.v2-shadow-transcript {
+  background: #ffffff;
+}
+
+.v2-live-transcript-view {
+  margin-top: 12px;
+}
+
+.v2-live-transcript-label {
+  color: #60746e;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.v2-live-transcript-text {
+  margin: 8px 0 0;
+  color: #24332f;
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+.v2-preview-suffix {
+  color: #60746e;
+  font-style: italic;
+}
+
+.v2-raw-preview-debug {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  color: #60746e;
+  font-size: 12px;
+}
+
+.v2-raw-preview-debug code {
+  white-space: normal;
+}
+
+.v2-demo-buttons {
+  margin-top: 10px;
+}
+
+.v2-demo-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  color: #60746e;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.v2-demo-meta span {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #edf2ee;
+}
+
 .notes-panel {
   margin-top: 14px;
 }

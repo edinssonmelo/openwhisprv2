@@ -19,6 +19,7 @@ const MINIMAL_TRANSCRIPTION_PROMPT = [
 ].join(' ');
 
 type WhisperPromptMode = 'empty' | 'minimal' | 'contextual';
+type AsrPipelineMode = 'baseline-whisper' | 'moonshine-qwen-v2';
 
 interface TranscriptionContextPack {
   defaultLanguage: string;
@@ -364,6 +365,7 @@ function resolveWhisperModel(): { name: string; path: string } | null {
 
 function getWhisperSetupStatus() {
   const paths = getWhisperPaths();
+  const asrConfig = getAsrConfig();
   const ffmpegOk = commandExists('ffmpeg');
   const cliOk = fsSync.existsSync(paths.cliPath);
   const candidates = WHISPER_MODEL_ORDER.map((name) => {
@@ -389,12 +391,25 @@ function getWhisperSetupStatus() {
     cliPath: paths.cliPath,
     modelPath: resolved?.path ?? path.join(paths.modelsDir, 'ggml-large-v3-turbo.bin'),
     activeModelName: resolved?.name ?? null,
-    previewModelName: null,
+    previewModelName: asrConfig.pipelineMode === 'moonshine-qwen-v2' && asrConfig.moonshineCmd ? 'moonshine' : null,
     finalModelName: resolved?.name ?? null,
     modelCandidates: candidates,
+    pipelineMode: asrConfig.pipelineMode,
+    moonshineConfigured: Boolean(asrConfig.moonshineCmd),
+    qwenConfigured: Boolean(asrConfig.qwenCmd),
     message: ok
-      ? `Whisper listo (large-v3-turbo).`
+      ? `Whisper listo (large-v3-turbo). Pipeline: ${asrConfig.pipelineMode}.`
       : `Whisper no está listo. Ejecuta npm run whisper:setup:turbo. Falta: ${missing.join(', ')}`,
+  };
+}
+
+function getAsrConfig(): { pipelineMode: AsrPipelineMode; moonshineCmd: string | null; qwenCmd: string | null } {
+  const requested = process.env.ASR_PIPELINE_MODE;
+  const pipelineMode: AsrPipelineMode = requested === 'moonshine-qwen-v2' ? 'moonshine-qwen-v2' : 'baseline-whisper';
+  return {
+    pipelineMode,
+    moonshineCmd: process.env.MOONSHINE_ASR_CMD?.trim() || null,
+    qwenCmd: process.env.QWEN3_ASR_CMD?.trim() || null,
   };
 }
 
@@ -664,6 +679,14 @@ type WhisperInvocationDebug = {
   argsSanitized: string[];
 };
 
+type ExternalAsrResult = {
+  ok: boolean;
+  text: string;
+  durationMs: number;
+  stderr: string;
+  error?: string;
+};
+
 async function transcribeBlock(payload: {
   blockId: string;
   wavBytes: Uint8Array;
@@ -683,17 +706,7 @@ async function transcribeBlock(payload: {
   verbatimOnly?: boolean;
   previewModelPolicy?: 'same-as-final' | 'fast';
 }) {
-  const setup = getWhisperSetupStatus();
   const startedAt = Date.now();
-  if (!setup.ok) {
-    return {
-      ok: false,
-      blockId: payload.blockId,
-      durationMs: 0,
-      error: setup.message,
-    };
-  }
-
   const paths = getWhisperPaths();
   await fs.mkdir(paths.tmpDir, { recursive: true });
   const wavPath = path.join(paths.tmpDir, `${payload.blockId}.wav`);
@@ -701,6 +714,51 @@ async function transcribeBlock(payload: {
 
   const inferredRole: 'preview' | 'final' = payload.mode === 'preview' ? 'preview' : 'final';
   const role = payload.modelRole ?? inferredRole;
+  const asrConfig = getAsrConfig();
+
+  try {
+    if (asrConfig.pipelineMode === 'moonshine-qwen-v2' && payload.mode === 'preview') {
+      if (!asrConfig.moonshineCmd) {
+        return {
+          ok: false,
+          blockId: payload.blockId,
+          durationMs: Date.now() - startedAt,
+          error: 'Moonshine preview no configurado (MOONSHINE_ASR_CMD vacío).',
+          modelName: 'moonshine',
+        };
+      }
+
+      const external = await runExternalAsrCommand(asrConfig.moonshineCmd, wavPath);
+      debugLog('transcription:external-preview-result', {
+        blockId: payload.blockId,
+        engineUsed: 'moonshine',
+        durationMs: external.durationMs,
+        ok: external.ok,
+        stderr: summarizeStderr(external.stderr),
+        error: external.error,
+      });
+      return {
+        ok: external.ok,
+        blockId: payload.blockId,
+        durationMs: external.durationMs,
+        text: external.text,
+        error: external.error,
+        stderr: summarizeStderr(external.stderr),
+        modelName: 'moonshine',
+        modelPath: asrConfig.moonshineCmd,
+      };
+    }
+
+    const setup = getWhisperSetupStatus();
+    if (!setup.ok) {
+      return {
+        ok: false,
+        blockId: payload.blockId,
+        durationMs: Date.now() - startedAt,
+        error: setup.message,
+      };
+    }
+
   const modelResolved = resolveWhisperModel();
   if (!modelResolved) {
     return {
@@ -829,6 +887,7 @@ async function transcribeBlock(payload: {
       error: String(error),
       whisperDebug,
     };
+  }
   } finally {
     fs.unlink(wavPath).catch(() => undefined);
   }
@@ -861,11 +920,64 @@ function runWhisper(command: string, args: string[]) {
   });
 }
 
+function runExternalAsrCommand(commandLine: string, wavPath: string): Promise<ExternalAsrResult> {
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const child = spawn(commandLine, [wavPath], {
+      windowsHide: true,
+      env: process.env,
+      shell: true,
+    });
+    activeTranscriptionProcesses.add(child);
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', (error) => {
+      activeTranscriptionProcesses.delete(child);
+      resolve({
+        ok: false,
+        text: '',
+        durationMs: Date.now() - startedAt,
+        stderr,
+        error: String(error),
+      });
+    });
+    child.on('close', (exitCode) => {
+      activeTranscriptionProcesses.delete(child);
+      const text = sanitizeExternalAsrText(stdout);
+      const ok = exitCode === 0 && text.length > 0;
+      resolve({
+        ok,
+        text,
+        durationMs: Date.now() - startedAt,
+        stderr,
+        error: ok ? undefined : (summarizeStderr(stderr) || `external ASR exited with code ${exitCode}`),
+      });
+    });
+  });
+}
+
 function parseWhisperText(stdout: string) {
   return stdout
     .split('\n')
     .map((line) => line.replace(/^\s*\[[^\]]+\]\s*/u, '').trim())
     .filter((line) => line && !line.startsWith('whisper_') && !line.startsWith('system_info:'))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sanitizeExternalAsrText(stdout: string) {
+  return stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();

@@ -39,6 +39,9 @@ declare global {
           activeModelName?: string | null;
           previewModelName?: string | null;
           finalModelName?: string | null;
+          pipelineMode?: 'baseline-whisper' | 'moonshine-qwen-v2';
+          moonshineConfigured?: boolean;
+          qwenConfigured?: boolean;
           modelCandidates?: Array<{
             name: string;
             path: string;

@@ -55,6 +55,19 @@ npm run build
 
 En código existe un modo más experimental (`SAFE_BASELINE = false`) con refinado opcional por **Ollama** en local; el flujo habitual es baseline local sin eso.
 
+### Preview v2 con Moonshine (opcional)
+
+El baseline sigue siendo Whisper. Para probar Moonshine solo como preview en la v2:
+
+```bash
+python3 -m venv .venv-moonshine
+.venv-moonshine/bin/python -m pip install -r requirements-moonshine.txt
+.venv-moonshine/bin/python scripts/asr_moonshine_preview.py .venv-moonshine/lib/python3.13/site-packages/moonshine_voice/assets/two_cities.wav
+ASR_PIPELINE_MODE=moonshine-qwen-v2 \
+MOONSHINE_ASR_CMD=".venv-moonshine/bin/python scripts/asr_moonshine_preview.py" \
+npm run dev
+```
+
 ---
 
 ## Licencia
