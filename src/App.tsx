@@ -2,12 +2,49 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { encodeWav } from './audio/wav';
 import { createVadEndpointing, type VadClosedSegment } from './audio/vadEndpointing';
 import { createTranscriptCandidateLedger, type LedgerDebugGroup, type LedgerSnapshot } from './audio/transcriptCandidateLedger';
+import {
+  filterVirtualSystemInputCandidates,
+  runSystemAudioEngine,
+  SystemAudioEngineError,
+  type SystemAudioDeviceCandidate,
+  type SystemAudioProviderId,
+  type SystemAudioStrategy,
+} from './audio/systemAudioEngine';
 import { LiveTranscriptView } from './components/LiveTranscriptView';
+import {
+  buildFinalTranscriptRefinementPrompt,
+  shouldCreateRefinementBatch,
+  type RefinementSegmentInput,
+} from './transcription/finalTranscriptRefiner';
+import { DashboardHome } from './components/DashboardHome';
+import type { DashboardSessionSummary } from './types/dashboardSession';
+import { HomeConfirmDialog } from './components/HomeConfirmDialog';
+import { FloatingAssistantShell } from './components/FloatingAssistantShell';
+import { SetupOnboarding } from './components/SetupOnboarding';
+import { PremiumToast } from './components/PremiumToast';
+import type { AssistantChatMessage } from './components/AssistantChatPanel';
+import { copyToClipboard } from './utils/copyToClipboard';
+import {
+  getOnboardingSystemSkipped,
+  isOnboardingComplete,
+  loadCapturePreference,
+  loadSelectedSystemInputId,
+  loadSystemCaptureStrategy,
+  markOnboardingComplete,
+  persistCapturePreference,
+  persistSelectedSystemInputId,
+  persistSystemCaptureStrategy,
+  type CapturePreference,
+  type SystemCaptureStrategy,
+} from './storage/appPreferences';
+import { readDashboardTheme } from './storage/dashboardTheme';
 import { createTranscriptStore } from './transcription/transcriptStore';
-import type { AsrPipelineMode, TranscriptViewState } from './transcription/types';
+import type { AsrEngineName, AsrFinalEngineMode, AsrPipelineMode, TranscriptRefinementMode, TranscriptViewState } from './transcription/types';
 type SourceKey = 'mic' | 'system' | 'mixed';
 type CaptureMode = 'mic' | 'system' | 'both';
+type AppMode = 'dashboard' | 'session';
 type CaptureStatus = 'idle' | 'requesting_permission' | 'capturing' | 'silence' | 'failed' | 'stopped';
+type CaptureHealth = 'ok' | 'silent' | 'audio-ended' | 'recovering' | 'failed';
 type TranscriptViewMode = 'verbatim' | 'clean';
 type WhisperPromptMode = 'empty' | 'minimal' | 'contextual';
 
@@ -19,6 +56,17 @@ interface MeterState {
   silence: boolean;
   clipping: boolean;
   error: string | null;
+}
+
+interface CaptureHealthState {
+  captureHealth: CaptureHealth;
+  audioTrackReadyState: MediaStreamTrackState | 'none';
+  audioTrackMuted: boolean;
+  audioTrackEndedAt: number | null;
+  lastAudioRmsAt: number | null;
+  lastNonSilentAudioAt: number | null;
+  lastCheckedAt: number | null;
+  message: string | null;
 }
 
 interface DesktopSource {
@@ -50,6 +98,14 @@ interface TranscriptSegment {
   whisperPromptLength?: number;
   coalesced?: boolean;
   language?: 'es' | 'auto';
+  engineUsed?: AsrEngineName;
+  fallbackUsed?: boolean;
+  fallbackReason?: string;
+  whisperText?: string;
+  qwenText?: string;
+  whisperDurationMs?: number;
+  qwenDurationMs?: number;
+  qwenError?: string;
 }
 
 interface WhisperSetupState {
@@ -64,6 +120,10 @@ interface WhisperSetupState {
   pipelineMode?: AsrPipelineMode;
   moonshineConfigured?: boolean;
   qwenConfigured?: boolean;
+  experimentalPreview?: boolean;
+  finalEngine?: AsrFinalEngineMode;
+  refinementMode?: TranscriptRefinementMode;
+  refinerModel?: string;
   modelCandidates?: Array<{
     name: string;
     path: string;
@@ -84,6 +144,15 @@ interface CleanSegment {
   rawSegmentIds: string[];
   cleanText: string;
   status: 'final';
+}
+
+interface RefinedTranscriptState {
+  status: 'off' | 'idle' | 'generating' | 'ready' | 'error';
+  text: string;
+  error: string | null;
+  model: string | null;
+  mode: TranscriptRefinementMode;
+  updatedAt: number | null;
 }
 
 interface LiveTranscriptState {
@@ -139,6 +208,17 @@ const initialMeter: MeterState = {
   error: null,
 };
 
+const initialCaptureHealth: CaptureHealthState = {
+  captureHealth: 'ok',
+  audioTrackReadyState: 'none',
+  audioTrackMuted: false,
+  audioTrackEndedAt: null,
+  lastAudioRmsAt: null,
+  lastNonSilentAudioAt: null,
+  lastCheckedAt: null,
+  message: null,
+};
+
 /** Baseline estable: solo segmentos VAD cerrados transcritos con whisper.cpp (`ggml-large-v3-turbo.bin`); sin preview en vivo. */
 const SAFE_BASELINE = true;
 /** Observa finales reales del baseline con el store visual v2, sin afectar la vista principal. */
@@ -182,9 +262,27 @@ const FINAL_REVEAL_CATCHUP_WORDS_PER_TICK = 3;
 const VISIBLE_APPEND_MAX_OVERLAP = 12;
 /** Autoscroll al confirmar o actualizar preview solo si el usuario estaba cerca del fondo. */
 const SCROLL_STICK_THRESHOLD_PX = 72;
-const MIN_WHISPER_RMS = 0.018;
+const MIN_WHISPER_RMS_MIC = 0.0008;
+const MIN_WHISPER_RMS_SYSTEM = 0.003;
+const MIN_WHISPER_RMS_HELPER = 0.003;
 const NOTES_POLISH_INTERVAL_MS = 12_000;
+const AUDIO_WATCHDOG_INTERVAL_MS = 1_500;
+const AUDIO_SILENT_WARNING_MS = 12_000;
+const SYSTEM_SIGNAL_CHECK_TIMEOUT_MS = 3500;
+const SYSTEM_SIGNAL_CHECK_INTERVAL_MS = 200;
+const SYSTEM_SIGNAL_CHECK_RMS = 0.003;
+const SYSTEM_SIGNAL_CHECK_PEAK = 0.01;
+const SYSTEM_SIGNAL_CHECK_REQUIRED_HITS = 2;
+const MAX_AUTO_RECOVERY_ATTEMPTS_PER_MINUTE = 2;
+/** Tras captura exitosa: no promover a `audio-ended` ni auto-recover (glitches loopback / transición). */
+const CAPTURE_WATCHDOG_GRACE_MS = 4000;
+/** Tras expandir overlay de sesión (además de la gracia de captura). */
+const CAPTURE_OVERLAY_EXPAND_GRACE_MS = 2500;
+/** Intervalos consecutivos con track primario `ended` antes de marcar `audio-ended` (fuera de gracia). */
+const AUDIO_ENDED_DEBOUNCE_TICKS = 2;
 const DEFAULT_GLOSSARY = 'Intel, TSMC, Taiwan, Apple, GPU, Anthropic, OpenAI, chips, servidores, inversión, burbuja, foundry, informática, startups, Silicon Valley, programación, productos, IA';
+const DEFAULT_AI_CONTEXT_PROMPT = 'Con base en lo último que se ha dicho, dame una ayuda breve, útil y contextual.';
+const SAVED_SESSIONS_STORAGE_KEY = 'openwhispr.savedSessions.v1';
 const SUSPICIOUS_PHRASES = [
   'nos vemos en el próximo video',
   'gracias por ver el video',
@@ -192,14 +290,118 @@ const SUSPICIOUS_PHRASES = [
   'suscríbete',
   'dale like',
 ];
+const VERBOSE_CAPTURE_STORAGE = 'openwhispr.verboseCaptureDebug';
+const TRANSCRIPTION_TRACE_STORAGE = 'openwhispr.transcriptionTrace';
 const DEBUG_PREFIX = '[audio-diagnostics]';
+const TRACE_PREFIX = '[transcription-trace]';
+const CRITICAL_CAPTURE_PREFIX = '[openwhispr-capture]';
+
+const viteEnv = import.meta as unknown as { env?: Record<string, string | undefined> };
+
+/** Default on; set `VITE_OPENWHISPR_AUTO_RECOVER_AUDIO=false` to disable auto reconnect on `audio-ended`. */
+function isAutoRecoverSystemAudioEnabled(): boolean {
+  return viteEnv.env?.VITE_OPENWHISPR_AUTO_RECOVER_AUDIO !== 'false';
+}
+
+function isLowRmsDebugEnabled(): boolean {
+  return viteEnv.env?.VITE_OPENWHISPR_LOW_RMS_DEBUG === 'true';
+}
+
+function isForceMicWindowsEnabled(): boolean {
+  return viteEnv.env?.VITE_OPENWHISPR_FORCE_MIC_WINDOWS === 'true';
+}
+
+type WhisperRmsProfile = 'mic' | 'system' | 'helper';
+
+function minWhisperRmsForProfile(profile: WhisperRmsProfile): number {
+  if (isLowRmsDebugEnabled()) return 0;
+  if (profile === 'mic') return MIN_WHISPER_RMS_MIC;
+  if (profile === 'helper') return MIN_WHISPER_RMS_HELPER;
+  return MIN_WHISPER_RMS_SYSTEM;
+}
+
+function whisperProfileForLiveSource(source: SourceKey): WhisperRmsProfile {
+  if (source === 'system') return 'system';
+  return 'mic';
+}
+
+/** Explicit opt-in/out for the display video sink. macOS also enables it by default below. */
+function isDisplayVideoSinkEnabled(): boolean {
+  return viteEnv.env?.VITE_OPENWHISPR_KEEP_DISPLAY_VIDEO_SINK === 'true';
+}
+
+/** macOS + display stream with a video track: always attach hidden sink unless explicitly disabled. */
+function shouldAttachDisplayVideoSink(stream: MediaStream, platform: NodeJS.Platform | 'unknown'): boolean {
+  if (viteEnv.env?.VITE_OPENWHISPR_KEEP_DISPLAY_VIDEO_SINK === 'false') return false;
+  if (isDisplayVideoSinkEnabled()) return true;
+  const darwin =
+    platform === 'darwin' ||
+    (typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/i.test(navigator.userAgent));
+  return darwin && stream.getVideoTracks().length > 0;
+}
+
+/** Diagnostic escape hatch: keep the session in compact chrome-only mode to isolate macOS loopback vs overlay expansion. */
+function shouldExpandSessionOverlay(): boolean {
+  return viteEnv.env?.VITE_OPENWHISPR_DISABLE_OVERLAY_EXPAND !== 'true';
+}
+
+function toSystemAudioStrategy(strategy: SystemCaptureStrategy): SystemAudioStrategy {
+  return strategy;
+}
+
+/** Opt-in: VITE_VERBOSE_CAPTURE_DEBUG=true or localStorage openwhispr.verboseCaptureDebug=1 (default off in dev). */
+function isVerboseCaptureDebug(): boolean {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const override = localStorage.getItem(VERBOSE_CAPTURE_STORAGE);
+      if (override === '0') return false;
+      if (override === '1') return true;
+    }
+  } catch {
+    /* ignore storage */
+  }
+  return viteEnv.env?.VITE_VERBOSE_CAPTURE_DEBUG === 'true';
+}
+
+/** Opt-in: VITE_TRANSCRIPTION_TRACE=true or localStorage openwhispr.transcriptionTrace=1 (default off). */
+function isTranscriptionTraceEnabled(): boolean {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const override = localStorage.getItem(TRANSCRIPTION_TRACE_STORAGE);
+      if (override === '0') return false;
+      if (override === '1') return true;
+    }
+  } catch {
+    /* ignore storage */
+  }
+  return viteEnv.env?.VITE_TRANSCRIPTION_TRACE === 'true';
+}
+
+function transcriptionTrace(scope: string, data?: unknown) {
+  if (!isTranscriptionTraceEnabled()) return;
+  if (data === undefined) {
+    console.log(`${TRACE_PREFIX} ${scope}`);
+    return;
+  }
+  console.log(`${TRACE_PREFIX} ${scope} ${safeJson(data)}`);
+}
 
 function debug(scope: string, data?: unknown) {
+  if (!isVerboseCaptureDebug()) return;
   if (data === undefined) {
     console.log(`${DEBUG_PREFIX} ${scope}`);
     return;
   }
   console.log(`${DEBUG_PREFIX} ${scope} ${safeJson(data)}`);
+}
+
+function captureDiag(scope: string, data?: unknown) {
+  if (!isVerboseCaptureDebug()) return;
+  if (data === undefined) {
+    console.log(`${CRITICAL_CAPTURE_PREFIX} ${scope}`);
+    return;
+  }
+  console.log(`${CRITICAL_CAPTURE_PREFIX} ${scope} ${safeJson(data)}`);
 }
 
 function safeJson(value: unknown) {
@@ -217,6 +419,39 @@ function describeStream(stream: MediaStream) {
     audioTracks: stream.getAudioTracks().map(describeTrack),
     videoTracks: stream.getVideoTracks().map(describeTrack),
   };
+}
+
+function formatTimer(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+  const seconds = Math.floor(totalSeconds % 60).toString().padStart(2, '0');
+  return `${minutes}:${seconds}`;
+}
+
+function loadSavedSessions(): DashboardSessionSummary[] {
+  try {
+    const raw = localStorage.getItem(SAVED_SESSIONS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as DashboardSessionSummary[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((session) => typeof session.id === 'string' && typeof session.createdAt === 'number')
+      .slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
+function persistSavedSessions(sessions: DashboardSessionSummary[]) {
+  localStorage.setItem(SAVED_SESSIONS_STORAGE_KEY, JSON.stringify(sessions.slice(0, 20)));
+}
+
+function createSessionTitle(createdAt: number) {
+  return `Meeting ${new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(createdAt))}`;
 }
 
 function mergeVadClosedSegments(a: VadClosedSegment, b: VadClosedSegment, sampleRate: number): VadClosedSegment {
@@ -415,19 +650,56 @@ function describeTrack(track: MediaStreamTrack) {
 }
 
 export default function App() {
+  const [appMode, setAppMode] = useState<AppMode>('dashboard');
+  const appModeRef = useRef<AppMode>(appMode);
+  appModeRef.current = appMode;
+  const [savedSessions, setSavedSessions] = useState<DashboardSessionSummary[]>(() => loadSavedSessions());
+  const [selectedSavedSessionId, setSelectedSavedSessionId] = useState<string | null>(null);
   const [platform, setPlatform] = useState<NodeJS.Platform | 'unknown'>('unknown');
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
   const [desktopSources, setDesktopSources] = useState<DesktopSource[]>([]);
   const [selectedMicId, setSelectedMicId] = useState<string>('');
-  const [selectedSystemInputId, setSelectedSystemInputId] = useState<string>('');
+  const [selectedSystemInputId, setSelectedSystemInputId] = useState<string>(() => loadSelectedSystemInputId());
+  const [systemCaptureStrategy, setSystemCaptureStrategy] = useState<SystemCaptureStrategy>(() => loadSystemCaptureStrategy());
   const [selectedOutputId, setSelectedOutputId] = useState<string>('');
   const [selectedDesktopSourceId, setSelectedDesktopSourceId] = useState<string>('');
   const [micPermission, setMicPermission] = useState<PermissionState | 'unknown'>('unknown');
   const [systemPermission, setSystemPermission] = useState<PermissionState | 'unknown'>('unknown');
   const [nativeMediaAccess, setNativeMediaAccess] = useState<{ microphone: string; screen: string } | null>(null);
+  const [systemAudioHelperCheck, setSystemAudioHelperCheck] = useState<{
+    ok: boolean;
+    path?: string;
+    error?: string;
+    running?: boolean;
+  } | null>(null);
+  const [coreAudioTapHelperCheck, setCoreAudioTapHelperCheck] = useState<{
+    ok: boolean;
+    path?: string;
+    error?: string;
+    running?: boolean;
+  } | null>(null);
   const [captureMode, setCaptureMode] = useState<CaptureMode | null>(null);
+  useEffect(() => {
+    debug('app-mode:state', {
+      appMode,
+      captureMode,
+      health: captureHealthRef.current,
+      timestampMs: Date.now(),
+      performanceMs: Number(performance.now().toFixed(1)),
+    });
+  }, [appMode, captureMode]);
+  /** Fuentes que realmente quedaron capturando (p. ej. modo `both` con solo mic). */
+  const [sessionAudioSources, setSessionAudioSources] = useState<{ mic: boolean; system: boolean }>({
+    mic: false,
+    system: false,
+  });
   const [meters, setMeters] = useState<Record<SourceKey, MeterState>>({
+    mic: initialMeter,
+    system: initialMeter,
+    mixed: initialMeter,
+  });
+  const metersRef = useRef<Record<SourceKey, MeterState>>({
     mic: initialMeter,
     system: initialMeter,
     mixed: initialMeter,
@@ -438,6 +710,30 @@ export default function App() {
   const [savedWav, setSavedWav] = useState<{ path: string; fileUrl: string } | null>(null);
   const [rawSegments, setRawSegments] = useState<TranscriptSegment[]>([]);
   const [cleanSegments, setCleanSegments] = useState<CleanSegment[]>([]);
+  const [refinedTranscript, setRefinedTranscript] = useState<RefinedTranscriptState>({
+    status: 'off',
+    text: '',
+    error: null,
+    model: null,
+    mode: 'off',
+    updatedAt: null,
+  });
+  const [transcriptView, setTranscriptView] = useState<'live' | 'refined'>('live');
+  const [chatMessages, setChatMessages] = useState<AssistantChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [setupWizardOpen, setSetupWizardOpen] = useState(() => !isOnboardingComplete());
+  const [sessionSettingsOpen, setSessionSettingsOpen] = useState(false);
+  const [settingsAudioScrollNonce, setSettingsAudioScrollNonce] = useState(0);
+  const [homeConfirmOpen, setHomeConfirmOpen] = useState(false);
+  const [capturePreference, setCapturePreference] = useState<CapturePreference>(() => loadCapturePreference());
+  const [overlayCollapsed, setOverlayCollapsed] = useState(false);
+  const [captureStartedAt, setCaptureStartedAt] = useState<number | null>(null);
+  const [captureElapsedSeconds, setCaptureElapsedSeconds] = useState(0);
+  const [captureHealthState, setCaptureHealthState] = useState<CaptureHealthState>(initialCaptureHealth);
   const [ledgerDebugGroups, setLedgerDebugGroups] = useState<LedgerDebugGroup[]>([]);
   const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptState>({
     committedText: '',
@@ -460,28 +756,72 @@ export default function App() {
   const [whisperLanguage, setWhisperLanguage] = useState<'es' | 'auto'>('es');
   const [allowWhisperContext, setAllowWhisperContext] = useState(false);
   const asrPipelineMode = whisperSetup?.pipelineMode ?? 'baseline-whisper';
-  const v2PipelineActive = asrPipelineMode === 'moonshine-qwen-v2';
+  const v2Mode = asrPipelineMode === 'moonshine-qwen-v2';
+  const baselineMode = !v2Mode;
+  const asrFinalEngine = whisperSetup?.finalEngine ?? 'whisper';
+  const refinementMode = whisperSetup?.refinementMode ?? 'off';
 
   const allowWhisperContextRef = useRef(allowWhisperContext);
   const whisperLanguageRef = useRef(whisperLanguage);
   const asrPipelineModeRef = useRef<AsrPipelineMode>(asrPipelineMode);
+  const refinementModeRef = useRef<TranscriptRefinementMode>(refinementMode);
   const moonshineConfiguredRef = useRef(Boolean(whisperSetup?.moonshineConfigured));
   allowWhisperContextRef.current = allowWhisperContext;
   whisperLanguageRef.current = whisperLanguage;
   asrPipelineModeRef.current = asrPipelineMode;
+  refinementModeRef.current = refinementMode;
   moonshineConfiguredRef.current = Boolean(whisperSetup?.moonshineConfigured);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamsRef = useRef<Partial<Record<SourceKey, MediaStream>>>({});
   const analysersRef = useRef<Partial<Record<SourceKey, AnalyserNode>>>({});
   const graphNodesRef = useRef<AudioNode[]>([]);
+  const displayVideoSinkRef = useRef<HTMLVideoElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const silenceStartRef = useRef<Partial<Record<SourceKey, number>>>({});
   const recordingChunksRef = useRef<Float32Array[]>([]);
   const recordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const recordingTimerRef = useRef<number | null>(null);
   const transcriptionProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const transcriptionFirstFrameLoggedRef = useRef(false);
+  const lastProcessorFrameAtRef = useRef<number | null>(null);
+  const lastProcessorRmsTraceAtRef = useRef(0);
+  const captureWatchdogRef = useRef<number | null>(null);
+  /** Hasta este timestamp (ms): no `audio-ended` definitivo ni auto-recovery por churn de loopback/overlay. */
+  const captureWatchdogGraceUntilRef = useRef(0);
+  const audioEndedWatchdogStreakRef = useRef(0);
+  const captureHealthRef = useRef<CaptureHealthState>(initialCaptureHealth);
+  const lastAudioRmsAtRef = useRef<number | null>(null);
+  const lastNonSilentAudioAtRef = useRef<number | null>(null);
+  const audioTrackEndedAtRef = useRef<number | null>(null);
+  const lastCaptureModeRef = useRef<CaptureMode | null>(null);
+  const recoveryInFlightRef = useRef(false);
+  const recoveryAttemptTimesRef = useRef<number[]>([]);
+  const captureStopInProgressRef = useRef(false);
+  const captureStartInProgressRef = useRef(false);
+  /** Serializes all capture teardown/start (stopCapture + startCapture) to avoid macOS loopback double-stop races. */
+  const captureLifecycleRef = useRef(Promise.resolve());
+  const captureGenerationRef = useRef(0);
+  const stoppedTracksRef = useRef<WeakSet<MediaStreamTrack>>(new WeakSet());
   const transcriptionSampleCursorRef = useRef<number>(0);
+  const enqueueTranscriptionRef = useRef<(request: TranscriptionWindow) => void>(() => undefined);
+  const nativeHelperChunkUnsubscribeRef = useRef<(() => void) | null>(null);
+  const nativeHelperStatusUnsubscribeRef = useRef<(() => void) | null>(null);
+  const nativeHelperActiveRef = useRef(false);
+  const nativeHelperLastChunkAtRef = useRef<number | null>(null);
+  const nativeHelperLastNonSilentAtRef = useRef<number | null>(null);
+  const nativeHelperLastRmsRef = useRef(0);
+  const nativeHelperLastPeakRef = useRef(0);
+  const nativeHelperSampleCursorRef = useRef(0);
+  const nativeHelperSegmentStartMsRef = useRef<number | null>(null);
+  const nativeHelperSamplesRef = useRef<Float32Array>(new Float32Array(0));
+  const coreTapChunkUnsubscribeRef = useRef<(() => void) | null>(null);
+  const coreTapStatusUnsubscribeRef = useRef<(() => void) | null>(null);
+  const coreTapActiveRef = useRef(false);
+  /** Last wall time we forced a VAD segment for mic-only debug (`VITE_OPENWHISPR_FORCE_MIC_WINDOWS`). */
+  const forceMicWindowLastAtRef = useRef(0);
+  /** Session uses native PCM helper as sole system path (no MediaStream transcription). */
+  const systemPcmHelperOnlyRef = useRef(false);
   const transcriptionBusyRef = useRef<boolean>(false);
   /** Cola unificada solo para `!SAFE_BASELINE`; en safeBaseline solo cola final (`pendingFinalWindowsRef`). */
   const pendingTranscriptionWindowsRef = useRef<TranscriptionWindow[]>([]);
@@ -501,6 +841,8 @@ export default function App() {
   const lastNotesTextLengthRef = useRef<number>(0);
   const polisherBusyRef = useRef<boolean>(false);
   const pendingPolishJobRef = useRef<PendingPolishJob | null>(null);
+  const pendingFinalRefinementSegmentsRef = useRef<RefinementSegmentInput[]>([]);
+  const finalRefinementBusyRef = useRef(false);
   const cleanContextRef = useRef<string>('');
   const lastClippingWarningAtRef = useRef<number>(0);
   /** Solo `preview` | `final` mientras transcribeBlock está en vuelo (para cancelar solo previews). */
@@ -526,6 +868,13 @@ export default function App() {
     v2DemoStoreRef.current = createTranscriptStore();
   }
   const [v2DemoTranscript, setV2DemoTranscript] = useState<TranscriptViewState>(() => v2DemoStoreRef.current!.getState());
+  const v2MainStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
+  if (v2MainStoreRef.current === null) {
+    v2MainStoreRef.current = createTranscriptStore();
+  }
+  const [v2MainTranscript, setV2MainTranscript] = useState<TranscriptViewState>(() => v2MainStoreRef.current!.getState());
+  const [v2MainFinalCount, setV2MainFinalCount] = useState(0);
+  const [v2MainLastSegmentId, setV2MainLastSegmentId] = useState<string | null>(null);
   const v2ShadowStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
   if (v2ShadowStoreRef.current === null) {
     v2ShadowStoreRef.current = createTranscriptStore();
@@ -559,12 +908,12 @@ export default function App() {
         ...prev,
         ...patch,
         previewQueueSize: SAFE_BASELINE && !isV2Pipeline ? 0 : p.filter((w) => w.mode === 'preview').length,
-        finalQueueSize: SAFE_BASELINE ? fq.length : p.filter((w) => w.mode === 'final').length,
+        finalQueueSize: SAFE_BASELINE && !isV2Pipeline ? fq.length : p.filter((w) => w.mode === 'final').length,
         previewDroppedCount: previewDroppedCountRef.current,
         previewReplacedCount: previewReplacedCountRef.current,
         finalAcceptedCount: finalAcceptedCountRef.current,
         previewBusyLive: SAFE_BASELINE && !isV2Pipeline ? false : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview'),
-        finalBusyLive: SAFE_BASELINE ? finalBusyRef.current : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final'),
+        finalBusyLive: SAFE_BASELINE && !isV2Pipeline ? finalBusyRef.current : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final'),
         previewBlockedByFinalCount: previewBlockedByFinalCountRef.current,
       };
     });
@@ -606,6 +955,164 @@ export default function App() {
     updateV2DemoTranscript(v2DemoStoreRef.current!.reset());
   }, [updateV2DemoTranscript]);
 
+  const resetV2Main = useCallback(() => {
+    setV2MainTranscript(v2MainStoreRef.current!.reset());
+    setV2MainFinalCount(0);
+    setV2MainLastSegmentId(null);
+  }, []);
+
+  const acceptV2MainPreview = useCallback((segment: TranscriptSegment, segmentId: string) => {
+    try {
+      const next = v2MainStoreRef.current!.acceptPreview({
+        segmentId,
+        text: segment.text,
+        engine: segment.engineUsed ?? 'moonshine',
+      });
+      setV2MainTranscript(next);
+      setV2MainLastSegmentId(segmentId);
+    } catch (error) {
+      debug('v2-main-preview:error', {
+        segmentId,
+        error: String(error),
+      });
+    }
+  }, []);
+
+  const acceptV2MainFinal = useCallback((segment: TranscriptSegment, segmentId: string) => {
+    try {
+      const next = v2MainStoreRef.current!.acceptFinal({
+        segmentId,
+        text: segment.text,
+        engine: segment.engineUsed ?? 'whisper-large-v3-turbo',
+      });
+      setV2MainTranscript(next);
+      setV2MainFinalCount((count) => count + 1);
+      setV2MainLastSegmentId(segmentId);
+    } catch (error) {
+      debug('v2-main-final:error', {
+        segmentId,
+        error: String(error),
+      });
+    }
+  }, []);
+
+  const runFinalRefinementBatch = useCallback((segments: RefinementSegmentInput[], mode: Exclude<TranscriptRefinementMode, 'off'>) => {
+    if (segments.length === 0) return;
+    if (!polisherSetup?.ok) {
+      setRefinedTranscript((current) => ({
+        ...current,
+        status: 'error',
+        mode,
+        model: whisperSetup?.refinerModel ?? polisherSetup?.model ?? null,
+        error: polisherSetup?.message ?? 'Refiner no disponible.',
+      }));
+      return;
+    }
+    finalRefinementBusyRef.current = true;
+    const batchId = `final-refine-${Date.now()}-${segments.at(-1)?.endMs ?? 0}`;
+    const prompt = buildFinalTranscriptRefinementPrompt({
+      batchId,
+      segments,
+      mode,
+      glossary,
+      context: cleanContextRef.current.slice(-1400),
+      language: 'Spanish',
+    });
+    setRefinedTranscript((current) => ({
+      ...current,
+      status: 'generating',
+      mode,
+      model: whisperSetup?.refinerModel ?? polisherSetup.model,
+      error: null,
+    }));
+    window.meetingAssistant.polisher.polishSegment({
+      batchId,
+      rawSegments: segments.map((segment) => ({
+        id: segment.id,
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+        text: segment.whisperText,
+        qwenText: segment.qwenText,
+        source: segment.source,
+        rms: 0.1,
+      })),
+      context: cleanContextRef.current.slice(-1400),
+      glossary,
+      refinementMode: mode,
+      prompt,
+    }).then((result) => {
+      if (!result.ok || !(result.text ?? '').trim()) {
+        setRefinedTranscript((current) => ({
+          ...current,
+          status: 'error',
+          error: result.error ?? 'Refiner sin texto.',
+          updatedAt: Date.now(),
+        }));
+        return;
+      }
+      const text = (result.text ?? '').trim();
+      cleanContextRef.current = `${cleanContextRef.current} ${text}`.trim();
+      setRefinedTranscript((current) => ({
+        status: 'ready',
+        text: `${current.text} ${text}`.trim(),
+        error: null,
+        model: whisperSetup?.refinerModel ?? polisherSetup.model,
+        mode,
+        updatedAt: Date.now(),
+      }));
+    }).catch((error) => {
+      setRefinedTranscript((current) => ({
+        ...current,
+        status: 'error',
+        error: String(error),
+        updatedAt: Date.now(),
+      }));
+    }).finally(() => {
+      finalRefinementBusyRef.current = false;
+      const pending = pendingFinalRefinementSegmentsRef.current;
+      if (shouldCreateRefinementBatch({
+        mode: refinementModeRef.current,
+        pendingSegmentCount: pending.length,
+        pendingDurationMs: pending.length > 0 ? pending[pending.length - 1].endMs - pending[0].startMs : 0,
+      })) {
+        pendingFinalRefinementSegmentsRef.current = [];
+        runFinalRefinementBatch(pending, refinementModeRef.current as Exclude<TranscriptRefinementMode, 'off'>);
+      }
+    });
+  }, [glossary, polisherSetup, whisperSetup?.refinerModel]);
+
+  const queueFinalRefinementSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
+    const mode = refinementModeRef.current;
+    if (mode === 'off') {
+      setRefinedTranscript((current) => current.status === 'off' ? current : { ...current, status: 'off', mode, error: null });
+      return;
+    }
+    const whisperText = (segment.whisperText ?? segment.text).trim();
+    if (!whisperText) return;
+    const nextSegment: RefinementSegmentInput = {
+      id: segmentId,
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      whisperText,
+      qwenText: mode === 'whisper-qwen' ? segment.qwenText : undefined,
+      source: segment.source,
+    };
+    pendingFinalRefinementSegmentsRef.current = [...pendingFinalRefinementSegmentsRef.current, nextSegment];
+    const pending = pendingFinalRefinementSegmentsRef.current;
+    const pendingDurationMs = pending[pending.length - 1].endMs - pending[0].startMs;
+    setRefinedTranscript((current) => ({
+      ...current,
+      status: current.text ? current.status : 'idle',
+      mode,
+      model: whisperSetup?.refinerModel ?? polisherSetup?.model ?? null,
+      error: null,
+    }));
+    if (finalRefinementBusyRef.current) return;
+    if (!shouldCreateRefinementBatch({ mode, pendingSegmentCount: pending.length, pendingDurationMs })) return;
+    pendingFinalRefinementSegmentsRef.current = [];
+    runFinalRefinementBatch(pending, mode);
+  }, [polisherSetup?.model, runFinalRefinementBatch, whisperSetup?.refinerModel]);
+
   const resetV2Shadow = useCallback(() => {
     setV2ShadowTranscript(v2ShadowStoreRef.current!.reset());
     setV2ShadowFinalCount(0);
@@ -631,33 +1138,33 @@ export default function App() {
     }
   }, []);
 
-  const acceptV2ShadowPreview = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    if (!V2_TRANSCRIPT_STORE_SHADOW) return;
-    try {
-      const next = v2ShadowStoreRef.current!.acceptPreview({
-        segmentId,
-        text: segment.text,
-        engine: 'moonshine',
-      });
-      setV2ShadowTranscript(next);
-      setV2ShadowLastSegmentId(segmentId);
-    } catch (error) {
-      debug('v2-shadow-preview:error', {
-        segmentId,
-        error: String(error),
-      });
-    }
-  }, []);
-
-
-
   const macSystemFallbackText =
     'Para capturar audio del sistema en este Mac cuando Electron loopback falla, instala BlackHole, enruta la salida del sistema hacia BlackHole y selecciona BlackHole como entrada virtual.';
 
   const virtualSystemInputs = useMemo(() => {
-    const virtualNames = ['blackhole', 'loopback', 'soundflower', 'vb-cable', 'stereo mix', 'what u hear'];
-    return inputDevices.filter((device) => virtualNames.some((name) => device.label.toLowerCase().includes(name)));
+    const candidates: SystemAudioDeviceCandidate[] = inputDevices.map((device) => ({
+      deviceId: device.deviceId,
+      groupId: device.groupId,
+      label: device.label || '',
+    }));
+    const allowedIds = new Set(filterVirtualSystemInputCandidates(candidates).map((c) => c.deviceId));
+    return inputDevices.filter((device) => allowedIds.has(device.deviceId));
   }, [inputDevices]);
+
+  useEffect(() => {
+    persistSelectedSystemInputId(selectedSystemInputId);
+  }, [selectedSystemInputId]);
+
+  useEffect(() => {
+    if (!selectedSystemInputId) return;
+    if (!virtualSystemInputs.some((d) => d.deviceId === selectedSystemInputId)) {
+      setSelectedSystemInputId('');
+    }
+  }, [selectedSystemInputId, virtualSystemInputs]);
+
+  useEffect(() => {
+    persistSystemCaptureStrategy(systemCaptureStrategy);
+  }, [systemCaptureStrategy]);
 
   const liveCleanText = useMemo(() => cleanSegments.map((segment) => segment.cleanText).join(' ').trim(), [cleanSegments]);
 
@@ -666,14 +1173,123 @@ export default function App() {
     setDiagnosticLog((current) => [`${new Date().toLocaleTimeString()} - ${message}`, ...current].slice(0, 50));
   }, []);
 
+  const patchCaptureHealth = useCallback((patch: Partial<CaptureHealthState>) => {
+    const next = { ...captureHealthRef.current, ...patch };
+    captureHealthRef.current = next;
+    setCaptureHealthState(next);
+  }, []);
+
+  const visibleTranscriptText = useMemo(() => {
+    if (v2Mode) return v2MainTranscript.visibleText.trim();
+    const baselineText = [visibleCommittedText, liveVisualDraft.visibleDraft].filter(Boolean).join(' ').trim();
+    return baselineText || liveTranscript.committedText.trim() || liveCleanText;
+  }, [liveCleanText, liveTranscript.committedText, liveVisualDraft.visibleDraft, v2MainTranscript.visibleText, v2Mode, visibleCommittedText]);
+
+  const askLocalAssistant = useCallback((questionOverride?: string) => {
+    const question = (questionOverride ?? chatInput).trim() || DEFAULT_AI_CONTEXT_PROMPT;
+    if (!question || chatBusy) return;
+    const userMessage: AssistantChatMessage = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      text: question,
+    };
+    setChatMessages((current) => [...current, userMessage]);
+    setChatInput('');
+    setAiPanelOpen(true);
+    setChatError(null);
+    setChatBusy(true);
+    const startedAt = Date.now();
+    debug('assistant:ask-start', {
+      recording: Boolean(captureMode),
+      captureHealth: captureHealthRef.current.captureHealth,
+    });
+    const rawContext = [
+      visibleTranscriptText,
+      rawSegments.slice(-10).map((segment) => segment.whisperText ?? segment.text).join(' '),
+    ].join(' ').replace(/\s+/g, ' ').trim().slice(-8000);
+    window.meetingAssistant.assistant.ask({
+      question,
+      transcriptContext: rawContext,
+      refinedContext: refinedTranscript.text.slice(-4000),
+    }).then((result) => {
+      if (!result.ok || !(result.text ?? '').trim()) {
+        debug('assistant:ask-error', {
+          durationMs: Date.now() - startedAt,
+          recording: Boolean(captureMode),
+          captureHealth: captureHealthRef.current.captureHealth,
+          error: result.error ?? 'empty-response',
+        });
+        setChatError(result.error ?? 'No pude responder con la IA local. Revisa que Gemma esté disponible.');
+        return;
+      }
+      setChatMessages((current) => [...current, {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        text: (result.text ?? '').trim(),
+      }]);
+      debug('assistant:ask-end', {
+        durationMs: Date.now() - startedAt,
+        recording: Boolean(captureMode),
+        captureHealth: captureHealthRef.current.captureHealth,
+      });
+    }).catch(() => {
+      debug('assistant:ask-error', {
+        durationMs: Date.now() - startedAt,
+        recording: Boolean(captureMode),
+        captureHealth: captureHealthRef.current.captureHealth,
+      });
+      setChatError('No pude responder con la IA local. Revisa que Gemma esté disponible.');
+    }).finally(() => {
+      setChatBusy(false);
+    });
+  }, [captureMode, chatBusy, chatInput, rawSegments, refinedTranscript.text, visibleTranscriptText]);
+
+  const showToast = useCallback((message: string) => {
+    setToastMessage(message);
+  }, []);
+
+  const copyTranscript = useCallback(async () => {
+    const useRefined = transcriptView === 'refined' && Boolean(refinedTranscript.text.trim());
+    const text = useRefined ? refinedTranscript.text.trim() : visibleTranscriptText.trim();
+    if (!text) {
+      showToast('Aún no hay transcripción');
+      return;
+    }
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      showToast('Transcripción copiada al portapapeles');
+    } else {
+      debug('clipboard:transcript-failed');
+      showToast('No se pudo copiar. Prueba de nuevo tras hacer clic en la ventana.');
+    }
+  }, [refinedTranscript.text, showToast, transcriptView, visibleTranscriptText]);
+
+  const copyLastAiResponse = useCallback(async () => {
+    const lastResponse = [...chatMessages].reverse().find((message) => message.role === 'assistant')?.text.trim();
+    if (!lastResponse) return;
+    const ok = await copyToClipboard(lastResponse);
+    if (!ok) {
+      debug('clipboard:ai-error');
+    }
+  }, [chatMessages]);
+
+  const clearSavedSessions = useCallback(() => {
+    setSavedSessions([]);
+    setSelectedSavedSessionId(null);
+  }, []);
+
   const patchMeter = useCallback((source: SourceKey, patch: Partial<MeterState>) => {
-    setMeters((current) => ({
-      ...current,
-      [source]: {
-        ...current[source],
-        ...patch,
-      },
-    }));
+    setMeters((current) => {
+      const next = {
+        ...current,
+        [source]: {
+          ...current[source],
+          ...patch,
+        },
+      };
+      metersRef.current = next;
+      return next;
+    });
   }, []);
 
   const onLiveTranscriptScroll = useCallback(() => {
@@ -716,12 +1332,26 @@ export default function App() {
       const { sources, error } = await window.meetingAssistant.audio.getDesktopSources();
       debug('desktop-sources', { sources, error });
       setDesktopSources(sources);
-      setSelectedDesktopSourceId((current) => current || sources[0]?.id || '');
+      setSelectedDesktopSourceId((current) => {
+        if (current?.startsWith('screen:')) return current;
+        return sources.find((source) => source.id.startsWith('screen:'))?.id || '';
+      });
       if (error) addLog(error);
     } catch (error) {
       addLog(`system: no se pudieron listar fuentes de pantalla (${String(error)})`);
     }
   }, [addLog]);
+
+  useEffect(() => {
+    if (selectedDesktopSourceId && !selectedDesktopSourceId.startsWith('screen:')) {
+      debug('display-capture:renderer-ignore-window-source', { selectedDesktopSourceId });
+      window.meetingAssistant.displayCapture.setPreferredSourceId(null);
+      return;
+    }
+    window.meetingAssistant.displayCapture.setPreferredSourceId(
+      selectedDesktopSourceId.trim() ? selectedDesktopSourceId : null,
+    );
+  }, [selectedDesktopSourceId]);
 
   const refreshPermissions = useCallback(async () => {
     try {
@@ -739,6 +1369,30 @@ export default function App() {
     }
   }, []);
 
+  const refreshSystemAudioHelperCheck = useCallback(async () => {
+    try {
+      const result = await window.meetingAssistant.systemAudioHelper.check();
+      setSystemAudioHelperCheck(result);
+      debug('system-audio-helper:check-ui', result);
+    } catch (error) {
+      const result = { ok: false, error: String(error) };
+      setSystemAudioHelperCheck(result);
+      debug('system-audio-helper:check-ui-error', String(error));
+    }
+  }, []);
+
+  const refreshCoreAudioTapHelperCheck = useCallback(async () => {
+    try {
+      const result = await window.meetingAssistant.coreAudioTapHelper.check();
+      setCoreAudioTapHelperCheck(result);
+      debug('core-audio-tap-helper:check-ui', result);
+    } catch (error) {
+      const result = { ok: false, error: String(error) };
+      setCoreAudioTapHelperCheck(result);
+      debug('core-audio-tap-helper:check-ui-error', String(error));
+    }
+  }, []);
+
   useEffect(() => {
     void window.meetingAssistant.platform.getInfo().then((info) => {
       debug('platform-info', info);
@@ -751,6 +1405,8 @@ export default function App() {
     void refreshDevices();
     void refreshDesktopSources();
     void refreshPermissions();
+    void refreshSystemAudioHelperCheck();
+    void refreshCoreAudioTapHelperCheck();
     void window.meetingAssistant.transcription.checkSetup().then((setup) => {
       setWhisperSetup(setup);
       debug('transcription:setup', setup);
@@ -764,7 +1420,7 @@ export default function App() {
 
     navigator.mediaDevices?.addEventListener?.('devicechange', refreshDevices);
     return () => navigator.mediaDevices?.removeEventListener?.('devicechange', refreshDevices);
-  }, [addLog, refreshDesktopSources, refreshDevices, refreshPermissions]);
+  }, [addLog, refreshCoreAudioTapHelperCheck, refreshDesktopSources, refreshDevices, refreshPermissions, refreshSystemAudioHelperCheck]);
 
   useLayoutEffect(() => {
     if (!SAFE_BASELINE) return;
@@ -805,6 +1461,70 @@ export default function App() {
   }, [liveTranscript]);
 
   useEffect(() => {
+    captureHealthRef.current = captureHealthState;
+  }, [captureHealthState]);
+
+  useEffect(() => {
+    persistSavedSessions(savedSessions);
+  }, [savedSessions]);
+
+  useLayoutEffect(() => {
+    const t = readDashboardTheme();
+    const html = document.documentElement;
+    if (t === 'dark') {
+      html.setAttribute('data-dashboard-theme', 'dark');
+      html.style.colorScheme = 'dark';
+    } else {
+      html.removeAttribute('data-dashboard-theme');
+      html.style.colorScheme = 'light';
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    const body = document.body;
+    const overlayCapable = window.meetingAssistant.overlayWindow;
+
+    if (appMode === 'session' && overlayCapable) {
+      root.classList.remove('openwhispr-dashboard-window');
+      body.classList.remove('openwhispr-dashboard-window');
+      root.classList.add('openwhispr-overlay-window');
+      body.classList.add('openwhispr-overlay-window');
+      window.meetingAssistant.windowControls.setAppMode('session');
+      transcriptionTrace('layout:session', {
+        htmlClass: root.className,
+        overlayCapable,
+      });
+    } else {
+      root.classList.remove('openwhispr-overlay-window');
+      body.classList.remove('openwhispr-overlay-window');
+      if (overlayCapable) {
+        root.classList.add('openwhispr-dashboard-window');
+        body.classList.add('openwhispr-dashboard-window');
+        window.meetingAssistant.overlay.setPointerPassthrough(false);
+        window.meetingAssistant.windowControls.setAppMode('dashboard');
+      } else {
+        root.classList.remove('openwhispr-dashboard-window');
+        body.classList.remove('openwhispr-dashboard-window');
+      }
+      transcriptionTrace('layout:dashboard', { appMode, overlayCapable });
+    }
+  }, [appMode]);
+
+  useEffect(() => {
+    if (!captureMode || captureStartedAt === null) {
+      setCaptureElapsedSeconds(0);
+      return undefined;
+    }
+    const updateElapsed = () => {
+      setCaptureElapsedSeconds(Math.max(0, Math.floor((Date.now() - captureStartedAt) / 1000)));
+    };
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(id);
+  }, [captureMode, captureStartedAt]);
+
+  useEffect(() => {
     if (SAFE_BASELINE) return;
     if (finalRevealQueue.length === 0) return;
     const id = window.setInterval(() => {
@@ -839,22 +1559,85 @@ export default function App() {
     return audioContextRef.current;
   }, []);
 
+  async function ensureRunningAudioContext() {
+    const ctx = ensureAudioContext();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+        debug('audio-context:resumed', { state: ctx.state });
+      } catch (error) {
+        debug('audio-context:resume-error', String(error));
+      }
+    }
+    return ctx;
+  }
+
   const connectAnalyser = useCallback(
     (stream: MediaStream, source: SourceKey) => {
       const audioContext = ensureAudioContext();
       debug(`stream:${source}:connect-analyser`, describeStream(stream));
       stream.getTracks().forEach((track) => {
+        const trackPayload = (eventName: string) => ({
+          eventName,
+          source,
+          appMode: appModeRef.current,
+          captureMode: lastCaptureModeRef.current,
+          generation: captureGenerationRef.current,
+          stopInProgress: captureStopInProgressRef.current,
+          recoveryInFlight: recoveryInFlightRef.current,
+          timestampMs: Date.now(),
+          performanceMs: Number(performance.now().toFixed(1)),
+          stream: describeStream(stream),
+          track: describeTrack(track),
+        });
         track.addEventListener('mute', () => {
-          debug(`track:${source}:mute`, describeTrack(track));
-          addLog(`${source}: track ${track.kind} muted (${track.label || track.id})`);
+          const payload = trackPayload('mute');
+          debug(`track:${source}:mute`, payload);
+          if (track.kind === 'audio') {
+            patchCaptureHealth({
+              audioTrackMuted: true,
+              audioTrackReadyState: track.readyState,
+              lastCheckedAt: Date.now(),
+              message: 'El audio está silenciado.',
+            });
+            addLog(`${source}: audio muted (${track.label || track.id})`);
+          }
         });
         track.addEventListener('unmute', () => {
-          debug(`track:${source}:unmute`, describeTrack(track));
-          addLog(`${source}: track ${track.kind} unmuted (${track.label || track.id})`);
+          const payload = trackPayload('unmute');
+          debug(`track:${source}:unmute`, payload);
+          if (track.kind === 'audio') {
+            patchCaptureHealth({
+              audioTrackMuted: false,
+              audioTrackReadyState: track.readyState,
+              captureHealth: ['failed', 'recovering', 'audio-ended'].includes(captureHealthRef.current.captureHealth)
+                ? captureHealthRef.current.captureHealth
+                : 'ok',
+              lastCheckedAt: Date.now(),
+              message: captureHealthRef.current.captureHealth === 'audio-ended' ? captureHealthRef.current.message : null,
+            });
+            addLog(`${source}: audio activo (${track.label || track.id})`);
+          }
         });
         track.addEventListener('ended', () => {
-          debug(`track:${source}:ended`, describeTrack(track));
-          addLog(`${source}: track ${track.kind} ended (${track.label || track.id})`);
+          const payload = trackPayload('ended');
+          captureDiag(`track:${source}:ended`, payload);
+          debug(`track:${source}:ended`, payload);
+          if (track.kind === 'audio') {
+            const endedAt = Date.now();
+            audioTrackEndedAtRef.current = endedAt;
+            const inGrace = endedAt < captureWatchdogGraceUntilRef.current;
+            patchCaptureHealth({
+              audioTrackReadyState: 'ended',
+              audioTrackMuted: track.muted,
+              audioTrackEndedAt: endedAt,
+              lastCheckedAt: endedAt,
+              message: inGrace || captureStopInProgressRef.current
+                ? captureHealthRef.current.message
+                : 'El audio parece haberse interrumpido; verificando la mezcla antes de reconectar.',
+            });
+            addLog(`${source}: audio finalizó (${track.label || track.id})`);
+          }
         });
       });
       const mediaSource = audioContext.createMediaStreamSource(stream);
@@ -869,7 +1652,7 @@ export default function App() {
         error: null,
       });
     },
-    [addLog, ensureAudioContext, patchMeter],
+    [addLog, ensureAudioContext, patchCaptureHealth, patchMeter],
   );
 
   const startMeterLoop = useCallback(() => {
@@ -877,6 +1660,7 @@ export default function App() {
     let lastMeterDebugAt = 0;
     const tick = () => {
       const now = performance.now();
+      const nowWall = Date.now();
       const meterSnapshot: Partial<Record<SourceKey, { rms: number; peak: number; silence: boolean; clipping: boolean }>> = {};
       (['mic', 'system', 'mixed'] as SourceKey[]).forEach((source) => {
         const analyser = analysersRef.current[source];
@@ -894,6 +1678,18 @@ export default function App() {
 
         const rms = Math.sqrt(sum / data.length);
         const clipping = peak >= CLIPPING_THRESHOLD;
+        const mode = lastCaptureModeRef.current;
+        const watchesSystem = mode === 'system' || mode === 'both';
+        const isPrimaryAudioMeter =
+          source === liveTranscriptionSourceRef.current ||
+          (watchesSystem && source === 'system') ||
+          (mode === 'mic' && source === 'mic');
+        if (isPrimaryAudioMeter) {
+          lastAudioRmsAtRef.current = nowWall;
+          if (rms >= SILENCE_THRESHOLD) {
+            lastNonSilentAudioAtRef.current = nowWall;
+          }
+        }
         const previousSilenceStart = silenceStartRef.current[source];
         if (rms < SILENCE_THRESHOLD) {
           silenceStartRef.current[source] = previousSilenceStart ?? now;
@@ -931,16 +1727,173 @@ export default function App() {
     animationFrameRef.current = null;
   }, []);
 
-  const stopCapture = useCallback(async () => {
+  function runCaptureLifecycle<T>(label: string, task: () => Promise<T>): Promise<T> {
+    const run = captureLifecycleRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        debug(`capture:lifecycle:${label}:start`);
+        try {
+          const result = await task();
+          debug(`capture:lifecycle:${label}:end`);
+          return result;
+        } catch (error) {
+          debug(`capture:lifecycle:${label}:error`, String(error));
+          throw error;
+        }
+      });
+    captureLifecycleRef.current = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  function stopTrackOnce(track: MediaStreamTrack, source: string) {
+    if (stoppedTracksRef.current.has(track)) return;
+    stoppedTracksRef.current.add(track);
+    if (track.readyState === 'ended') {
+      debug(`track:${source}:stop-skip-ended`, describeTrack(track));
+      return;
+    }
+    try {
+      track.stop();
+      debug(`track:${source}:stopped`, describeTrack(track));
+    } catch (error) {
+      debug(`track:${source}:stop-error`, String(error));
+    }
+  }
+
+  async function closeAudioContextOnce() {
+    const ctx = audioContextRef.current;
+    audioContextRef.current = null;
+    if (!ctx || ctx.state === 'closed') return;
+    try {
+      await ctx.close();
+      debug('audio-context:closed');
+    } catch (error) {
+      debug('audio-context:close-error', String(error));
+    }
+  }
+
+  function detachDisplayVideoSink(reason: string) {
+    const sink = displayVideoSinkRef.current;
+    displayVideoSinkRef.current = null;
+    if (!sink) return;
+    try {
+      sink.pause();
+      sink.srcObject = null;
+      sink.remove();
+      debug('capture:system:video-sink:detached', { reason });
+    } catch (error) {
+      debug('capture:system:video-sink:detach-error', { reason, error: String(error) });
+    }
+  }
+
+  function attachDisplayVideoSink(stream: MediaStream) {
+    if (!shouldAttachDisplayVideoSink(stream, platform)) return;
+    const videoTracks = stream.getVideoTracks();
+    if (videoTracks.length === 0) {
+      debug('capture:system:video-sink:skip', { reason: 'no-video-track', stream: describeStream(stream) });
+      return;
+    }
+    detachDisplayVideoSink('replace');
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.style.position = 'fixed';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    video.style.pointerEvents = 'none';
+    video.style.left = '-10px';
+    video.style.top = '-10px';
+    video.srcObject = stream;
+    document.body.appendChild(video);
+    displayVideoSinkRef.current = video;
+    void video.play()
+      .then(() => {
+        captureDiag('capture:system:video-sink:playing', { stream: describeStream(stream) });
+        debug('capture:system:video-sink:playing', { stream: describeStream(stream) });
+      })
+      .catch((error) => {
+        captureDiag('capture:system:video-sink:play-error', String(error));
+        debug('capture:system:video-sink:play-error', String(error));
+      });
+  }
+
+  const stopCaptureCore = useCallback(async (options?: { preserveSession?: boolean; reason?: string }) => {
+    const startedAt = Date.now();
+    captureStopInProgressRef.current = true;
+    const stopPayload = {
+      reason: options?.reason ?? null,
+      preserveSession: Boolean(options?.preserveSession),
+      generation: captureGenerationRef.current,
+      streams: Object.fromEntries(
+        Object.entries(streamsRef.current).map(([source, stream]) => [source, stream ? describeStream(stream) : null]),
+      ),
+    };
+    captureDiag('capture:stop-core:start', stopPayload);
+    debug('capture:stop-core:start', stopPayload);
+    if (nativeHelperActiveRef.current || nativeHelperChunkUnsubscribeRef.current || nativeHelperStatusUnsubscribeRef.current) {
+      nativeHelperChunkUnsubscribeRef.current?.();
+      nativeHelperChunkUnsubscribeRef.current = null;
+      nativeHelperStatusUnsubscribeRef.current?.();
+      nativeHelperStatusUnsubscribeRef.current = null;
+      nativeHelperActiveRef.current = false;
+      nativeHelperSamplesRef.current = new Float32Array(0);
+      nativeHelperSampleCursorRef.current = 0;
+      nativeHelperSegmentStartMsRef.current = null;
+      nativeHelperLastChunkAtRef.current = null;
+      nativeHelperLastNonSilentAtRef.current = null;
+      nativeHelperLastRmsRef.current = 0;
+      nativeHelperLastPeakRef.current = 0;
+      void window.meetingAssistant.systemAudioHelper.stop().catch((error) => {
+        debug('system-audio-helper:stop-error', String(error));
+      });
+    }
+    if (coreTapActiveRef.current || coreTapChunkUnsubscribeRef.current || coreTapStatusUnsubscribeRef.current) {
+      coreTapChunkUnsubscribeRef.current?.();
+      coreTapChunkUnsubscribeRef.current = null;
+      coreTapStatusUnsubscribeRef.current?.();
+      coreTapStatusUnsubscribeRef.current = null;
+      coreTapActiveRef.current = false;
+      nativeHelperSamplesRef.current = new Float32Array(0);
+      nativeHelperSampleCursorRef.current = 0;
+      nativeHelperSegmentStartMsRef.current = null;
+      nativeHelperLastChunkAtRef.current = null;
+      nativeHelperLastNonSilentAtRef.current = null;
+      nativeHelperLastRmsRef.current = 0;
+      nativeHelperLastPeakRef.current = 0;
+      void window.meetingAssistant.coreAudioTapHelper.stop().catch((error) => {
+        debug('core-audio-tap-helper:stop-error', String(error));
+      });
+    }
     stopMeterLoop();
+    if (captureWatchdogRef.current !== null) {
+      window.clearInterval(captureWatchdogRef.current);
+      captureWatchdogRef.current = null;
+    }
 
     if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
     recordingTimerRef.current = null;
-    recordingProcessorRef.current?.disconnect();
+
+    try {
+      recordingProcessorRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
     recordingProcessorRef.current = null;
-    transcriptionProcessorRef.current?.disconnect();
+
+    try {
+      transcriptionProcessorRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
     transcriptionProcessorRef.current = null;
     transcriptionSampleCursorRef.current = 0;
+    lastProcessorFrameAtRef.current = null;
+    lastProcessorRmsTraceAtRef.current = 0;
     transcriptionBusyRef.current = false;
     transcriptionInFlightModeRef.current = null;
     pendingTranscriptionWindowsRef.current = [];
@@ -954,200 +1907,870 @@ export default function App() {
     previewSegmentOpenedAtRef.current.clear();
     previewFirstSuccessRef.current.clear();
     finalizedSegmentIdsRef.current.clear();
-    setVisibleCommittedText(liveTranscriptRef.current.committedText);
-    setFinalRevealQueue([]);
-    setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
+    if (!options?.preserveSession) {
+      setVisibleCommittedText(liveTranscriptRef.current.committedText);
+      setFinalRevealQueue([]);
+      setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
+    }
     pendingPolishJobRef.current = null;
     void window.meetingAssistant.transcription.cancelPending().catch((error) => {
       debug('transcription:cancel:error', String(error));
     });
     setRecording(false);
+    lastCaptureModeRef.current = null;
+    if (!options?.preserveSession) {
+      setCaptureStartedAt(null);
+      setCaptureElapsedSeconds(0);
+    }
 
-    graphNodesRef.current.forEach((node) => node.disconnect());
-    graphNodesRef.current = [];
-    Object.values(streamsRef.current).forEach((stream) => {
-      stream?.getTracks().forEach((track) => track.stop());
-    });
+    const streams = streamsRef.current;
     streamsRef.current = {};
     analysersRef.current = {};
     silenceStartRef.current = {};
+    detachDisplayVideoSink('stop-capture-core');
 
-    await audioContextRef.current?.close();
-    audioContextRef.current = null;
+    Object.entries(streams).forEach(([source, stream]) => {
+      stream?.getTracks().forEach((track) => stopTrackOnce(track, source));
+    });
+
+    graphNodesRef.current.forEach((node) => {
+      try {
+        node.disconnect();
+      } catch {
+        /* noop */
+      }
+    });
+    graphNodesRef.current = [];
+
+    await closeAudioContextOnce();
 
     setCaptureMode(null);
-    setMeters({
+    const stoppedMeters: Record<SourceKey, MeterState> = {
       mic: { ...initialMeter, status: 'stopped' },
       system: { ...initialMeter, status: 'stopped' },
       mixed: { ...initialMeter, status: 'stopped' },
-    });
-    addLog('captura detenida');
-  }, [addLog, stopMeterLoop]);
+    };
+    metersRef.current = stoppedMeters;
+    setMeters(stoppedMeters);
+    setSessionAudioSources({ mic: false, system: false });
+    systemPcmHelperOnlyRef.current = false;
+    captureWatchdogGraceUntilRef.current = 0;
+    audioEndedWatchdogStreakRef.current = 0;
+    if (!options?.preserveSession) {
+      patchCaptureHealth({ ...initialCaptureHealth, lastCheckedAt: Date.now() });
+      lastAudioRmsAtRef.current = null;
+      lastNonSilentAudioAtRef.current = null;
+      audioTrackEndedAtRef.current = null;
+      recoveryAttemptTimesRef.current = [];
+    }
+    addLog(options?.reason ?? 'captura detenida');
+    const stopEndPayload = {
+      reason: options?.reason ?? null,
+      durationMs: Date.now() - startedAt,
+      preserveSession: Boolean(options?.preserveSession),
+    };
+    captureDiag('capture:stop-core:end', stopEndPayload);
+    debug('capture:stop-core:end', stopEndPayload);
+    captureStopInProgressRef.current = false;
+  }, [addLog, patchCaptureHealth, stopMeterLoop]);
+
+  const stopCapture = useCallback(
+    (options?: { preserveSession?: boolean; reason?: string }) =>
+      runCaptureLifecycle('stop', () => stopCaptureCore(options)),
+    [stopCaptureCore],
+  );
 
   const captureMic = useCallback(async () => {
     patchMeter('mic', { status: 'requesting_permission', error: null });
-    try {
-      const constraints = {
-        audio: {
-          deviceId: selectedMicId ? { exact: selectedMicId } : undefined,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false,
-        },
-        video: false,
-      } satisfies MediaStreamConstraints;
-      debug('capture:mic:constraints', constraints);
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      debug('capture:mic:stream', describeStream(stream));
-      if (stream.getAudioTracks().length === 0) {
-        throw new Error('empty-stream: no audio tracks returned for microphone');
-      }
-      streamsRef.current.mic = stream;
-      connectAnalyser(stream, 'mic');
-      await refreshDevices();
-      await refreshPermissions();
-      addLog('mic: captura iniciada');
-      return stream;
-    } catch (error) {
-      const message = `permission/device: no se pudo capturar micrófono (${String(error)})`;
-      patchMeter('mic', { status: 'failed', error: message });
-      addLog(message);
-      throw error;
+
+    const knownMic = selectedMicId
+      ? inputDevices.find((device) => device.kind === 'audioinput' && device.deviceId === selectedMicId)
+      : undefined;
+
+    const makeConstraints = (deviceId?: string): MediaStreamConstraints => ({
+      audio: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+      },
+      video: false,
+    });
+
+    const attempts: Array<{ label: string; constraints: MediaStreamConstraints }> = [];
+
+    if (knownMic?.deviceId) {
+      attempts.push({ label: 'selected-exact', constraints: makeConstraints(knownMic.deviceId) });
+    } else if (selectedMicId) {
+      debug('capture:mic:selected-device-missing', { selectedMicId });
     }
-  }, [addLog, connectAnalyser, patchMeter, refreshDevices, refreshPermissions, selectedMicId]);
+
+    attempts.push({ label: 'default', constraints: makeConstraints() });
+
+    let lastError: unknown = null;
+
+    for (const attempt of attempts) {
+      try {
+        debug('capture:mic:constraints', { attempt: attempt.label, constraints: attempt.constraints });
+        const stream = await navigator.mediaDevices.getUserMedia(attempt.constraints);
+        debug('capture:mic:stream', describeStream(stream));
+        if (stream.getAudioTracks().length === 0) {
+          throw new Error('empty-stream: no audio tracks returned for microphone');
+        }
+        streamsRef.current.mic = stream;
+        connectAnalyser(stream, 'mic');
+        await refreshDevices();
+        await refreshPermissions();
+        addLog(
+          attempt.label === 'default'
+            ? 'mic: captura iniciada con micrófono por defecto'
+            : 'mic: captura iniciada',
+        );
+        return stream;
+      } catch (error) {
+        lastError = error;
+        debug('capture:mic:attempt-error', { attempt: attempt.label, error: String(error) });
+      }
+    }
+
+    const message = `permission/device: no se pudo capturar micrófono (${String(lastError)})`;
+    patchMeter('mic', { status: 'failed', error: message });
+    addLog(message);
+    throw lastError;
+  }, [addLog, connectAnalyser, inputDevices, patchMeter, refreshDevices, refreshPermissions, selectedMicId]);
+
+  const resetNativeHelperBuffers = useCallback(() => {
+    nativeHelperSamplesRef.current = new Float32Array(0);
+    nativeHelperSampleCursorRef.current = 0;
+    nativeHelperSegmentStartMsRef.current = null;
+    nativeHelperLastChunkAtRef.current = null;
+    nativeHelperLastNonSilentAtRef.current = null;
+    nativeHelperLastRmsRef.current = 0;
+    nativeHelperLastPeakRef.current = 0;
+  }, []);
+
+  const stopNativeSystemAudioHelper = useCallback((reason: string) => {
+    nativeHelperChunkUnsubscribeRef.current?.();
+    nativeHelperChunkUnsubscribeRef.current = null;
+    nativeHelperStatusUnsubscribeRef.current?.();
+    nativeHelperStatusUnsubscribeRef.current = null;
+    nativeHelperActiveRef.current = false;
+    resetNativeHelperBuffers();
+    captureDiag('system-audio-helper:stop-request', { reason, generation: captureGenerationRef.current });
+    debug('system-audio-helper:stop-request', { reason, generation: captureGenerationRef.current });
+    void window.meetingAssistant.systemAudioHelper.stop().catch((error) => {
+      debug('system-audio-helper:stop-error', String(error));
+    });
+  }, [resetNativeHelperBuffers]);
+
+  const stopCoreAudioTapHelper = useCallback((reason: string) => {
+    coreTapChunkUnsubscribeRef.current?.();
+    coreTapChunkUnsubscribeRef.current = null;
+    coreTapStatusUnsubscribeRef.current?.();
+    coreTapStatusUnsubscribeRef.current = null;
+    coreTapActiveRef.current = false;
+    resetNativeHelperBuffers();
+    captureDiag('core-audio-tap-helper:stop-request', { reason, generation: captureGenerationRef.current });
+    debug('core-audio-tap-helper:stop-request', { reason, generation: captureGenerationRef.current });
+    void window.meetingAssistant.coreAudioTapHelper.stop().catch((error) => {
+      debug('core-audio-tap-helper:stop-error', String(error));
+    });
+  }, [resetNativeHelperBuffers]);
+
+  const flushNativeHelperWindow = useCallback((force = false) => {
+    const sampleRate = 48_000;
+    const minSamples = Math.floor((MIN_FINAL_AUDIO_MS / 1000) * sampleRate);
+    const targetSamples = Math.floor(6 * sampleRate);
+    const samples = nativeHelperSamplesRef.current;
+    if (samples.length === 0) return;
+    if (!force && samples.length < targetSamples) return;
+    if (samples.length < minSamples) return;
+
+    const windowSamples = force ? samples : samples.slice(0, targetSamples);
+    nativeHelperSamplesRef.current = force ? new Float32Array(0) : samples.slice(targetSamples);
+
+    const startMs = nativeHelperSegmentStartMsRef.current
+      ?? ((Math.max(0, nativeHelperSampleCursorRef.current - windowSamples.length) / sampleRate) * 1000);
+    const endMs = startMs + samplesDurationMs(windowSamples, sampleRate);
+    nativeHelperSegmentStartMsRef.current = force
+      ? null
+      : endMs;
+
+    const { rms, peak, gain, processedSamples } = prepareWhisperSamples(windowSamples, { lowRmsDebug: isLowRmsDebugEnabled() });
+    const durationMs = samplesDurationMs(processedSamples, sampleRate);
+    const minRms = minWhisperRmsForProfile('helper');
+    if (isLowRmsDebugEnabled()) {
+      debug('system-audio-helper:window-rms-debug', { rms, peak, minRms, durationMs, sampleCount: processedSamples.length });
+    }
+    if (rms < minRms || durationMs < MIN_FINAL_AUDIO_MS) {
+      debug('system-audio-helper:skip-low-quality-window', {
+        rms,
+        peak,
+        durationMs,
+        sampleCount: processedSamples.length,
+      });
+      return;
+    }
+
+    const segmentId = `system-helper-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const blockId = `final-${segmentId}-${Math.round(startMs)}-${Math.round(endMs)}`;
+    captureDiag('system-audio-helper:transcription-window', {
+      blockId,
+      segmentId,
+      startMs: Math.round(startMs),
+      endMs: Math.round(endMs),
+      rms,
+      peak,
+      whisperGain: gain,
+      sampleCount: processedSamples.length,
+      generation: captureGenerationRef.current,
+    });
+    debug('system-audio-helper:transcription-window', {
+      blockId,
+      segmentId,
+      rms,
+      peak,
+      sampleCount: processedSamples.length,
+    });
+    enqueueTranscriptionRef.current({
+      blockId,
+      wavBytes: encodeWav(processedSamples, sampleRate),
+      startMs: Math.round(startMs),
+      endMs: Math.round(endMs),
+      rms,
+      peak,
+      source: 'system',
+      sampleRate,
+      sampleCount: processedSamples.length,
+      possibleClipping: peak >= CLIPPING_THRESHOLD,
+      whisperGain: gain,
+      mode: 'final',
+      segmentId,
+      verbatimOnly: true,
+      language: 'es',
+    });
+  }, []);
+
+  const handleNativeHelperChunk = useCallback((payload: {
+    sequence: number;
+    version: number;
+    sampleRate: number;
+    channels: number;
+    frameCount: number;
+    pcm: Uint8Array;
+  }) => {
+    const bytes = payload.pcm.byteOffset % 4 === 0
+      ? payload.pcm
+      : payload.pcm.slice();
+    const floatCount = Math.floor(bytes.byteLength / 4);
+    const stereo = new Float32Array(bytes.buffer, bytes.byteOffset, floatCount);
+    const channels = Math.max(1, payload.channels || 2);
+    const frameCount = Math.min(payload.frameCount, Math.floor(stereo.length / channels));
+    const mono = new Float32Array(frameCount);
+    let sumSq = 0;
+    let peak = 0;
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      let value = 0;
+      const base = frame * channels;
+      for (let channel = 0; channel < channels; channel += 1) {
+        value += stereo[base + channel] ?? 0;
+      }
+      value /= channels;
+      mono[frame] = value;
+      const absolute = Math.abs(value);
+      if (absolute > peak) peak = absolute;
+      sumSq += value * value;
+    }
+    const rms = frameCount > 0 ? Math.sqrt(sumSq / frameCount) : 0;
+    const now = Date.now();
+    nativeHelperLastChunkAtRef.current = now;
+    nativeHelperLastRmsRef.current = rms;
+    nativeHelperLastPeakRef.current = peak;
+    lastAudioRmsAtRef.current = now;
+    if (rms >= SYSTEM_SIGNAL_CHECK_RMS || peak >= SYSTEM_SIGNAL_CHECK_PEAK) {
+      nativeHelperLastNonSilentAtRef.current = now;
+      lastNonSilentAudioAtRef.current = now;
+    }
+
+    patchMeter('system', {
+      rms,
+      peak,
+      sampleRate: payload.sampleRate,
+      status: rms < SILENCE_THRESHOLD ? 'silence' : 'capturing',
+      silence: rms < SILENCE_THRESHOLD,
+      clipping: peak >= CLIPPING_THRESHOLD,
+      error: null,
+    });
+
+    if (isVerboseCaptureDebug() && (payload.sequence === 1 || payload.sequence % 100 === 0)) {
+      captureDiag('system-audio-helper:chunk', {
+        sequence: payload.sequence,
+        sampleRate: payload.sampleRate,
+        channels,
+        frameCount,
+        rms: Number(rms.toFixed(6)),
+        peak: Number(peak.toFixed(6)),
+        generation: captureGenerationRef.current,
+      });
+    }
+
+    const current = nativeHelperSamplesRef.current;
+    const next = new Float32Array(current.length + mono.length);
+    next.set(current, 0);
+    next.set(mono, current.length);
+    if (nativeHelperSegmentStartMsRef.current === null) {
+      nativeHelperSegmentStartMsRef.current = (nativeHelperSampleCursorRef.current / (payload.sampleRate || 48_000)) * 1000;
+    }
+    nativeHelperSampleCursorRef.current += mono.length;
+    nativeHelperSamplesRef.current = next;
+    flushNativeHelperWindow(false);
+  }, [flushNativeHelperWindow, patchMeter]);
+
+  const startNativeSystemAudioHelper = useCallback(async (reason: string) => {
+    stopCoreAudioTapHelper('before-native-helper');
+    const check = await window.meetingAssistant.systemAudioHelper.check();
+    captureDiag('system-audio-helper:check', { reason, ...check, generation: captureGenerationRef.current });
+    debug('system-audio-helper:check', { reason, ...check });
+    if (!check.ok) {
+      throw new SystemAudioEngineError(check.error ?? 'Native macOS helper is not built.', {
+        status: 'needs-helper',
+        providerId: 'native-helper',
+        setupHint: check.error ?? 'Native macOS helper is not built. Run npm run build:macos-audio-helper.',
+      });
+    }
+
+    resetNativeHelperBuffers();
+    nativeHelperChunkUnsubscribeRef.current?.();
+    nativeHelperStatusUnsubscribeRef.current?.();
+    nativeHelperChunkUnsubscribeRef.current = window.meetingAssistant.systemAudioHelper.onChunk(handleNativeHelperChunk);
+    nativeHelperStatusUnsubscribeRef.current = window.meetingAssistant.systemAudioHelper.onStatus((status) => {
+      captureDiag('system-audio-helper:status', { ...status, generation: captureGenerationRef.current });
+      debug('system-audio-helper:status', status);
+      if (status.status === 'failed') {
+        patchMeter('system', {
+          status: 'failed',
+          error: status.error ?? 'Native macOS helper stopped unexpectedly.',
+        });
+      }
+    });
+
+    const started = await window.meetingAssistant.systemAudioHelper.start();
+    captureDiag('system-audio-helper:start-result', { reason, ...started, generation: captureGenerationRef.current });
+    debug('system-audio-helper:start-result', { reason, ...started });
+    if (!started.ok) {
+      nativeHelperChunkUnsubscribeRef.current?.();
+      nativeHelperChunkUnsubscribeRef.current = null;
+      nativeHelperStatusUnsubscribeRef.current?.();
+      nativeHelperStatusUnsubscribeRef.current = null;
+      resetNativeHelperBuffers();
+      void window.meetingAssistant.systemAudioHelper.stop().catch(() => undefined);
+      throw new SystemAudioEngineError(started.error ?? 'Native macOS helper failed to start.', {
+        status: 'failed',
+        providerId: 'native-helper',
+        setupHint:
+          started.error
+          ?? 'ScreenCaptureKit startCapture timed out. Grant Screen Recording permission to Terminal/Electron/Openwhispr and restart.',
+      });
+    }
+
+    nativeHelperActiveRef.current = true;
+    patchMeter('system', { status: 'requesting_permission', error: null, rms: 0, peak: 0 });
+    addLog('system: captura nativa macOS iniciada (PCM vía helper; sin MediaStream)');
+    return {
+      providerId: 'native-helper' as const,
+      kind: 'pcm-helper' as const,
+    };
+  }, [
+    addLog,
+    handleNativeHelperChunk,
+    patchMeter,
+    resetNativeHelperBuffers,
+    stopCoreAudioTapHelper,
+  ]);
+
+  const startCoreAudioTapHelper = useCallback(async (reason: string) => {
+    stopNativeSystemAudioHelper('before-coreaudio-tap-helper');
+    const check = await window.meetingAssistant.coreAudioTapHelper.check();
+    captureDiag('core-audio-tap-helper:check', { reason, ...check, generation: captureGenerationRef.current });
+    debug('core-audio-tap-helper:check', { reason, ...check });
+    if (!check.ok) {
+      throw new SystemAudioEngineError(check.error ?? 'CoreAudio Tap helper is not built.', {
+        status: 'needs-helper',
+        providerId: 'coreaudio-tap',
+        setupHint: check.error ?? 'Run npm run build:macos-coreaudio-tap-helper.',
+      });
+    }
+
+    resetNativeHelperBuffers();
+    coreTapChunkUnsubscribeRef.current?.();
+    coreTapStatusUnsubscribeRef.current?.();
+    coreTapChunkUnsubscribeRef.current = window.meetingAssistant.coreAudioTapHelper.onChunk(handleNativeHelperChunk);
+    coreTapStatusUnsubscribeRef.current = window.meetingAssistant.coreAudioTapHelper.onStatus((status) => {
+      captureDiag('core-audio-tap-helper:status', { ...status, generation: captureGenerationRef.current });
+      debug('core-audio-tap-helper:status', status);
+      if (status.status === 'failed') {
+        patchMeter('system', {
+          status: 'failed',
+          error: status.error ?? 'CoreAudio Tap helper stopped unexpectedly.',
+        });
+      }
+    });
+
+    const started = await window.meetingAssistant.coreAudioTapHelper.start();
+    captureDiag('core-audio-tap-helper:start-result', { reason, ...started, generation: captureGenerationRef.current });
+    debug('core-audio-tap-helper:start-result', { reason, ...started });
+    if (!started.ok) {
+      coreTapChunkUnsubscribeRef.current?.();
+      coreTapChunkUnsubscribeRef.current = null;
+      coreTapStatusUnsubscribeRef.current?.();
+      coreTapStatusUnsubscribeRef.current = null;
+      resetNativeHelperBuffers();
+      void window.meetingAssistant.coreAudioTapHelper.stop().catch(() => undefined);
+      throw new SystemAudioEngineError(started.error ?? 'CoreAudio Tap helper failed to start.', {
+        status: 'failed',
+        providerId: 'coreaudio-tap',
+        setupHint: started.error ?? 'CoreAudio Tap helper failed to start.',
+      });
+    }
+
+    coreTapActiveRef.current = true;
+    patchMeter('system', { status: 'requesting_permission', error: null, rms: 0, peak: 0 });
+    addLog('system: CoreAudio Tap helper iniciado (PCM vía helper; sin MediaStream)');
+    return {
+      providerId: 'coreaudio-tap' as const,
+      kind: 'pcm-helper' as const,
+    };
+  }, [
+    addLog,
+    handleNativeHelperChunk,
+    patchMeter,
+    resetNativeHelperBuffers,
+    stopNativeSystemAudioHelper,
+  ]);
+
+  const waitForUsableAudioSignal = useCallback(async (
+    source: SourceKey,
+    timeoutMs = SYSTEM_SIGNAL_CHECK_TIMEOUT_MS,
+    providerId?: SystemAudioProviderId,
+  ): Promise<boolean> => {
+    const startedAt = Date.now();
+    let hitCount = 0;
+    const startPayload = {
+      source,
+      timeoutMs,
+      rmsThreshold: SYSTEM_SIGNAL_CHECK_RMS,
+      peakThreshold: SYSTEM_SIGNAL_CHECK_PEAK,
+      requiredHits: SYSTEM_SIGNAL_CHECK_REQUIRED_HITS,
+      generation: captureGenerationRef.current,
+      providerId: providerId ?? null,
+    };
+    captureDiag('capture:system:signal-check:start', startPayload);
+    debug('capture:system:signal-check:start', startPayload);
+
+    return new Promise((resolve) => {
+      const sample = () => {
+        if (providerId === 'native-helper' || providerId === 'coreaudio-tap') {
+          const elapsedMs = Date.now() - startedAt;
+          const rms = nativeHelperLastRmsRef.current;
+          const peak = nativeHelperLastPeakRef.current;
+          const hasChunk = nativeHelperLastChunkAtRef.current !== null && nativeHelperLastChunkAtRef.current >= startedAt;
+          const usable = Boolean(nativeHelperLastNonSilentAtRef.current && nativeHelperLastNonSilentAtRef.current >= startedAt);
+          if (usable) hitCount += 1;
+          else hitCount = 0;
+          const samplePayload = {
+            source,
+            providerId,
+            elapsedMs,
+            rms: Number(rms.toFixed(6)),
+            peak: Number(peak.toFixed(6)),
+            usable,
+            hasChunk,
+            hitCount,
+            generation: captureGenerationRef.current,
+          };
+          captureDiag('capture:system:signal-check:sample', samplePayload);
+          debug('capture:system:signal-check:sample', samplePayload);
+          if (hitCount >= SYSTEM_SIGNAL_CHECK_REQUIRED_HITS) {
+            captureDiag('capture:system:signal-check:ok', samplePayload);
+            debug('capture:system:signal-check:ok', samplePayload);
+            resolve(true);
+            return;
+          }
+          if (elapsedMs >= timeoutMs) {
+            const failedPayload = {
+              ...samplePayload,
+              reason: hasChunk ? 'timeout-silent-pcm-helper' : 'timeout-no-pcm-helper-chunks',
+            };
+            captureDiag('capture:system:signal-check:failed', failedPayload);
+            debug('capture:system:signal-check:failed', failedPayload);
+            resolve(false);
+            return;
+          }
+          window.setTimeout(sample, SYSTEM_SIGNAL_CHECK_INTERVAL_MS);
+          return;
+        }
+
+        const analyser = analysersRef.current[source];
+        const elapsedMs = Date.now() - startedAt;
+        if (!analyser) {
+          const failedPayload = {
+            source,
+            providerId: providerId ?? null,
+            elapsedMs,
+            reason: 'missing-analyser',
+            generation: captureGenerationRef.current,
+          };
+          captureDiag('capture:system:signal-check:failed', failedPayload);
+          debug('capture:system:signal-check:failed', failedPayload);
+          resolve(false);
+          return;
+        }
+
+        const data = new Float32Array(analyser.fftSize);
+        analyser.getFloatTimeDomainData(data);
+        let sum = 0;
+        let peak = 0;
+        for (let i = 0; i < data.length; i += 1) {
+          const value = data[i];
+          const absolute = Math.abs(value);
+          sum += value * value;
+          peak = Math.max(peak, absolute);
+        }
+        const rms = Math.sqrt(sum / data.length);
+        const usable = rms >= SYSTEM_SIGNAL_CHECK_RMS || peak >= SYSTEM_SIGNAL_CHECK_PEAK;
+        if (usable) hitCount += 1;
+        else hitCount = 0;
+
+        const samplePayload = {
+          source,
+          providerId: providerId ?? null,
+          elapsedMs,
+          rms: Number(rms.toFixed(6)),
+          peak: Number(peak.toFixed(6)),
+          usable,
+          hitCount,
+          generation: captureGenerationRef.current,
+        };
+        captureDiag('capture:system:signal-check:sample', samplePayload);
+        debug('capture:system:signal-check:sample', samplePayload);
+
+        if (hitCount >= SYSTEM_SIGNAL_CHECK_REQUIRED_HITS) {
+          const okPayload = {
+            source,
+            providerId: providerId ?? null,
+            elapsedMs,
+            rms: Number(rms.toFixed(6)),
+            peak: Number(peak.toFixed(6)),
+            hitCount,
+            generation: captureGenerationRef.current,
+          };
+          captureDiag('capture:system:signal-check:ok', okPayload);
+          debug('capture:system:signal-check:ok', okPayload);
+          resolve(true);
+          return;
+        }
+
+        if (elapsedMs >= timeoutMs) {
+          const failedPayload = {
+            source,
+            providerId: providerId ?? null,
+            elapsedMs,
+            rms: Number(rms.toFixed(6)),
+            peak: Number(peak.toFixed(6)),
+            hitCount,
+            reason: 'timeout-silent',
+            generation: captureGenerationRef.current,
+          };
+          captureDiag('capture:system:signal-check:failed', failedPayload);
+          debug('capture:system:signal-check:failed', failedPayload);
+          resolve(false);
+          return;
+        }
+
+        window.setTimeout(sample, SYSTEM_SIGNAL_CHECK_INTERVAL_MS);
+      };
+
+      sample();
+    });
+  }, []);
+
+  const captureSystemFromVirtualInput = useCallback(async (deviceId: string, reason: string) => {
+    if (!deviceId) {
+      throw new Error('missing-virtual-input: select a BlackHole/Loopback virtual input in Audio settings');
+    }
+
+    const virtualConstraints = {
+      audio: {
+        deviceId: { exact: deviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      video: false,
+    } satisfies MediaStreamConstraints;
+    const device = inputDevices.find((input) => input.deviceId === deviceId);
+    const candidate: SystemAudioDeviceCandidate = {
+      deviceId,
+      groupId: device?.groupId,
+      label: device?.label ?? '',
+    };
+    if (filterVirtualSystemInputCandidates([candidate]).length === 0) {
+      throw new Error(
+        'invalid-virtual-input: select a BlackHole / Loopback / VB-CABLE style virtual input in Settings (not Default / headset)',
+      );
+    }
+    const beforePayload = {
+      reason,
+      deviceId,
+      deviceLabel: device?.label ?? null,
+      constraints: virtualConstraints,
+      generation: captureGenerationRef.current,
+    };
+    captureDiag('capture:system:virtual:before', beforePayload);
+    debug('capture:system:virtual:before', beforePayload);
+
+    const stream = await navigator.mediaDevices.getUserMedia(virtualConstraints);
+    const streamPayload = {
+      reason,
+      deviceId,
+      deviceLabel: device?.label ?? null,
+      stream: describeStream(stream),
+      generation: captureGenerationRef.current,
+    };
+    captureDiag('capture:system:virtual:stream', streamPayload);
+    debug('capture:system:virtual:stream', streamPayload);
+    if (stream.getAudioTracks().length === 0) {
+      throw new Error('empty-stream: virtual system input returned no audio track');
+    }
+    streamsRef.current.system = stream;
+    connectAnalyser(stream, 'system');
+    addLog(`system: captura iniciada desde entrada virtual${device?.label ? ` (${device.label})` : ''}`);
+    return stream;
+  }, [addLog, connectAnalyser, inputDevices]);
 
   const captureSystem = useCallback(async () => {
     patchMeter('system', { status: 'requesting_permission', error: null });
-
-    try {
-      // Only request systemAudio; avoid false/AGC flags here — on macOS Electron loopback,
-      // extra processing constraints have caused silent meters / early track end when combined
-      // with Web Audio routing (see audioContext.resume + pull-only destination below).
+    const virtualCandidates = filterVirtualSystemInputCandidates(
+      inputDevices.map((device) => ({
+        deviceId: device.deviceId,
+        groupId: device.groupId,
+        label: device.label ?? '',
+      })),
+    );
+    const stopProviderStream = (stream: MediaStream, reason: string) => {
+      captureDiag('system-audio:provider:stop', { reason, stream: describeStream(stream) });
+      debug('system-audio:provider:stop', { reason, stream: describeStream(stream) });
+      if (streamsRef.current.system === stream) {
+        delete streamsRef.current.system;
+      }
+      stream.getTracks().forEach((track) => stopTrackOnce(track, `system-${reason}`));
+      detachDisplayVideoSink(reason);
+      if (analysersRef.current.system) {
+        delete analysersRef.current.system;
+      }
+      patchMeter('system', {
+        status: 'stopped',
+        rms: 0,
+        peak: 0,
+        silence: false,
+        error: null,
+      });
+    };
+    const captureElectronLoopback = async () => {
       const displayConstraints = {
         audio: {
           systemAudio: 'include',
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false,
         },
         video: true,
-      } as DisplayMediaStreamOptions;
-      debug('capture:system:getDisplayMedia:constraints', displayConstraints);
+      } as DisplayMediaStreamOptions & {
+        audio: MediaTrackConstraints & {
+          systemAudio: 'include';
+          suppressLocalAudioPlayback: false;
+        };
+      };
+      const getDisplayBeforePayload = {
+        constraints: displayConstraints,
+        appMode: appModeRef.current,
+        captureMode: lastCaptureModeRef.current,
+        generation: captureGenerationRef.current,
+        selectedDesktopSourceId,
+        timestampMs: Date.now(),
+        performanceMs: Number(performance.now().toFixed(1)),
+      };
+      captureDiag('capture:system:getDisplayMedia:before', getDisplayBeforePayload);
+      debug('capture:system:getDisplayMedia:before', getDisplayBeforePayload);
       const displayStream = await navigator.mediaDevices.getDisplayMedia(displayConstraints);
-      debug('capture:system:getDisplayMedia:stream', describeStream(displayStream));
+      const getDisplayStreamPayload = {
+        appMode: appModeRef.current,
+        captureMode: lastCaptureModeRef.current,
+        generation: captureGenerationRef.current,
+        timestampMs: Date.now(),
+        performanceMs: Number(performance.now().toFixed(1)),
+        stream: describeStream(displayStream),
+      };
+      captureDiag('capture:system:getDisplayMedia:stream', getDisplayStreamPayload);
+      debug('capture:system:getDisplayMedia:stream', getDisplayStreamPayload);
       if (displayStream.getAudioTracks().length === 0) {
         throw new Error('empty-stream: display capture returned no audio track');
       }
       streamsRef.current.system = displayStream;
+      attachDisplayVideoSink(displayStream);
       connectAnalyser(displayStream, 'system');
       await refreshPermissions();
       addLog('system: captura display/system iniciada');
-      return displayStream;
-    } catch (firstError) {
-      debug('capture:system:getDisplayMedia:error', String(firstError));
-      try {
-        const legacyConstraints = {
-          audio: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: selectedDesktopSourceId || undefined,
-            },
+      return {
+        providerId: 'electron-loopback' as const,
+        kind: 'media-stream' as const,
+        stream: displayStream,
+      };
+    };
+    try {
+      const result = await runSystemAudioEngine({
+        platform: platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : platform === 'linux' ? 'linux' : 'unknown',
+        strategy: toSystemAudioStrategy(systemCaptureStrategy),
+        selectedOutputDevice: selectedOutputId,
+        selectedMicDevice: selectedMicId,
+        selectedSystemInputId,
+        virtualInputCandidates: virtualCandidates,
+        providers: {
+          electronLoopback: {
+            id: 'electron-loopback',
+            available: () => true,
+            start: () => captureElectronLoopback(),
           },
-          video: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: selectedDesktopSourceId || undefined,
-              maxWidth: 1,
-              maxHeight: 1,
+          nativeHelper: {
+            id: 'native-helper',
+            available: async () => {
+              const check = await window.meetingAssistant.systemAudioHelper.check();
+              return Boolean(check.ok);
             },
+            start: (reason) => startNativeSystemAudioHelper(reason),
           },
-        } as MediaStreamConstraints;
-        debug('capture:system:legacy:constraints', legacyConstraints);
-        const legacyStream = await (navigator.mediaDevices as MediaDevices).getUserMedia(legacyConstraints);
-        debug('capture:system:legacy:stream', describeStream(legacyStream));
-        if (legacyStream.getAudioTracks().length === 0) {
-          throw new Error('empty-stream: legacy desktop capture returned no audio track');
-        }
-        streamsRef.current.system = legacyStream;
-        connectAnalyser(legacyStream, 'system');
-        addLog('system: captura legacy chromeMediaSource iniciada');
-        return legacyStream;
-      } catch (secondError) {
-        debug('capture:system:legacy:error', String(secondError));
-        const fallbackDeviceId = selectedSystemInputId || virtualSystemInputs[0]?.deviceId || '';
-        debug('capture:system:virtual:candidate', {
-          selectedSystemInputId,
-          virtualSystemInputs: virtualSystemInputs.map((device) => ({
-            deviceId: device.deviceId,
-            groupId: device.groupId,
-            label: device.label,
-          })),
-          fallbackDeviceId,
-        });
-        if (fallbackDeviceId) {
-          try {
-            const virtualConstraints = {
-              audio: {
-                deviceId: { exact: fallbackDeviceId },
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-              },
-              video: false,
-            } satisfies MediaStreamConstraints;
-            debug('capture:system:virtual:constraints', virtualConstraints);
-            const fallbackStream = await navigator.mediaDevices.getUserMedia(virtualConstraints);
-            debug('capture:system:virtual:stream', describeStream(fallbackStream));
-            if (fallbackStream.getAudioTracks().length === 0) {
-              throw new Error('empty-stream: virtual system input returned no audio track');
-            }
-            streamsRef.current.system = fallbackStream;
-            connectAnalyser(fallbackStream, 'system');
-            addLog('system: captura iniciada desde entrada virtual seleccionada');
-            return fallbackStream;
-          } catch (thirdError) {
-            debug('capture:system:virtual:error', String(thirdError));
-            const fallback = platform === 'darwin' ? ` ${macSystemFallbackText}` : '';
-            const message = `system: falló captura de audio del sistema (${String(firstError)} / ${String(secondError)} / ${String(thirdError)}).${fallback}`;
-            patchMeter('system', { status: 'failed', error: message });
-            addLog(message);
-            throw thirdError;
-          }
-        }
+          coreAudioTap: {
+            id: 'coreaudio-tap',
+            available: async () => {
+              const check = await window.meetingAssistant.coreAudioTapHelper.check();
+              return Boolean(check.ok);
+            },
+            start: (reason) => startCoreAudioTapHelper(reason),
+          },
+          virtualInput: (deviceId) => ({
+            id: 'virtual-input',
+            available: () => Boolean(deviceId),
+            start: async (reason) => ({
+              providerId: 'virtual-input' as const,
+              kind: 'media-stream' as const,
+              stream: await captureSystemFromVirtualInput(deviceId, reason),
+            }),
+          }),
+        },
+        probeUsableAudio: (_stream, providerId) => waitForUsableAudioSignal('system', SYSTEM_SIGNAL_CHECK_TIMEOUT_MS, providerId),
+        stopPcmHelper: (providerId, reason) => {
+          if (providerId === 'native-helper') stopNativeSystemAudioHelper(reason);
+          else stopCoreAudioTapHelper(reason);
+        },
+        probePcmHelper: (providerId) => waitForUsableAudioSignal('system', SYSTEM_SIGNAL_CHECK_TIMEOUT_MS, providerId),
+        stopStream: stopProviderStream,
+        log: (eventName, payload) => {
+          captureDiag(eventName, {
+            ...payload,
+            generation: captureGenerationRef.current,
+          });
+          debug(eventName, payload);
+        },
+      });
 
-        const fallback = platform === 'darwin' ? ` ${macSystemFallbackText}` : '';
-        const virtualHint = platform === 'darwin' && virtualSystemInputs.length === 0
-          ? ' No se detectó BlackHole/Loopback/VB-CABLE como entrada.'
-          : '';
-        const message = `system: falló captura de audio del sistema (${String(firstError)} / ${String(secondError)}).${virtualHint}${fallback}`;
-        patchMeter('system', { status: 'failed', error: message });
-        addLog(message);
-        throw secondError;
+      if (result.kind === 'pcm-helper') {
+        if (result.providerId === 'coreaudio-tap') {
+          addLog('system: CoreAudio Tap helper validado con señal audible (PCM)');
+        } else {
+          addLog('system: ScreenCaptureKit helper validado con señal audible (PCM; experimental)');
+        }
+      } else if (result.providerId === 'electron-loopback') {
+        addLog('system: loopback nativo validado con señal audible');
+      } else if (result.providerId === 'virtual-input') {
+        addLog('system: entrada virtual validada con señal audible');
       }
+
+      return result;
+    } catch (error) {
+      const engineError = error instanceof SystemAudioEngineError ? error : null;
+      const fallback = platform === 'darwin' ? ` ${macSystemFallbackText}` : '';
+      const message = engineError?.setupHint
+        ? engineError.setupHint
+        : `system: falló captura de audio del sistema (${String(error)}).${fallback}`;
+      patchMeter('system', { status: 'failed', error: message });
+      patchCaptureHealth({
+        captureHealth: engineError?.status === 'silent' ? 'silent' : 'failed',
+        audioTrackReadyState: engineError?.status === 'silent' ? 'live' : captureHealthRef.current.audioTrackReadyState,
+        lastCheckedAt: Date.now(),
+        message,
+      });
+      addLog(`system: ${message}`);
+      throw error;
     }
   }, [
     addLog,
+    captureSystemFromVirtualInput,
     connectAnalyser,
+    inputDevices,
     macSystemFallbackText,
     patchMeter,
+    patchCaptureHealth,
     platform,
     refreshPermissions,
     selectedDesktopSourceId,
+    selectedMicId,
+    selectedOutputId,
     selectedSystemInputId,
-    virtualSystemInputs,
+    startCoreAudioTapHelper,
+    startNativeSystemAudioHelper,
+    stopCoreAudioTapHelper,
+    stopNativeSystemAudioHelper,
+    systemCaptureStrategy,
+    waitForUsableAudioSignal,
   ]);
 
   const buildMixedStream = useCallback((sources: MediaStream[]) => {
     const audioContext = ensureAudioContext();
     const destination = audioContext.createMediaStreamDestination();
-    sources.forEach((stream) => {
+    const mixedBuildPayload = {
+      sourceCount: sources.length,
+      generation: captureGenerationRef.current,
+      audioContextState: audioContext.state,
+      inputStreams: sources.map(describeStream),
+    };
+    captureDiag('capture:mixed:build:start', mixedBuildPayload);
+    debug('capture:mixed:build:start', mixedBuildPayload);
+    sources.forEach((stream, index) => {
       const source = audioContext.createMediaStreamSource(stream);
       const gain = audioContext.createGain();
-      gain.gain.value = SAFE_BASELINE
-        ? (sources.length > 1 ? 0.35 : 0.7)
-        : Math.max(0.45, 1 / Math.max(1, sources.length));
+      if (SAFE_BASELINE) {
+        if (sources.length > 1) {
+          /* Slightly louder loopback/display: it often sits below mic in RMS on macOS. */
+          gain.gain.value = index === 0 ? 0.32 : 0.58;
+        } else {
+          gain.gain.value = 0.7;
+        }
+      } else {
+        gain.gain.value = Math.max(0.45, 1 / Math.max(1, sources.length));
+      }
       source.connect(gain);
       gain.connect(destination);
       graphNodesRef.current.push(source, gain);
+      debug('capture:mixed:input-connected', {
+        index,
+        gain: gain.gain.value,
+        stream: describeStream(stream),
+      });
     });
     streamsRef.current.mixed = destination.stream;
+    captureDiag('capture:mixed:destination', describeStream(destination.stream));
+    debug('capture:mixed:destination', describeStream(destination.stream));
     connectAnalyser(destination.stream, 'mixed');
     return destination.stream;
   }, [connectAnalyser, ensureAudioContext]);
@@ -1298,7 +2921,7 @@ export default function App() {
     }
     setRawSegments((current) => [...current, { ...segment, asrMode: 'preview' as const, segmentId }].slice(-120));
     if (isV2Pipeline) {
-      acceptV2ShadowPreview(segment, segmentId);
+      acceptV2MainPreview(segment, segmentId);
       return;
     }
     const snapshot = candidateLedgerRef.current.addCandidate({
@@ -1317,13 +2940,14 @@ export default function App() {
       language: segment.language,
     });
     applyLedgerSnapshot(snapshot, segment.source);
-  }, [acceptV2ShadowPreview, applyLedgerSnapshot, showRawDebug]);
+  }, [acceptV2MainPreview, applyLedgerSnapshot, showRawDebug]);
 
   const handleFinalSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
     const finalText = segment.text.trim();
     if (!finalText) return;
+    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
 
-    if (SAFE_BASELINE) {
+    if (SAFE_BASELINE && !isV2Pipeline) {
       const pk = segment.peak ?? 0;
       if (pk >= CLIPPING_THRESHOLD) {
         finalizedSegmentIdsRef.current.add(segmentId);
@@ -1393,6 +3017,29 @@ export default function App() {
       return;
     }
 
+    if (isV2Pipeline) {
+      setRawSegments((current) => [...current, {
+        ...segment,
+        status: 'final' as const,
+        asrMode: 'final' as const,
+        segmentId,
+        stabilizationReason: segment.fallbackUsed ? 'v2-final-fallback' : 'v2-final',
+      }].slice(-120));
+      finalizedSegmentIdsRef.current.add(segmentId);
+      acceptV2MainFinal(segment, segmentId);
+      queueFinalRefinementSegment(segment, segmentId);
+      finalAcceptedCountRef.current += 1;
+      syncAsrLiveStats({});
+      debug('transcription:v2-final-accepted', {
+        segmentId,
+        engineUsed: segment.engineUsed ?? segment.modelName,
+        fallbackUsed: segment.fallbackUsed ?? false,
+        fallbackReason: segment.fallbackReason,
+        modelName: segment.modelName,
+      });
+      return;
+    }
+
     setRawSegments((current) => [...current, {
       ...segment,
       status: 'final' as const,
@@ -1416,7 +3063,7 @@ export default function App() {
       language: segment.language,
     });
     applyLedgerSnapshot(snapshot, segment.source);
-  }, [acceptV2ShadowFinal, addLog, applyLedgerSnapshot, syncAsrLiveStats]);
+  }, [acceptV2MainFinal, acceptV2ShadowFinal, addLog, applyLedgerSnapshot, queueFinalRefinementSegment, syncAsrLiveStats]);
 
 
   /** safeBaseline: whisper.cpp transcribe cada segmento VAD cerrado (solo final). */
@@ -1569,6 +3216,14 @@ export default function App() {
         segmentId: request.segmentId,
         asrMode: 'final',
         language: effectiveLanguage,
+        engineUsed: result.engineUsed,
+        fallbackUsed: result.fallbackUsed,
+        fallbackReason: result.fallbackReason,
+        whisperText: result.whisperText,
+        qwenText: result.qwenText,
+        whisperDurationMs: result.whisperDurationMs,
+        qwenDurationMs: result.qwenDurationMs,
+        qwenError: result.qwenError,
       };
       handleFinalSegment(baseSegment, request.segmentId);
     }).catch((error) => {
@@ -1587,14 +3242,15 @@ export default function App() {
     if (transcriptionBusyRef.current) return;
     const request = pendingTranscriptionWindowsRef.current.shift();
     if (!request) return;
+    const isBaselineMode = !isV2Pipeline;
 
     transcriptionBusyRef.current = true;
     transcriptionInFlightModeRef.current = request.mode;
 
-    const effectiveGlossary = SAFE_BASELINE ? undefined : (request.verbatimOnly ? undefined : glossary);
-    const effectivePromptMode = SAFE_BASELINE ? 'empty' : (request.verbatimOnly ? 'empty' : promptMode);
-    const effectiveVerbatimOnly = SAFE_BASELINE ? true : request.verbatimOnly;
-    const effectiveLanguage = SAFE_BASELINE ? 'es' : request.language;
+    const effectiveGlossary = SAFE_BASELINE && isBaselineMode ? undefined : (request.verbatimOnly ? undefined : glossary);
+    const effectivePromptMode = SAFE_BASELINE && isBaselineMode ? 'empty' : (request.verbatimOnly ? 'empty' : promptMode);
+    const effectiveVerbatimOnly = SAFE_BASELINE && isBaselineMode ? true : request.verbatimOnly;
+    const effectiveLanguage = SAFE_BASELINE && isBaselineMode ? 'es' : request.language;
 
     debug('transcription:window-send', {
       blockId: request.blockId,
@@ -1609,7 +3265,8 @@ export default function App() {
       language: effectiveLanguage,
       promptMode: effectivePromptMode,
       glossaryChars: effectiveGlossary?.length ?? 0,
-      safeBaseline: SAFE_BASELINE,
+      safeBaseline: SAFE_BASELINE && isBaselineMode,
+      v2Mode: isV2Pipeline,
       sampleRate: request.sampleRate,
       sampleCount: request.sampleCount,
       bytes: request.wavBytes.byteLength,
@@ -1659,7 +3316,7 @@ export default function App() {
         } else {
           addLog(`transcription error: ${err}`);
         }
-        if (SAFE_BASELINE && request.mode === 'final') {
+        if (SAFE_BASELINE && isBaselineMode && request.mode === 'final') {
           debug('transcription:final-audit', {
             startMs: request.startMs,
             endMs: request.endMs,
@@ -1680,7 +3337,7 @@ export default function App() {
       if (!text) {
         if (request.mode === 'final') {
           addLog(`transcription: segmento final sin texto (${result.durationMs}ms)`);
-          if (SAFE_BASELINE) {
+          if (SAFE_BASELINE && isBaselineMode) {
             debug('transcription:final-audit', {
               startMs: request.startMs,
               endMs: request.endMs,
@@ -1698,7 +3355,7 @@ export default function App() {
         return;
       }
 
-      if (SAFE_BASELINE && request.mode === 'final' && (request.peak ?? 0) >= CLIPPING_THRESHOLD) {
+      if (SAFE_BASELINE && isBaselineMode && request.mode === 'final' && (request.peak ?? 0) >= CLIPPING_THRESHOLD) {
         addLog(`${request.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${(request.peak ?? 0).toFixed(3)})`);
         debug('transcription:final-audit', {
           startMs: request.startMs,
@@ -1769,6 +3426,14 @@ export default function App() {
         segmentId: request.segmentId,
         asrMode: request.mode === 'final' ? 'final' as const : 'preview' as const,
         language: effectiveLanguage,
+        engineUsed: result.engineUsed,
+        fallbackUsed: result.fallbackUsed,
+        fallbackReason: result.fallbackReason,
+        whisperText: result.whisperText,
+        qwenText: result.qwenText,
+        whisperDurationMs: result.whisperDurationMs,
+        qwenDurationMs: result.qwenDurationMs,
+        qwenError: result.qwenError,
       };
 
       if (request.mode === 'final') {
@@ -1807,7 +3472,7 @@ export default function App() {
       return;
     }
 
-    if (SAFE_BASELINE && r.mode === 'final') {
+    if (SAFE_BASELINE && !isV2Pipeline && r.mode === 'final') {
       pendingFinalWindowsRef.current.push(r);
       syncAsrLiveStats({});
       debug('transcription:window-queued', {
@@ -1861,10 +3526,14 @@ export default function App() {
     });
     processNextTranscriptionWindow();
   }, [processNextFinalWindow, processNextTranscriptionWindow, syncAsrLiveStats]);
+  enqueueTranscriptionRef.current = enqueueTranscription;
 
   const startLiveTranscription = useCallback((stream: MediaStream, source: SourceKey) => {
     const audioContext = ensureAudioContext();
     transcriptionProcessorRef.current?.disconnect();
+    transcriptionFirstFrameLoggedRef.current = false;
+    lastProcessorFrameAtRef.current = null;
+    lastProcessorRmsTraceAtRef.current = 0;
     transcriptionSampleCursorRef.current = 0;
     transcriptionBusyRef.current = false;
     pendingTranscriptionWindowsRef.current = [];
@@ -1908,20 +3577,48 @@ export default function App() {
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
     const silentSink = audioContext.createGain();
     silentSink.gain.value = 0;
-    // Pull graph without sending to hardware speakers — routing loopback to
-    // audioContext.destination can make macOS tear down screen-capture system audio.
-    const pullSink = audioContext.createMediaStreamDestination();
+    /* Gain 0: inaudible, but connection to destination keeps ScriptProcessor pulling reliably on macOS/Electron. */
 
     processor.onaudioprocess = (event) => {
       const input = new Float32Array(event.inputBuffer.getChannelData(0));
+      if (input.length === 0) {
+        debug('transcription:empty-audio-frame');
+        return;
+      }
+      const nowWall = Date.now();
+      lastProcessorFrameAtRef.current = nowWall;
+      let framePeak = 0;
+      let sumSq = 0;
+      for (let i = 0; i < input.length; i += 1) {
+        const s = input[i]!;
+        const a = Math.abs(s);
+        if (a > framePeak) framePeak = a;
+        sumSq += s * s;
+      }
+      const frameRms = Math.sqrt(sumSq / input.length);
+      if (!transcriptionFirstFrameLoggedRef.current) {
+        transcriptionFirstFrameLoggedRef.current = true;
+        const firstFramePayload = { source, rms: frameRms, peak: framePeak, sampleRate: audioContext.sampleRate, timestampMs: nowWall };
+        captureDiag('transcription:processor-first-frame', firstFramePayload);
+        transcriptionTrace('processor-first-frame', firstFramePayload);
+        debug('transcription:processor-first-frame', firstFramePayload);
+      } else if (isTranscriptionTraceEnabled() && nowWall - lastProcessorRmsTraceAtRef.current > 2_000) {
+        lastProcessorRmsTraceAtRef.current = nowWall;
+        const rmsSamplePayload = { source, rms: frameRms, peak: framePeak, sampleRate: audioContext.sampleRate, timestampMs: nowWall };
+        captureDiag('transcription:processor-rms-sample', rmsSamplePayload);
+        transcriptionTrace('processor-rms-sample', rmsSamplePayload);
+        debug('transcription:processor-rms-sample', rmsSamplePayload);
+      }
       const frameStartSample = transcriptionSampleCursorRef.current;
       transcriptionSampleCursorRef.current += input.length;
 
+      const captureSource = liveTranscriptionSourceRef.current;
       const { closed } = vadRef.current.pushFrame(input, audioContext.sampleRate, frameStartSample);
 
       const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-      const verbatimOnly = SAFE_BASELINE ? true : !allowWhisperContextRef.current;
-      const language = SAFE_BASELINE ? 'es' : whisperLanguageRef.current;
+      const isBaselineMode = !isV2Pipeline;
+      const verbatimOnly = SAFE_BASELINE && isBaselineMode ? true : !allowWhisperContextRef.current;
+      const language = SAFE_BASELINE && isBaselineMode ? 'es' : whisperLanguageRef.current;
 
       if (vadRef.current.isSegmentOpen() && !activeSegmentIdRef.current) {
         const newSegId = `seg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -1929,9 +3626,16 @@ export default function App() {
         previewSegmentOpenedAtRef.current.set(newSegId, performance.now());
       }
 
-      const captureSource = liveTranscriptionSourceRef.current;
+      const closedExtra: VadClosedSegment[] = [];
+      if (isForceMicWindowsEnabled() && lastCaptureModeRef.current === 'mic' && captureSource === 'mic') {
+        if (nowWall - forceMicWindowLastAtRef.current >= 5000) {
+          forceMicWindowLastAtRef.current = nowWall;
+          const forced = vadRef.current.forceEmitOpenSegmentForDebug(audioContext.sampleRate);
+          if (forced) closedExtra.push(forced);
+        }
+      }
 
-      for (const seg of closed) {
+      for (const seg of [...closed, ...closedExtra]) {
         const segmentId = activeSegmentIdRef.current;
         if (segmentId) {
           previewFirstSuccessRef.current.delete(segmentId);
@@ -1951,7 +3655,7 @@ export default function App() {
           continue;
         }
 
-        const { rms, peak, gain, processedSamples } = prepareWhisperSamples(workSeg.samples);
+        const { rms, peak, gain, processedSamples } = prepareWhisperSamples(workSeg.samples, { lowRmsDebug: isLowRmsDebugEnabled() });
         warnPossibleClipping(captureSource, peak);
 
         if (SAFE_BASELINE && peak >= CLIPPING_THRESHOLD) {
@@ -1972,8 +3676,9 @@ export default function App() {
         }
 
         const audioDurationMs = samplesDurationMs(processedSamples, audioContext.sampleRate);
-        if (rms < MIN_WHISPER_RMS || audioDurationMs < MIN_FINAL_AUDIO_MS) {
-          debug('transcription:vad-skip-low-quality-final', { rms, durationMs: audioDurationMs, vadDurationMs: workSeg.durationMs });
+        const minWhisper = minWhisperRmsForProfile(whisperProfileForLiveSource(captureSource));
+        if (rms < minWhisper || audioDurationMs < MIN_FINAL_AUDIO_MS) {
+          debug('transcription:vad-skip-low-quality-final', { rms, durationMs: audioDurationMs, vadDurationMs: workSeg.durationMs, minWhisper });
           continue;
         }
         const blockId = `final-${segmentId ?? 'unknown'}-${Math.round(workSeg.startMs)}-${Math.round(workSeg.endMs)}`;
@@ -2044,11 +3749,12 @@ export default function App() {
         snap.endSample,
         MAX_PREVIEW_AUDIO_MS,
       );
-      const { rms, peak, gain, processedSamples } = prepareWhisperSamples(tail.samples);
+      const { rms, peak, gain, processedSamples } = prepareWhisperSamples(tail.samples, { lowRmsDebug: isLowRmsDebugEnabled() });
       warnPossibleClipping(captureSource, peak);
       const audioDurationMs = samplesDurationMs(processedSamples, audioContext.sampleRate);
-      if (rms < MIN_WHISPER_RMS || audioDurationMs < MIN_PREVIEW_AUDIO_MS) {
-        debug('transcription:preview-skip-low-quality', { rms, durationMs: audioDurationMs });
+      const minWhisper = minWhisperRmsForProfile(whisperProfileForLiveSource(captureSource));
+      if (rms < minWhisper || audioDurationMs < MIN_PREVIEW_AUDIO_MS) {
+        debug('transcription:preview-skip-low-quality', { rms, durationMs: audioDurationMs, minWhisper });
         return;
       }
 
@@ -2077,121 +3783,248 @@ export default function App() {
 
     mediaSource.connect(processor);
     processor.connect(silentSink);
-    silentSink.connect(pullSink);
+    silentSink.connect(audioContext.destination);
     transcriptionProcessorRef.current = processor;
-    graphNodesRef.current.push(mediaSource, processor, silentSink, pullSink);
+    graphNodesRef.current.push(mediaSource, processor, silentSink);
 
-    addLog(SAFE_BASELINE
-      ? 'transcripción: baseline — segmentos VAD (~≥5 s, máx 15 s) → whisper.cpp (large-v3-turbo). Sin preview en vivo.'
-      : 'transcripción: VAD + ledger; Whisper con calidad prioritaria si contexto activo');
+    debug('transcription:processor-connected', {
+      source,
+      sampleRate: audioContext.sampleRate,
+      stream: describeStream(stream),
+    });
+
+    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
+    addLog(isV2Pipeline
+      ? 'transcripción en vivo lista: Whisper principal; comparación opcional en configuración.'
+      : SAFE_BASELINE
+        ? 'transcripción iniciada con Whisper Large V3 Turbo.'
+        : 'transcripción iniciada con Whisper Large V3 Turbo y contexto activo.');
   }, [addLog, enqueueTranscription, ensureAudioContext, syncAsrLiveStats, warnPossibleClipping]);
 
   const startCapture = useCallback(
-    async (mode: CaptureMode) => {
-      await stopCapture();
-      setSavedWav(null);
-      setRawSegments([]);
-      setCleanSegments([]);
-      setLedgerDebugGroups([]);
-      setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
-      setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
-      setVisibleCommittedText('');
-      setFinalRevealQueue([]);
-      resetV2Shadow();
-      pendingTranscriptionWindowsRef.current = [];
-      pendingFinalWindowsRef.current = [];
-      finalBusyRef.current = false;
-      previewBlockedByFinalCountRef.current = 0;
-      transcriptionBusyRef.current = false;
-      vadRef.current.reset();
-      vadShortAccumRef.current = null;
-      candidateLedgerRef.current.reset();
-      if (ledgerFlushTimerRef.current !== null) {
-        window.clearTimeout(ledgerFlushTimerRef.current);
-        ledgerFlushTimerRef.current = null;
-      }
-      activeSegmentIdRef.current = null;
-      lastPreviewPerfMsRef.current = 0;
-      transcriptionInFlightModeRef.current = null;
-      previewDroppedCountRef.current = 0;
-      previewReplacedCountRef.current = 0;
-      finalAcceptedCountRef.current = 0;
-      previewSegmentOpenedAtRef.current.clear();
-      previewFirstSuccessRef.current.clear();
-      finalizedSegmentIdsRef.current.clear();
-      setAsrLiveStats({
-        previewLatencyMs: null,
-        finalLatencyMs: null,
-        previewQueueSize: 0,
-        finalQueueSize: 0,
-        previewDroppedCount: 0,
-        previewReplacedCount: 0,
-        finalAcceptedCount: 0,
-        lastPreviewSegmentDurationMs: null,
-        timeToFirstPreviewMs: null,
-        lastCancelReason: null,
-        previewBusyLive: false,
-        finalBusyLive: false,
-        previewBlockedByFinalCount: 0,
-      });
-      pendingPolishJobRef.current = null;
-      cleanContextRef.current = '';
-      setCaptureMode(mode);
-      addLog(`iniciando captura: ${mode}`);
-      debug('capture:start', {
-        mode,
-        selectedMicId,
-        selectedSystemInputId,
-        selectedDesktopSourceId,
-        inputDevices: inputDevices.map((device) => ({ deviceId: device.deviceId, groupId: device.groupId, label: device.label })),
-        outputDevices: outputDevices.map((device) => ({ deviceId: device.deviceId, groupId: device.groupId, label: device.label })),
-        desktopSources,
-        nativeMediaAccess,
-        browserPermissions: {
-          micPermission,
-          systemPermission,
-        },
-      });
+    (mode: CaptureMode, options?: { preserveSession?: boolean; reconnect?: boolean }) =>
+      runCaptureLifecycle('start', async () => {
+        const generation = ++captureGenerationRef.current;
+        const preserveSession = Boolean(options?.preserveSession);
+        captureStartInProgressRef.current = true;
 
-      const captured: MediaStream[] = [];
-      if (mode === 'mic' || mode === 'both') {
         try {
-          captured.push(await captureMic());
-        } catch {
-          addLog('mic: no disponible para esta sesión');
-        }
-      }
-      if (mode === 'system' || mode === 'both') {
-        try {
-          captured.push(await captureSystem());
-        } catch {
-          addLog('system: no disponible para esta sesión');
-        }
-      }
+          await stopCaptureCore({
+            preserveSession,
+            reason: options?.reconnect ? 'reconectando audio: captura anterior liberada' : undefined,
+          });
 
-      if (captured.length > 0) {
-        const mixedStream = buildMixedStream(captured);
-        debug('capture:mixed:stream', describeStream(mixedStream));
-        startLiveTranscription(mixedStream, captured.length > 1 ? 'mixed' : mode === 'system' ? 'system' : 'mic');
-      } else {
-        patchMeter('mixed', {
-          status: 'failed',
-          error: 'empty-stream: no hay fuentes activas para mezclar ni transcribir',
+          if (generation !== captureGenerationRef.current) {
+            debug('capture:start-aborted-stale-generation', { generation });
+            return;
+          }
+
+          await ensureRunningAudioContext();
+
+        if (!preserveSession) {
+          setSavedWav(null);
+          setRawSegments([]);
+          setCleanSegments([]);
+          setLedgerDebugGroups([]);
+          setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
+          setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
+          setVisibleCommittedText('');
+          setFinalRevealQueue([]);
+          resetV2Main();
+          resetV2Shadow();
+          pendingFinalRefinementSegmentsRef.current = [];
+          finalRefinementBusyRef.current = false;
+          setRefinedTranscript({
+            status: refinementModeRef.current === 'off' ? 'off' : 'idle',
+            text: '',
+            error: null,
+            model: whisperSetup?.refinerModel ?? polisherSetup?.model ?? null,
+            mode: refinementModeRef.current,
+            updatedAt: null,
+          });
+        }
+        pendingTranscriptionWindowsRef.current = [];
+        pendingFinalWindowsRef.current = [];
+        finalBusyRef.current = false;
+        previewBlockedByFinalCountRef.current = 0;
+        transcriptionBusyRef.current = false;
+        vadRef.current.reset();
+        vadShortAccumRef.current = null;
+        forceMicWindowLastAtRef.current = 0;
+        candidateLedgerRef.current.reset();
+        if (ledgerFlushTimerRef.current !== null) {
+          window.clearTimeout(ledgerFlushTimerRef.current);
+          ledgerFlushTimerRef.current = null;
+        }
+        activeSegmentIdRef.current = null;
+        lastPreviewPerfMsRef.current = 0;
+        transcriptionInFlightModeRef.current = null;
+        previewDroppedCountRef.current = 0;
+        previewReplacedCountRef.current = 0;
+        finalAcceptedCountRef.current = 0;
+        previewSegmentOpenedAtRef.current.clear();
+        previewFirstSuccessRef.current.clear();
+        finalizedSegmentIdsRef.current.clear();
+        setAsrLiveStats({
+          previewLatencyMs: null,
+          finalLatencyMs: null,
+          previewQueueSize: 0,
+          finalQueueSize: 0,
+          previewDroppedCount: 0,
+          previewReplacedCount: 0,
+          finalAcceptedCount: 0,
+          lastPreviewSegmentDurationMs: null,
+          timeToFirstPreviewMs: null,
+          lastCancelReason: null,
+          previewBusyLive: false,
+          finalBusyLive: false,
+          previewBlockedByFinalCount: 0,
         });
-      }
-
-      const ctx = audioContextRef.current;
-      if (ctx?.state === 'suspended') {
-        try {
-          await ctx.resume();
-          debug('audio-context:resumed', { state: ctx.state });
-        } catch (error) {
-          debug('audio-context:resume-error', String(error));
+        if (!preserveSession) {
+          pendingPolishJobRef.current = null;
+          cleanContextRef.current = '';
         }
-      }
+        setCaptureMode(mode);
+        lastCaptureModeRef.current = mode;
+        setCaptureStartedAt((current) => (preserveSession && current !== null ? current : Date.now()));
+        if (!preserveSession) {
+          setCaptureElapsedSeconds(0);
+        }
+        const now = Date.now();
+        lastAudioRmsAtRef.current = null;
+        lastNonSilentAudioAtRef.current = null;
+        audioTrackEndedAtRef.current = null;
+        patchCaptureHealth({
+          captureHealth: options?.reconnect ? 'recovering' : 'ok',
+          audioTrackReadyState: 'none',
+          audioTrackMuted: false,
+          audioTrackEndedAt: null,
+          lastAudioRmsAt: null,
+          lastNonSilentAudioAt: null,
+          lastCheckedAt: now,
+          message: options?.reconnect ? 'Reconectando audio...' : null,
+        });
+        addLog(options?.reconnect ? `reconectando audio: ${mode}` : `iniciando captura: ${mode}`);
+        const captureStartPayload = {
+          mode,
+          selectedMicId,
+          selectedSystemInputId,
+          systemCaptureStrategy,
+          selectedDesktopSourceId,
+          inputDevices: inputDevices.map((device) => ({ deviceId: device.deviceId, groupId: device.groupId, label: device.label })),
+          outputDevices: outputDevices.map((device) => ({ deviceId: device.deviceId, groupId: device.groupId, label: device.label })),
+          desktopSources,
+          nativeMediaAccess,
+          browserPermissions: {
+            micPermission,
+            systemPermission,
+          },
+        };
+        captureDiag('capture:start', captureStartPayload);
+        debug('capture:start', captureStartPayload);
 
-      startMeterLoop();
-    },
+        const captured: MediaStream[] = [];
+        let micCaptured = false;
+        let systemMediaCaptured = false;
+        let systemPcmHelperActive = false;
+        let micStream: MediaStream | null = null;
+
+        /* `both`: system first, then mic. Parallel start caused CoreAudio Tap RMS probe to race with
+         * getUserMedia / permission UI (macOS can re-route I/O), leading to silent probe → tap stop
+         * → fallback to display loopback and broken audio. */
+        if (mode === 'system' || mode === 'both') {
+          try {
+            const result = await captureSystem();
+            if (result.kind === 'pcm-helper') {
+              systemPcmHelperActive = true;
+            } else {
+              captured.push(result.stream);
+              systemMediaCaptured = true;
+            }
+          } catch {
+            addLog('system: no disponible para esta sesión');
+          }
+        }
+
+        if (mode === 'mic' || mode === 'both') {
+          try {
+            micStream = await captureMic();
+            micCaptured = true;
+          } catch {
+            addLog('mic: no disponible para esta sesión');
+          }
+        }
+
+        if (micStream) {
+          captured.unshift(micStream);
+        }
+        const systemCaptured = systemMediaCaptured || systemPcmHelperActive;
+        systemPcmHelperOnlyRef.current = mode === 'system' && systemPcmHelperActive;
+        setSessionAudioSources({ mic: micCaptured, system: systemCaptured });
+
+        const hasLiveStreamTranscription = captured.length > 0;
+        const hasPcmOnlySystem = systemPcmHelperActive && !systemMediaCaptured;
+
+        if (hasLiveStreamTranscription) {
+          await ensureRunningAudioContext();
+          const mixedStream = buildMixedStream(captured);
+          const transcriptSource: SourceKey =
+            (mode === 'both' && hasPcmOnlySystem && captured.length === 1)
+              ? 'mic'
+              : (captured.length > 1 ? 'mixed' : mode === 'system' ? 'system' : 'mic');
+          captureDiag('capture:mixed:stream', { source: transcriptSource, stream: describeStream(mixedStream) });
+          debug('capture:mixed:stream', { source: transcriptSource, stream: describeStream(mixedStream) });
+          startLiveTranscription(mixedStream, transcriptSource);
+          const graceUntil = Date.now() + CAPTURE_WATCHDOG_GRACE_MS;
+          captureWatchdogGraceUntilRef.current = Math.max(captureWatchdogGraceUntilRef.current, graceUntil);
+          audioEndedWatchdogStreakRef.current = 0;
+          patchCaptureHealth({
+            captureHealth: 'ok',
+            message: null,
+            lastCheckedAt: Date.now(),
+          });
+          if (mode === 'both') {
+            if (micCaptured && !systemMediaCaptured && !systemPcmHelperActive) {
+              showToast('System audio unavailable. Using microphone only.');
+            } else if (micCaptured && systemPcmHelperActive && !systemMediaCaptured) {
+              showToast('System PCM helper active; mic and system are transcribed on separate paths.');
+            } else if (!micCaptured && systemMediaCaptured) {
+              showToast('Microphone unavailable. Using system audio only.');
+            } else if (!micCaptured && systemPcmHelperActive) {
+              showToast('Microphone unavailable. Using system PCM helper only.');
+            }
+          }
+        } else if (systemPcmHelperActive) {
+          await ensureRunningAudioContext();
+          liveTranscriptionSourceRef.current = 'system';
+          patchCaptureHealth({
+            captureHealth: 'ok',
+            message: mode === 'system'
+              ? 'Listening to system PCM helper. Transcription uses helper audio only.'
+              : 'System PCM helper active without a microphone stream.',
+            lastCheckedAt: Date.now(),
+          });
+          if (mode === 'system') {
+            addLog('system: transcripción solo por helper PCM (sin MediaStream).');
+          }
+        } else {
+          patchMeter('mixed', {
+            status: 'failed',
+            error: 'empty-stream: no hay fuentes activas para mezclar ni transcribir',
+          });
+          patchCaptureHealth({
+            captureHealth: 'failed',
+            message: 'No hay fuentes de audio activas para transcribir.',
+            lastCheckedAt: Date.now(),
+          });
+          showToast('Could not start audio. Check microphone and system capture in Settings.');
+        }
+
+        startMeterLoop();
+        } finally {
+          captureStartInProgressRef.current = false;
+        }
+      }),
     [
       addLog,
       buildMixedStream,
@@ -2201,19 +4034,347 @@ export default function App() {
       inputDevices,
       micPermission,
       nativeMediaAccess,
+      patchCaptureHealth,
       patchMeter,
       selectedDesktopSourceId,
       selectedMicId,
       selectedOutputId,
       selectedSystemInputId,
+      systemCaptureStrategy,
       startMeterLoop,
       startLiveTranscription,
-      stopCapture,
+      stopCaptureCore,
       systemPermission,
       outputDevices,
+      resetV2Main,
       resetV2Shadow,
+      showToast,
+      whisperSetup,
+      polisherSetup,
     ],
   );
+
+  const reconnectAudioCapture = useCallback(async (source: 'manual' | 'auto' = 'manual') => {
+    const mode = lastCaptureModeRef.current ?? captureMode;
+    debug('capture:reconnect-requested', {
+      source,
+      mode,
+      captureMode,
+      recoveryInFlight: recoveryInFlightRef.current,
+      appMode: appModeRef.current,
+      health: captureHealthRef.current,
+      streams: Object.fromEntries(
+        Object.entries(streamsRef.current).map(([streamSource, stream]) => [streamSource, stream ? describeStream(stream) : null]),
+      ),
+    });
+    captureDiag('capture:reconnect-requested', {
+      source,
+      mode,
+      captureMode,
+      recoveryInFlight: recoveryInFlightRef.current,
+      appMode: appModeRef.current,
+      health: captureHealthRef.current,
+    });
+    if (!mode || recoveryInFlightRef.current) return;
+    recoveryInFlightRef.current = true;
+    patchCaptureHealth({
+      captureHealth: 'recovering',
+      message: 'Reconectando audio...',
+      lastCheckedAt: Date.now(),
+    });
+    addLog(source === 'auto' ? 'recovery started: reconectando audio automáticamente' : 'recovery started: reconectando audio');
+    debug('capture:recovery-start', {
+      source,
+      mode,
+      health: captureHealthRef.current,
+    });
+    try {
+      await startCapture(mode, { preserveSession: true, reconnect: true });
+      patchCaptureHealth({
+        captureHealth: 'ok',
+        message: null,
+        lastCheckedAt: Date.now(),
+      });
+      addLog('recovery success: audio reconectado');
+      debug('capture:recovery-success', { source, mode });
+    } catch (error) {
+      patchCaptureHealth({
+        captureHealth: 'failed',
+        message: 'No pude reconectar el audio. Inténtalo de nuevo desde Configuración.',
+        lastCheckedAt: Date.now(),
+      });
+      addLog(`recovery failed: ${String(error)}`);
+      debug('capture:recovery-failed', { source, mode, error: String(error) });
+    } finally {
+      recoveryInFlightRef.current = false;
+    }
+  }, [addLog, captureMode, patchCaptureHealth, startCapture]);
+
+  const applyCapturePreferenceFromMenu = useCallback(
+    (mode: CapturePreference) => {
+      debug('capture:preference-change', {
+        mode,
+        previousMode: capturePreference,
+        activeCaptureMode: captureMode,
+        appMode: appModeRef.current,
+      });
+      setCapturePreference(mode);
+      persistCapturePreference(mode);
+      if (captureMode) {
+        void startCapture(mode, { preserveSession: true });
+      }
+    },
+    [captureMode, capturePreference, startCapture],
+  );
+
+  useEffect(() => {
+    if (!captureMode) return undefined;
+    if (captureWatchdogRef.current !== null) {
+      window.clearInterval(captureWatchdogRef.current);
+    }
+
+    const checkCaptureHealth = () => {
+      const now = Date.now();
+      const mode = lastCaptureModeRef.current ?? captureMode;
+      const watchedSource: SourceKey =
+        mode === 'mic'
+          ? 'mic'
+          : streamsRef.current.mixed
+            ? 'mixed'
+            : streamsRef.current.system
+              ? 'system'
+              : 'mixed';
+      const watchedStream = streamsRef.current[watchedSource];
+      const fallbackStream = streamsRef.current.mixed ?? streamsRef.current.system ?? streamsRef.current.mic;
+      const audioTrack = (watchedStream ?? fallbackStream)?.getAudioTracks()[0] ?? null;
+      const readyState = audioTrack?.readyState ?? 'none';
+      const muted = Boolean(audioTrack?.muted);
+      const lastAudioRmsAt = lastAudioRmsAtRef.current;
+      const lastNonSilentAudioAt = lastNonSilentAudioAtRef.current;
+      const lastProcessorFrameAt = lastProcessorFrameAtRef.current;
+      const systemTrack = streamsRef.current.system?.getAudioTracks()[0] ?? null;
+      const mixedTrack = streamsRef.current.mixed?.getAudioTracks()[0] ?? null;
+      const micTrack = streamsRef.current.mic?.getAudioTracks()[0] ?? null;
+      const currentMeters = metersRef.current;
+      const meterSnapshot = {
+        mic: {
+          rms: Number(currentMeters.mic.rms.toFixed(5)),
+          status: currentMeters.mic.status,
+          silence: currentMeters.mic.silence,
+        },
+        system: {
+          rms: Number(currentMeters.system.rms.toFixed(5)),
+          status: currentMeters.system.status,
+          silence: currentMeters.system.silence,
+        },
+        mixed: {
+          rms: Number(currentMeters.mixed.rms.toFixed(5)),
+          status: currentMeters.mixed.status,
+          silence: currentMeters.mixed.silence,
+        },
+      };
+      const inGrace = now < captureWatchdogGraceUntilRef.current;
+      let nextHealth: CaptureHealth = 'ok';
+      let message: string | null = null;
+      let reason = 'healthy';
+
+      if (!audioTrack) {
+        audioEndedWatchdogStreakRef.current = 0;
+        if (captureStartInProgressRef.current) {
+          nextHealth = 'ok';
+          message = null;
+          reason = 'start-in-progress-no-primary-yet';
+        } else {
+          nextHealth = 'failed';
+          message = 'No encuentro un track de audio activo para transcribir.';
+          reason = 'missing-primary-audio-track';
+        }
+      } else if (readyState === 'ended') {
+        if (inGrace) {
+          audioEndedWatchdogStreakRef.current = 0;
+          nextHealth = 'ok';
+          message = null;
+          reason = 'primary-ended-in-grace';
+        } else {
+          audioEndedWatchdogStreakRef.current += 1;
+          if (audioEndedWatchdogStreakRef.current >= AUDIO_ENDED_DEBOUNCE_TICKS) {
+            nextHealth = 'audio-ended';
+            message = 'El audio del sistema se interrumpió. Puedes reconectar la captura.';
+            audioTrackEndedAtRef.current = audioTrackEndedAtRef.current ?? now;
+            reason = 'primary-ended-debounced';
+          } else {
+            nextHealth = 'ok';
+            message = null;
+            reason = 'primary-ended-debounce-wait';
+          }
+        }
+      } else if (muted) {
+        audioEndedWatchdogStreakRef.current = 0;
+        nextHealth = 'silent';
+        message = 'El audio está silenciado.';
+        reason = 'primary-muted';
+      } else if (
+        lastProcessorFrameAt === null &&
+        !inGrace &&
+        now - captureWatchdogGraceUntilRef.current > AUDIO_WATCHDOG_INTERVAL_MS &&
+        mode !== 'mic'
+      ) {
+        audioEndedWatchdogStreakRef.current = 0;
+        if (captureStartInProgressRef.current) {
+          nextHealth = 'ok';
+          message = null;
+          reason = 'start-in-progress-no-processor-frames-yet';
+        } else {
+          nextHealth = 'failed';
+          message = 'La captura está activa, pero el procesador de transcripción no recibe frames de audio.';
+          reason = 'processor-no-frames-after-grace';
+        }
+      } else if (
+        lastNonSilentAudioAt === null &&
+        lastAudioRmsAt !== null &&
+        !inGrace &&
+        now - captureWatchdogGraceUntilRef.current > AUDIO_SILENT_WARNING_MS &&
+        mode !== 'mic'
+      ) {
+        audioEndedWatchdogStreakRef.current = 0;
+        nextHealth = 'silent';
+        message = 'El audio del sistema está conectado, pero no llega señal audible.';
+        reason = 'system-never-non-silent-after-grace';
+      } else if (
+        lastNonSilentAudioAt !== null &&
+        now - lastNonSilentAudioAt > AUDIO_SILENT_WARNING_MS &&
+        mode !== 'mic'
+      ) {
+        audioEndedWatchdogStreakRef.current = 0;
+        nextHealth = 'silent';
+        message = 'El audio del sistema está en silencio desde hace varios segundos.';
+        reason = 'system-silent-timeout';
+      } else {
+        audioEndedWatchdogStreakRef.current = 0;
+      }
+
+      const watchdogPayload = {
+        mode,
+        primarySource: watchedSource,
+        primaryReadyState: readyState,
+        primaryMuted: muted,
+        systemReadyState: systemTrack?.readyState ?? 'none',
+        systemMuted: systemTrack?.muted ?? null,
+        systemEnabled: systemTrack?.enabled ?? null,
+        systemTrackId: systemTrack?.id ?? null,
+        mixedReadyState: mixedTrack?.readyState ?? 'none',
+        mixedMuted: mixedTrack?.muted ?? null,
+        mixedEnabled: mixedTrack?.enabled ?? null,
+        mixedTrackId: mixedTrack?.id ?? null,
+        micReadyState: micTrack?.readyState ?? 'none',
+        micMuted: micTrack?.muted ?? null,
+        micEnabled: micTrack?.enabled ?? null,
+        micTrackId: micTrack?.id ?? null,
+        nextHealth,
+        reason,
+        inGrace,
+        recoveryInFlight: recoveryInFlightRef.current,
+        startInProgress: captureStartInProgressRef.current,
+        appMode: appModeRef.current,
+        generation: captureGenerationRef.current,
+        graceUntil: captureWatchdogGraceUntilRef.current,
+        endedStreak: audioEndedWatchdogStreakRef.current,
+        lastAudioRmsAt,
+        lastNonSilentAudioAt,
+        lastProcessorFrameAt,
+        meters: meterSnapshot,
+      };
+      captureDiag('capture:watchdog', watchdogPayload);
+
+      patchCaptureHealth({
+        captureHealth: recoveryInFlightRef.current ? 'recovering' : nextHealth,
+        audioTrackReadyState: readyState,
+        audioTrackMuted: muted,
+        audioTrackEndedAt: audioTrackEndedAtRef.current,
+        lastAudioRmsAt: lastAudioRmsAt === null ? null : Math.round(lastAudioRmsAt),
+        lastNonSilentAudioAt: lastNonSilentAudioAt === null ? null : Math.round(lastNonSilentAudioAt),
+        lastCheckedAt: now,
+        message,
+      });
+
+      if (
+        nextHealth === 'audio-ended' &&
+        isAutoRecoverSystemAudioEnabled() &&
+        !recoveryInFlightRef.current &&
+        now >= captureWatchdogGraceUntilRef.current
+      ) {
+        const recentAttempts = recoveryAttemptTimesRef.current.filter((attemptAt) => now - attemptAt < 60_000);
+        recoveryAttemptTimesRef.current = recentAttempts;
+        if (recentAttempts.length < MAX_AUTO_RECOVERY_ATTEMPTS_PER_MINUTE) {
+          recoveryAttemptTimesRef.current = [...recentAttempts, now];
+          void reconnectAudioCapture('auto');
+        }
+      }
+    };
+
+    checkCaptureHealth();
+    captureWatchdogRef.current = window.setInterval(checkCaptureHealth, AUDIO_WATCHDOG_INTERVAL_MS);
+    return () => {
+      if (captureWatchdogRef.current !== null) {
+        window.clearInterval(captureWatchdogRef.current);
+        captureWatchdogRef.current = null;
+      }
+    };
+  }, [captureMode, patchCaptureHealth, reconnectAudioCapture]);
+
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null) => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tagName = target.tagName.toLowerCase();
+      return tagName === 'input' || tagName === 'textarea' || target.isContentEditable;
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (appMode !== 'session') return;
+      const commandOrControl = event.metaKey || event.ctrlKey;
+      const editable = isEditableTarget(event.target);
+
+      if (commandOrControl && event.key === 'Enter') {
+        event.preventDefault();
+        if (!aiPanelOpen) {
+          setAiPanelOpen(true);
+          return;
+        }
+        askLocalAssistant();
+        return;
+      }
+
+      if (commandOrControl && (event.key === '\\' || event.code === 'Backslash')) {
+        event.preventDefault();
+        setOverlayCollapsed((current) => !current);
+        return;
+      }
+
+      if (event.key === 'Escape' && aiPanelOpen) {
+        event.preventDefault();
+        setAiPanelOpen(false);
+        return;
+      }
+
+      if (event.code === 'Space' && !editable && !commandOrControl) {
+        event.preventDefault();
+        debug('session:space-toggle', {
+          captureMode,
+          capturePreference,
+          appMode,
+          health: captureHealthRef.current,
+        });
+        if (captureMode) {
+          void stopCapture();
+        } else {
+          void startCapture(capturePreference);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [aiPanelOpen, appMode, askLocalAssistant, captureMode, capturePreference, startCapture, stopCapture]);
 
   const startTestRecording = useCallback(async () => {
     const stream = streamsRef.current.mixed || streamsRef.current.mic || streamsRef.current.system;
@@ -2279,541 +4440,525 @@ export default function App() {
     }, 250);
   }, [addLog, captureMode]);
 
-  const statusSummary = useMemo(() => {
-    if (platform === 'darwin') {
-      return 'macOS: se intenta system audio directo con Electron. Si el track llega vacío o termina, la ruta confiable del MVP es BlackHole como entrada virtual.';
+  const saveCurrentSessionSnapshot = useCallback(() => {
+    const transcriptText = visibleTranscriptText.trim();
+    const refinedText = refinedTranscript.text.trim();
+    if (!transcriptText && rawSegments.length === 0) return;
+
+    const createdAt = Date.now();
+    const source = rawSegments[0]?.source ?? captureMode ?? 'system';
+    const session: DashboardSessionSummary = {
+      id: `session-${createdAt}`,
+      title: createSessionTitle(createdAt),
+      createdAt,
+      durationSeconds: captureElapsedSeconds,
+      transcriptPreview: transcriptText.slice(0, 180),
+      transcriptText,
+      refinedText: refinedText || undefined,
+      source,
+      status: 'completed',
+    };
+    setSavedSessions((current) => [session, ...current].slice(0, 20));
+    setSelectedSavedSessionId(session.id);
+  }, [captureElapsedSeconds, captureMode, rawSegments, refinedTranscript.text, visibleTranscriptText]);
+
+  const startDashboardSession = useCallback(() => {
+    const mode: CapturePreference = 'both';
+    const startPayload = {
+      requestedMode: mode,
+      previousCapturePreference: capturePreference,
+      appMode: appModeRef.current,
+      captureMode,
+      health: captureHealthRef.current,
+      timestampMs: Date.now(),
+    };
+    captureDiag('session:start-request', startPayload);
+    debug('session:start-request', startPayload);
+    if (capturePreference !== 'both') {
+      setCapturePreference('both');
+      persistCapturePreference('both');
     }
-    if (platform === 'win32') {
-      return 'Windows: se intenta la ruta Electron/Chromium de desktop audio para loopback del sistema.';
+    transcriptionTrace('startDashboardSession:begin', { captureMode: mode });
+    setAppMode('session');
+    setOverlayCollapsed(false);
+    setAiPanelOpen(false);
+    // Expand overlay before capture so the first session layout uses full-display bounds (avoids a visible jump after capture settles).
+    if (window.meetingAssistant.overlayWindow && shouldExpandSessionOverlay()) {
+      window.meetingAssistant.windowControls.setAppMode('session');
+      window.meetingAssistant.windowControls.expandSessionOverlay();
+      captureWatchdogGraceUntilRef.current = Math.max(
+        captureWatchdogGraceUntilRef.current,
+        Date.now() + CAPTURE_OVERLAY_EXPAND_GRACE_MS,
+      );
+      const syncExpandPayload = {
+        captureMode: mode,
+        timestampMs: Date.now(),
+        performanceMs: Number(performance.now().toFixed(1)),
+        health: captureHealthRef.current,
+      };
+      captureDiag('session:overlay-expand-sync', syncExpandPayload);
+      transcriptionTrace('startDashboardSession:overlay-expand-sync', syncExpandPayload);
+    } else if (window.meetingAssistant.overlayWindow) {
+      captureDiag('session:overlay-expand-sync-skipped', {
+        reason: 'VITE_OPENWHISPR_DISABLE_OVERLAY_EXPAND=true',
+        captureMode: mode,
+      });
     }
-    return 'Plataforma no objetivo del MVP; los diagnósticos pueden servir para desarrollo.';
-  }, [platform]);
+    void startCapture(mode).then(() => {
+      const resolvedPayload = {
+        mode,
+        appMode: appModeRef.current,
+        captureMode: lastCaptureModeRef.current,
+        health: captureHealthRef.current,
+        streams: Object.fromEntries(
+          Object.entries(streamsRef.current).map(([source, stream]) => [source, stream ? describeStream(stream) : null]),
+        ),
+      };
+      captureDiag('session:start-capture-resolved', resolvedPayload);
+      debug('session:start-capture-resolved', resolvedPayload);
+    }).catch((error) => {
+      const errorPayload = {
+        mode,
+        error: String(error),
+        appMode: appModeRef.current,
+        health: captureHealthRef.current,
+      };
+      captureDiag('session:start-capture-error', errorPayload);
+      debug('session:start-capture-error', errorPayload);
+    });
+    if (getOnboardingSystemSkipped() && mode === 'both') {
+      showToast('Note: System audio was skipped in setup; capture may be microphone-only until you enable it in Settings.');
+    }
+  }, [captureMode, capturePreference, showToast, startCapture]);
 
-  return (
-    <main className="app-shell">
-      <section className="topbar">
-        <div>
-          <p className="eyebrow">Local Meeting Assistant MVP</p>
-          <h1>Audio Diagnostics</h1>
-        </div>
-        <div className="platform-pill">{platform}</div>
-      </section>
+  const finishDashboardSession = useCallback(async () => {
+    const finishPayload = {
+      appMode: appModeRef.current,
+      captureMode,
+      health: captureHealthRef.current,
+      timestampMs: Date.now(),
+      streams: Object.fromEntries(
+        Object.entries(streamsRef.current).map(([source, stream]) => [source, stream ? describeStream(stream) : null]),
+      ),
+    };
+    captureDiag('session:finish-request', finishPayload);
+    debug('session:finish-request', finishPayload);
+    saveCurrentSessionSnapshot();
+    await stopCapture({ reason: 'sesión finalizada' });
+    setAiPanelOpen(false);
+    setOverlayCollapsed(false);
+    setAppMode('dashboard');
+  }, [captureMode, saveCurrentSessionSnapshot, stopCapture]);
 
-      <section className="diagnostic-grid">
-        <div className="panel controls-panel">
-          <h2>Capture</h2>
-          <p className="muted">{statusSummary}</p>
+  const transcriptListeningHint = (() => {
+    if (!captureMode) return undefined;
+    if (systemPcmHelperOnlyRef.current && captureMode === 'system') {
+      return 'Listening to system PCM helper…';
+    }
+    if (sessionAudioSources.mic && sessionAudioSources.system) {
+      return 'Listening to microphone and system audio';
+    }
+    if (sessionAudioSources.mic) return 'Listening to microphone only';
+    if (sessionAudioSources.system) return 'Listening to system audio only';
+    if (captureHealthState.captureHealth === 'failed') return undefined;
+    if (captureMode === 'both') return 'Connecting audio sources…';
+    return undefined;
+  })();
 
-          <label className="field">
-            <span>Micrófono</span>
-            <select value={selectedMicId} onChange={(event) => setSelectedMicId(event.target.value)}>
-              {inputDevices.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Micrófono ${index + 1}`}
-                </option>
-              ))}
-            </select>
+  const statusTone: 'idle' | 'recording' | 'processing' | 'interrupted' | 'recovering' =
+    captureHealthState.captureHealth === 'audio-ended' || captureHealthState.captureHealth === 'failed'
+      ? 'interrupted'
+      : captureHealthState.captureHealth === 'recovering'
+        ? 'recovering'
+        : transcriptionBusyRef.current || finalBusyRef.current
+          ? 'processing'
+          : captureMode
+            ? 'recording'
+            : 'idle';
+  const statusLabel =
+    statusTone === 'interrupted'
+      ? 'Audio interrumpido'
+      : statusTone === 'recovering'
+        ? 'Reconectando…'
+        : statusTone === 'processing'
+          ? 'Procesando'
+          : captureMode
+            ? 'Escuchando'
+            : 'Pausado';
+  const timerLabel = captureMode ? formatTimer(captureElapsedSeconds) : '00:00';
+  const askShortcutLabel = platform === 'darwin' ? '⌘ ↵' : 'Ctrl+Enter';
+  const hideShortcutLabel = platform === 'darwin' ? '⌘ \\' : 'Ctrl+\\';
+  const audioStatus = (() => {
+    const meter = meters.mixed.status !== 'idle' ? meters.mixed : (meters.system.status !== 'idle' ? meters.system : meters.mic);
+    if (captureHealthState.captureHealth === 'audio-ended') return 'audio-ended';
+    if (meter.status === 'failed' || captureHealthState.captureHealth === 'failed') return 'ended';
+    if (meter.clipping) return 'ok';
+    if (meter.silence || captureHealthState.captureHealth === 'silent') return 'silent';
+    return captureMode ? 'ok' : 'idle';
+  })();
+  const showReconnectAudio = Boolean(captureMode && ['audio-ended', 'failed'].includes(captureHealthState.captureHealth));
+
+  const settingsPanel = (
+    <div className="settings-grid">
+      <div className="settings-section" id="settings-section-audio">
+        <h3>Audio</h3>
+        <p className="muted settings-section-lead">
+          Devices, screen/window for system loopback, and default capture mode for new sessions. You can also change capture mode from the ⋮ menu during a session.
+        </p>
+        <fieldset className="capture-preference-fieldset">
+          <legend>Capture mode</legend>
+          <label className="capture-pref-option">
+            <input
+              type="radio"
+              name="capture-preference"
+              value="mic"
+              checked={capturePreference === 'mic'}
+              onChange={() => {
+                setCapturePreference('mic');
+                persistCapturePreference('mic');
+              }}
+            />
+            Microphone only
           </label>
-
-          <label className="field">
-            <span>Salida que querés escuchar/capturar</span>
-            <select value={selectedOutputId} onChange={(event) => setSelectedOutputId(event.target.value)}>
-              <option value="">Salida predeterminada del sistema</option>
-              {outputDevices.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Salida ${index + 1}`}
-                </option>
-              ))}
-            </select>
+          <label className="capture-pref-option">
+            <input
+              type="radio"
+              name="capture-preference"
+              value="system"
+              checked={capturePreference === 'system'}
+              onChange={() => {
+                setCapturePreference('system');
+                persistCapturePreference('system');
+              }}
+            />
+            System audio only
           </label>
-
-          <label className="field">
-            <span>Fuente desktop/system</span>
-            <select value={selectedDesktopSourceId} onChange={(event) => setSelectedDesktopSourceId(event.target.value)}>
-              <option value="">Auto / picker del sistema</option>
-              {desktopSources.map((source) => (
-                <option key={source.id} value={source.id}>
-                  {source.name}
-                </option>
-              ))}
-            </select>
+          <label className="capture-pref-option">
+            <input
+              type="radio"
+              name="capture-preference"
+              value="both"
+              checked={capturePreference === 'both'}
+              onChange={() => {
+                setCapturePreference('both');
+                persistCapturePreference('both');
+              }}
+            />
+            Microphone + system audio
           </label>
-
-          <label className="field">
-            <span>Entrada virtual para system audio</span>
-            <select value={selectedSystemInputId} onChange={(event) => setSelectedSystemInputId(event.target.value)}>
-              <option value="">Auto detectar BlackHole/Loopback/VB-CABLE</option>
-              {inputDevices.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Entrada ${index + 1}`}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <p className="routing-note">
-            Los audífonos y bocinas son salidas, no entradas capturables por `getUserMedia`.
-            En macOS, si Electron no obtiene system audio directo, hay que rutear esa salida hacia una entrada virtual como BlackHole.
+        </fieldset>
+        <label className="field">
+          <span>Microphone</span>
+          <select value={selectedMicId} onChange={(event) => setSelectedMicId(event.target.value)}>
+            {inputDevices.map((device, index) => (
+              <option key={device.deviceId || index} value={device.deviceId}>
+                {device.label || `Micrófono ${index + 1}`}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>System audio source</span>
+          <select
+            value={systemCaptureStrategy}
+            onChange={(event) => setSystemCaptureStrategy(event.target.value as SystemCaptureStrategy)}
+          >
+            <option value="auto">Auto (recommended): CoreAudio Tap → virtual input → Electron loopback</option>
+            <option value="coreaudio-tap">Native CoreAudio Tap</option>
+            <option value="virtual-input">Virtual input only</option>
+            <option value="native-electron-loopback">Electron loopback (experimental)</option>
+            <option value="native-helper">ScreenCaptureKit helper (experimental)</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Screen / window for system capture</span>
+          <select value={selectedDesktopSourceId} onChange={(event) => setSelectedDesktopSourceId(event.target.value)}>
+            <option value="">Auto (first source in list)</option>
+            {desktopSources.map((source) => (
+              <option key={source.id} value={source.id}>
+                {source.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        {platform === 'darwin' ? (
+          <p className="muted settings-field-hint">
+            Auto does not use ScreenCaptureKit. CoreAudio Tap is the primary macOS path when the helper is built (
+            <code className="break-anywhere">npm run build:macos-coreaudio-tap-helper</code>
+            ). Electron loopback can be live but silent on some setups. ScreenCaptureKit is experimental; on many machines{' '}
+            <code>startCapture</code> never returns (
+            <strong>SCK_START_TIMEOUT</strong>
+            ) even when Screen Recording is granted — do not rely on it as the default.
           </p>
-
-          <div className="permission-row">
-            <PermissionBadge label="Mic" state={micPermission} />
-            <PermissionBadge label="Screen/System" state={systemPermission} />
-          </div>
-          {nativeMediaAccess && (
-            <div className="native-permissions">
-              <span>macOS mic: <strong>{nativeMediaAccess.microphone}</strong></span>
-              <span>macOS screen: <strong>{nativeMediaAccess.screen}</strong></span>
-            </div>
-          )}
-
-          <div className="button-grid">
-            <button onClick={() => void startCapture('mic')}>Capturar micrófono</button>
-            <button onClick={() => void startCapture('system')}>Capturar sistema</button>
-            <button onClick={() => void startCapture('both')}>Capturar ambos</button>
-            <button className="secondary" onClick={() => void stopCapture()}>Detener</button>
-          </div>
-
-          <button className="record-button" disabled={!captureMode || recording} onClick={() => void startTestRecording()}>
-            {recording ? `Grabando ${recordingSecondsLeft}s` : 'Grabar prueba 30 segundos'}
-          </button>
-
-          {savedWav && (
-            <div className="playback">
-              <span>WAV guardado</span>
-              <code>{savedWav.path}</code>
-              <audio controls src={savedWav.fileUrl} />
-            </div>
-          )}
-
-          {platform === 'darwin' && <p className="fallback">{macSystemFallbackText}</p>}
-        </div>
-
-        <div className="meters-stack">
-          <MeterCard title="Mic RMS" meter={meters.mic} />
-          <MeterCard title="System RMS" meter={meters.system} />
-          <MeterCard title="Mixed RMS" meter={meters.mixed} />
-        </div>
-
-        <div className="panel log-panel">
-          <h2>Failure / Debug Log</h2>
-          {diagnosticLog.length === 0 ? (
-            <p className="muted">Sin eventos todavía.</p>
-          ) : (
-            <ul>
-              {diagnosticLog.map((entry, index) => (
-                <li key={`${index}-${entry}`}>{entry}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div className="panel transcript-panel">
-          <div className="transcript-header">
-            <div>
-              <h2>Transcripción en vivo</h2>
-              <p className="muted">
-                {SAFE_BASELINE && !showRawDebug ? (
-                  <span>
-                    Segmentos cerrados por VAD (~≥{MIN_FINAL_AUDIO_MS / 1000}s, máximo {MAX_FINAL_SEGMENT_MS / 1000}s) se transcriben con whisper.cpp usando{' '}
-                    <strong>ggml-large-v3-turbo</strong>. Sin preview en vivo ni motores auxiliares.
-                    {whisperSetup?.ok && (
-                      <> Modelo: {whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'}.</>
-                    )}
-                  </span>
-                ) : (
-                  <>
-                    {SAFE_BASELINE && (
-                      <span><strong>Modo baseline:</strong> verbatim, Whisper sin prompt, idioma es, sin Gemma en ASR; solo transcripción final por segmento VAD. </span>
-                    )}
-                    {whisperSetup?.ok
-                      ? (SAFE_BASELINE
-                        ? `Whisper large-v3-turbo (.local/models). VAD ≥ ${MIN_FINAL_AUDIO_MS / 1000}s, máx ${MAX_FINAL_SEGMENT_MS / 1000}s; clipping ≥ ${CLIPPING_THRESHOLD} rechazado.`
-                        : `Whisper (${whisperSetup.activeModelName ?? 'modelo'}): VAD + ledger estabilizan frases; el preview va en cursiva. La vista principal muestra el texto refinado (Gemma) cuando está listo.`)
-                      : whisperSetup?.message ?? 'Verificando whisper.cpp local...'}
-                  </>
-                )}
-              </p>
-            </div>
-            <button className="secondary" onClick={() => {
-              setRawSegments([]);
-              setCleanSegments([]);
-              setLedgerDebugGroups([]);
-              setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
-              setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
-              setVisibleCommittedText('');
-              setFinalRevealQueue([]);
-              resetV2Shadow();
-              pendingTranscriptionWindowsRef.current = [];
-              vadRef.current.reset();
-              vadShortAccumRef.current = null;
-              candidateLedgerRef.current.reset();
-              if (ledgerFlushTimerRef.current !== null) {
-                window.clearTimeout(ledgerFlushTimerRef.current);
-                ledgerFlushTimerRef.current = null;
-              }
-              activeSegmentIdRef.current = null;
-              lastPreviewPerfMsRef.current = 0;
-              transcriptionInFlightModeRef.current = null;
-              previewDroppedCountRef.current = 0;
-              previewReplacedCountRef.current = 0;
-              finalAcceptedCountRef.current = 0;
-              previewSegmentOpenedAtRef.current.clear();
-              previewFirstSuccessRef.current.clear();
-              finalizedSegmentIdsRef.current.clear();
-              pendingFinalWindowsRef.current = [];
-              finalBusyRef.current = false;
-              previewBlockedByFinalCountRef.current = 0;
-              setAsrLiveStats({
-                previewLatencyMs: null,
-                finalLatencyMs: null,
-                previewQueueSize: 0,
-                finalQueueSize: 0,
-                previewDroppedCount: 0,
-                previewReplacedCount: 0,
-                finalAcceptedCount: 0,
-                lastPreviewSegmentDurationMs: null,
-                timeToFirstPreviewMs: null,
-                lastCancelReason: null,
-                previewBusyLive: false,
-                finalBusyLive: false,
-                previewBlockedByFinalCount: 0,
-              });
-              pendingPolishJobRef.current = null;
-              cleanContextRef.current = '';
-              transcriptionBusyRef.current = false;
-              void window.meetingAssistant.transcription.cancelPending().catch((error) => {
-                debug('transcription:cancel:error', String(error));
-              });
-            }}>Limpiar</button>
-          </div>
-          <div className="setup-grid">
-            {whisperSetup && (
-              <div className={whisperSetup.ok ? 'setup-status setup-ready' : 'setup-status setup-missing'}>
-                <strong>{whisperSetup.ok ? 'Whisper listo' : 'Whisper no listo'}</strong>
-                <span>{whisperSetup.ok
-                  ? `pipeline: ${asrPipelineMode} · final: ${whisperSetup.finalModelName ?? whisperSetup.activeModelName ?? '—'} · preview: ${whisperSetup.previewModelName ?? 'off'} — ${whisperSetup.modelPath}`
-                  : 'Ejecuta npm run whisper:setup:turbo'}</span>
-              </div>
-            )}
-            {polisherSetup && (
-              <div className={polisherSetup.ok ? 'setup-status setup-ready' : 'setup-status setup-missing'}>
-                <strong>{polisherSetup.ok ? 'Gemma listo' : 'Gemma no listo'}</strong>
-                <span>{polisherSetup.ok ? polisherSetup.model : polisherSetup.message}</span>
-              </div>
-            )}
-          </div>
-
-          <label className="field compact-field">
-            <span>Idioma Whisper</span>
-            <select value={whisperLanguage} onChange={(event) => setWhisperLanguage(event.target.value as 'es' | 'auto')} disabled={SAFE_BASELINE}>
-              <option value="es">es (forzar español)</option>
-              <option value="auto">auto (detección)</option>
-            </select>
-          </label>
-
-          <label className="field compact-field checkbox-field">
+        ) : null}
+        {platform === 'darwin' ? (
+          <div className="settings-inline-status">
             <span>
-              <input
-                type="checkbox"
-                checked={allowWhisperContext}
-                onChange={(event) => setAllowWhisperContext(event.target.checked)}
-                disabled={SAFE_BASELINE}
-              />
-              Usar glosario + contexto en el prompt de Whisper (recomendado para calidad en reuniones técnicas)
+              CoreAudio Tap helper:{' '}
+              {coreAudioTapHelperCheck?.ok
+                ? (coreAudioTapHelperCheck.running ? 'running' : 'ready')
+                : (coreAudioTapHelperCheck?.error ?? 'checking')}
             </span>
-          </label>
-
-          <label className="field compact-field">
-            <span>Términos adicionales para Whisper (si contexto activo)</span>
-            <textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} disabled={!allowWhisperContext || SAFE_BASELINE} />
-          </label>
-
-          <label className="field compact-field">
-            <span>Modo de prompt Whisper (si contexto activo)</span>
-            <select value={promptMode} onChange={(event) => setPromptMode(event.target.value as WhisperPromptMode)} disabled={!allowWhisperContext || SAFE_BASELINE}>
-              <option value="empty">sin prompt</option>
-              <option value="minimal">compacto ASR (recomendado)</option>
-              <option value="contextual">contextual compacto + términos</option>
-            </select>
-          </label>
-
-          <div className="button-row">
-            <button
-              className={transcriptViewMode === 'clean' ? 'primary' : 'secondary'}
-              onClick={() => setTranscriptViewMode('clean')}
-              disabled={SAFE_BASELINE}
-            >
-              Transcripción limpia
-            </button>
-            <button
-              className={transcriptViewMode === 'verbatim' ? 'primary' : 'secondary'}
-              onClick={() => setTranscriptViewMode('verbatim')}
-            >
-              ASR crudo (Whisper)
+            <button type="button" className="secondary" onClick={() => void refreshCoreAudioTapHelperCheck()}>
+              Refresh
             </button>
           </div>
-
-          <div className={SAFE_BASELINE || v2ShadowTranscript.visibleText.trim() || liveTranscript.committedText || visibleCommittedText.trim() || finalRevealQueue.length > 0 || liveVisualDraft.visibleDraft.trim() || liveVisualDraft.pendingWords.length > 0 || captureMode || liveCleanText ? 'live-transcript' : 'live-transcript empty-clean'}>
-            {!SAFE_BASELINE && transcriptViewMode === 'clean' ? (
-              liveCleanText ? (
-                <p><span>{liveCleanText}</span></p>
-              ) : liveTranscript.committedText || liveTranscript.unstableSuffix ? (
-                <p>
-                  {polisherSetup?.ok ? (
-                    <span className="muted">Refinando con Gemma… borrador Whisper: </span>
-                  ) : (
-                    <span className="muted">Ollama/Gemma no disponible; mostrando solo Whisper: </span>
-                  )}
-                  <span>{liveTranscript.committedText}</span>
-                  {liveTranscript.unstableSuffix && <span className="unstable-text"> {liveTranscript.unstableSuffix}</span>}
-                </p>
-              ) : (
-                'Sin transcripción todavía. Iniciá captura y hablá o reproducí audio.'
-              )
-            ) : v2PipelineActive ? (
-              <LiveTranscriptView
-                committedText={v2ShadowTranscript.committedText}
-                previewSuffix={v2ShadowTranscript.previewSuffix}
-                rawPreview={v2ShadowTranscript.rawPreview}
-                showDebug={showRawDebug}
-                pipelineLabel="Transcripción v2"
-              />
-            ) : SAFE_BASELINE ? (
-              <div className="live-transcript-stack">
-                <div
-                  className="live-transcript-scroll"
-                  ref={liveTranscriptScrollRef}
-                  onScroll={onLiveTranscriptScroll}
-                >
-                  <div className="live-transcript-section-title">Transcripción</div>
-                  <p className="live-transcript-text" aria-live="polite">
-                    {visibleCommittedText.trim() ? <span>{visibleCommittedText}</span> : null}
-                    {liveVisualDraft.visibleDraft.trim() ? (
-                      <>
-                        {' '}
-                        <span className="preview-draft">{liveVisualDraft.visibleDraft}</span>
-                      </>
-                    ) : null}
-                    {(finalRevealQueue.length > 0
-                      || liveVisualDraft.pendingWords.length > 0
-                      || Boolean(liveVisualDraft.visibleDraft.trim())
-                      || Boolean(visibleCommittedText.trim())) ? (
-                        <span className="typing-cursor" aria-hidden="true">
-                          ▌
-                        </span>
-                      ) : null}
-                  </p>
-                </div>
-              </div>
-            ) : liveTranscript.committedText || liveTranscript.unstableSuffix ? (
-              <p className="live-transcript-text">
-                <span>{liveTranscript.committedText}</span>
-                {liveTranscript.unstableSuffix && <span className="unstable-text"> {liveTranscript.unstableSuffix}</span>}
-              </p>
-            ) : (
-              'Sin transcripción en vivo todavía. Iniciá captura y hablá o reproducí audio.'
-            )}
+        ) : null}
+        {platform === 'darwin' ? (
+          <div className="settings-inline-status">
+            <span>
+              ScreenCaptureKit helper:{' '}
+              {systemAudioHelperCheck?.ok
+                ? (systemAudioHelperCheck.running ? 'running' : 'ready')
+                : (systemAudioHelperCheck?.error ?? 'checking')}
+            </span>
+            <button type="button" className="secondary" onClick={() => void refreshSystemAudioHelperCheck()}>
+              Refresh
+            </button>
           </div>
+        ) : null}
+        <label className="field">
+          <span>Virtual / loopback input</span>
+          <select value={selectedSystemInputId} onChange={(event) => setSelectedSystemInputId(event.target.value)}>
+            <option value="">Auto (virtual drivers only; {virtualSystemInputs.length || 'none found'})</option>
+            {virtualSystemInputs.map((device, index) => (
+              <option key={device.deviceId || index} value={device.deviceId}>
+                {device.label || `Virtual input ${index + 1}`}
+              </option>
+            ))}
+          </select>
+        </label>
+        {platform === 'darwin' && virtualSystemInputs.length === 0 ? (
+          <p className="muted settings-field-hint">
+            No virtual loopback device detected (BlackHole, Loopback, VB-CABLE, etc.). Install one and route system output into it for reliable capture when CoreAudio Tap is unavailable.
+          </p>
+        ) : null}
+      </div>
 
-          <div className="live-meta">
-            {SAFE_BASELINE && !showRawDebug ? (
-              <span>
-                Solo transcribe segmentos cerrados por VAD; sin preview en vivo. whisper.cpp Large V3 Turbo
-                ({whisperSetup?.ok ? (whisperSetup.finalModelName ?? '—') : 'pendiente'})
-                {' '}· español fijo · scroll al fondo si estabas cerca (~{SCROLL_STICK_THRESHOLD_PX}px).
-              </span>
-            ) : (
-              <>
-                <span>Estado: {liveTranscript.lastReason}</span>
-                <span>Preview (!baseline): Whisper cada ~{(PREVIEW_INTERVAL_MS / 1000).toFixed(1)}s (cola ≤{MAX_PREVIEW_AUDIO_MS / 1000}s)</span>
-                <span>ASR: {SAFE_BASELINE ? 'VAD → Whisper solo final' : 'ledger + VAD'}</span>
-                <span>Idioma: {SAFE_BASELINE ? 'es (forzado)' : whisperLanguage}</span>
-                {!SAFE_BASELINE && (
-                  <>
-                    {whisperSetup?.ok && <span>modelo: {whisperSetup.activeModelName ?? '—'}</span>}
-                    <span>lat preview: {asrLiveStats.previewLatencyMs != null ? `${asrLiveStats.previewLatencyMs}ms` : '—'}</span>
-                    <span>lat final: {asrLiveStats.finalLatencyMs != null ? `${asrLiveStats.finalLatencyMs}ms` : '—'}</span>
-                    <span>1er preview: {asrLiveStats.timeToFirstPreviewMs != null ? `${asrLiveStats.timeToFirstPreviewMs}ms` : '—'}</span>
-                    <span>cola pv/fin: {asrLiveStats.previewQueueSize}/{asrLiveStats.finalQueueSize}</span>
-                    <span>busy pv/fin: {asrLiveStats.previewBusyLive ? 'sí' : 'no'}/{asrLiveStats.finalBusyLive ? 'sí' : 'no'}</span>
-                    <span>pv bloq×fin: {asrLiveStats.previewBlockedByFinalCount}</span>
-                    <span>pv drop/reempl: {asrLiveStats.previewDroppedCount}/{asrLiveStats.previewReplacedCount}</span>
-                    <span>finales ok: {asrLiveStats.finalAcceptedCount}</span>
-                    {asrLiveStats.lastCancelReason && <span>cancel: {asrLiveStats.lastCancelReason}</span>}
-                  </>
-                )}
-                {SAFE_BASELINE && (
-                  <>
-                    <span>lat última finalización: {asrLiveStats.finalLatencyMs != null ? `${asrLiveStats.finalLatencyMs}ms` : '—'}</span>
-                    <span>cola final pendiente: {asrLiveStats.finalQueueSize}</span>
-                  </>
-                )}
-                <span>Whisper contexto: {SAFE_BASELINE ? 'no (baseline)' : (allowWhisperContext ? `sí (${promptMode})` : 'no')}</span>
-                <span>Vista: {SAFE_BASELINE ? 'verbatim (forzado)' : (transcriptViewMode === 'clean' ? 'limpia' : 'ASR crudo')}</span>
-                <span>Gemma: {SAFE_BASELINE ? 'off' : (polisherSetup?.ok ? 'disponible' : 'no listo')}</span>
-                {liveTranscript.lastUpdatedAt && <span>Última actualización: {new Date(liveTranscript.lastUpdatedAt).toLocaleTimeString()}</span>}
-              </>
-            )}
-          </div>
+      <div className="settings-section">
+        <h3>Captura</h3>
+        <p className="muted settings-section-lead">Session controls and diagnostics. Set default capture mode under Audio.</p>
+        <div className="button-grid compact">
+          <button className="secondary" onClick={() => void stopCapture()}>Detener captura</button>
+        </div>
+        <button className="secondary full-width" disabled={!captureMode || recording} onClick={() => void startTestRecording()}>
+          {recording ? `Grabando ${recordingSecondsLeft}s` : 'Grabar prueba 30 segundos'}
+        </button>
+        <button
+          className="secondary full-width"
+          disabled={!captureMode || captureHealthState.captureHealth === 'recovering'}
+          onClick={() => void reconnectAudioCapture('manual')}
+        >
+          Reconectar audio
+        </button>
+        <button className="secondary full-width" onClick={() => void finishDashboardSession()}>
+          Finalizar y volver al inicio
+        </button>
+      </div>
 
-          <details className="v2-text-demo">
-            <summary>V2 text demo</summary>
+      <div className="settings-section">
+        <h3>Estado</h3>
+        <p>ASR principal: Whisper Large V3 Turbo</p>
+        <p>IA local: {polisherSetup?.ok ? 'lista' : 'no disponible'}</p>
+        <p>Audio: {audioStatus}</p>
+        {captureHealthState.message && <p>{captureHealthState.message}</p>}
+        <p>RMS: {meters.mixed.rms.toFixed(3)}</p>
+        {asrFinalEngine === 'compare' && <p>Comparación Qwen activa</p>}
+        {whisperSetup?.experimentalPreview && <p>Preview experimental activo</p>}
+        {savedWav && <p className="break-anywhere">WAV: {savedWav.path}</p>}
+      </div>
+    </div>
+  );
+
+  const debugPanel = (
+    <div className="debug-stack">
+      <button className="secondary full-width" type="button" onClick={() => setShowRawDebug((current) => !current)}>
+        {showRawDebug ? 'Ocultar laboratorio' : 'Mostrar laboratorio'}
+      </button>
+      <div className="debug-metrics">
+        <span>audioTrackReadyState: {captureHealthState.audioTrackReadyState}</span>
+        <span>audioTrackMuted: {String(captureHealthState.audioTrackMuted)}</span>
+        <span>audioTrackEndedAt: {captureHealthState.audioTrackEndedAt ? new Date(captureHealthState.audioTrackEndedAt).toLocaleTimeString() : 'none'}</span>
+        <span>lastAudioRmsAt: {captureHealthState.lastAudioRmsAt ? new Date(captureHealthState.lastAudioRmsAt).toLocaleTimeString() : 'none'}</span>
+        <span>lastNonSilentAudioAt: {captureHealthState.lastNonSilentAudioAt ? new Date(captureHealthState.lastNonSilentAudioAt).toLocaleTimeString() : 'none'}</span>
+        <span>captureHealth: {captureHealthState.captureHealth}</span>
+        <span>rms: {meters.mixed.rms.toFixed(3)}</span>
+        <span>audioStatus: {audioStatus}</span>
+      </div>
+      <details>
+        <summary>Eventos</summary>
+        {diagnosticLog.length === 0 ? <p className="muted">Sin eventos visibles.</p> : (
+          <ul className="debug-list">{diagnosticLog.map((entry, index) => <li key={`${index}-${entry}`}>{entry}</li>)}</ul>
+        )}
+      </details>
+      {showRawDebug && (
+        <>
+          <details open>
+            <summary>Segmentos</summary>
+            <ol className="transcript-list raw-list">
+              {rawSegments.map((segment) => (
+                <li key={segment.id}>
+                  <div className="segment-meta">
+                    <time>{formatMs(segment.startMs)} - {formatMs(segment.endMs)}</time>
+                    <span className="source-tag">{segment.source}</span>
+                    <span className="source-tag">{segment.status}</span>
+                    <span className="source-tag">RMS {segment.rms.toFixed(3)}</span>
+                    {segment.engineUsed && <span className="source-tag">engine {segment.engineUsed}</span>}
+                    {segment.qwenText && <span className="source-tag">qwen</span>}
+                    {segment.qwenError && <span className="source-tag warning-tag">qwen error</span>}
+                    {segment.fallbackUsed && <span className="source-tag warning-tag">fallback</span>}
+                  </div>
+                  <p>{segment.text}</p>
+                  {segment.whisperText && <p className="muted">whisperText: {segment.whisperText}</p>}
+                  {segment.qwenText && <p className="muted">qwenText: {segment.qwenText}</p>}
+                  {segment.qwenError && <p className="muted">qwenError: {segment.qwenError}</p>}
+                </li>
+              ))}
+            </ol>
+          </details>
+          <details>
+            <summary>Laboratorio visual</summary>
             <LiveTranscriptView
               committedText={v2DemoTranscript.committedText}
               previewSuffix={v2DemoTranscript.previewSuffix}
               rawPreview={v2DemoTranscript.rawPreview}
-              showDebug={showRawDebug}
-              pipelineLabel="moonshine-qwen-v2 visual contract"
+              showDebug
+              pipelineLabel="Contrato visual"
             />
             <div className="button-row v2-demo-buttons">
-              <button className="secondary" type="button" onClick={runV2DemoPreviewOne}>Simular preview 1</button>
-              <button className="secondary" type="button" onClick={runV2DemoPreviewTwo}>Simular preview 2</button>
-              <button className="secondary" type="button" onClick={runV2DemoDifferentPreview}>Simular preview diferente</button>
-              <button className="secondary" type="button" onClick={runV2DemoFinal}>Simular final</button>
-              <button className="secondary" type="button" onClick={resetV2Demo}>Reset demo</button>
-            </div>
-            <div className="v2-demo-meta">
-              <span>reason: {v2DemoTranscript.lastReason}</span>
-              <span>segment: {v2DemoTranscript.segmentId ?? '-'}</span>
-              <span>history: {v2DemoTranscript.previewHistory.length}</span>
+              <button className="secondary" type="button" onClick={runV2DemoPreviewOne}>Preview 1</button>
+              <button className="secondary" type="button" onClick={runV2DemoPreviewTwo}>Preview 2</button>
+              <button className="secondary" type="button" onClick={runV2DemoDifferentPreview}>Divergente</button>
+              <button className="secondary" type="button" onClick={runV2DemoFinal}>Final</button>
+              <button className="secondary" type="button" onClick={resetV2Demo}>Reset</button>
             </div>
           </details>
+        </>
+      )}
+    </div>
+  );
 
-          <details className="v2-text-demo v2-shadow-transcript" open={v2PipelineActive}>
-            <summary>V2 shadow transcript</summary>
-            <LiveTranscriptView
-              committedText={v2ShadowTranscript.committedText}
-              previewSuffix={v2ShadowTranscript.previewSuffix}
-              rawPreview={v2ShadowTranscript.rawPreview}
-              showDebug={showRawDebug}
-              pipelineLabel="baseline-whisper finals through v2 store"
-            />
-            <div className="v2-demo-meta">
-              <span>enabled: {V2_TRANSCRIPT_STORE_SHADOW ? 'yes' : 'no'}</span>
-              <span>reason: {v2ShadowTranscript.lastReason}</span>
-              <span>finals: {v2ShadowFinalCount}</span>
-              <span>last segment: {v2ShadowLastSegmentId ?? '-'}</span>
-            </div>
-          </details>
+  const setupOverlay = setupWizardOpen ? (
+    <SetupOnboarding
+      whisperOk={Boolean(whisperSetup?.ok)}
+      whisperMessage={whisperSetup?.message ?? 'Run whisper setup from the project scripts.'}
+      aiOk={Boolean(polisherSetup?.ok)}
+      aiMessage={polisherSetup?.message ?? 'Optional: configure local AI for Ask AI.'}
+      onFinished={() => {
+        markOnboardingComplete();
+        setSetupWizardOpen(false);
+      }}
+    />
+  ) : null;
 
-          {(!SAFE_BASELINE || showRawDebug) && cleanSegments.length > 0 && (
-            <details className="notes-panel">
-              <summary>Fragmentos refinados ({cleanSegments.length})</summary>
-              <div className="clean-transcript">
-                {cleanSegments.map((segment) => (
-                  <p key={segment.id}>
-                    <time>{formatMs(segment.startMs)} - {formatMs(segment.endMs)}</time>
-                    {segment.cleanText}
-                  </p>
-                ))}
-              </div>
-            </details>
-          )}
+  if (appMode === 'dashboard') {
+    return (
+      <>
+        {setupOverlay}
+        <DashboardHome
+          userName="Michael"
+          sessions={savedSessions}
+          onStartSession={startDashboardSession}
+          onOpenSession={(session) => setSelectedSavedSessionId(session.id)}
+          onClearSessions={clearSavedSessions}
+          onNotify={showToast}
+          onRerunSetup={() => setSetupWizardOpen(true)}
+        />
+        <PremiumToast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+      </>
+    );
+  }
 
-          {(!SAFE_BASELINE || showRawDebug) && cleanSegments.length === 0 && (
-            <div className="notes-hint">
-              {polisherSetup?.ok
-                ? 'El texto refinado se acumula aquí; no modifica el audio ni reemplaza términos en el ASR crudo.'
-                : 'Instalá Ollama + Gemma para ver transcripción limpia; mientras tanto solo verás el borrador Whisper.'}
-            </div>
-          )}
-
-          <button className="raw-toggle secondary" type="button" onClick={() => setShowRawDebug((current) => !current)}>
-            {showRawDebug ? 'Ocultar debug avanzado' : 'Mostrar debug avanzado'}
-            {(rawSegments.length > 0 || ledgerDebugGroups.length > 0) && !showRawDebug ? ` (${rawSegments.length + ledgerDebugGroups.length})` : ''}
-          </button>
-
-          {showRawDebug && (
-            <>
-              <p className="muted debug-advanced-hint">Debug avanzado: segmentos crudos, ledger y puntuaciones (no forma parte de la lectura principal).</p>
-              {SAFE_BASELINE && (
-                <details className="preview-visual-debug">
-                  <summary>Estado interno (baseline)</summary>
-                  <div className="preview-visual-debug-body">
-                    <p><span className="muted">committedText (oficial, completo): </span><code>{liveTranscript.committedText.trim() || '—'}</code></p>
-                    <p><span className="muted">visibleCommittedText (lectura): </span><code>{visibleCommittedText.trim() || '—'}</code></p>
-                    <p><span className="muted">finalRevealQueue ({finalRevealQueue.length}): </span><code>{finalRevealQueue.length > 0 ? finalRevealQueue.join(' ') : '—'}</code></p>
-                    <p><span className="muted">segmentId borrador ledger: </span><code>{liveVisualDraft.segmentId ?? '—'}</code></p>
-                    <p><span className="muted">visibleDraft (!baseline): </span><code>{liveVisualDraft.visibleDraft.trim() || '—'}</code></p>
-                    <p><span className="muted">pendingWords: </span><code>{liveVisualDraft.pendingWords.length > 0 ? liveVisualDraft.pendingWords.join(' ') : '—'}</code></p>
-                    <p><span className="muted">unstableSuffix: </span><code>{liveTranscript.unstableSuffix.trim() || '—'}</code></p>
-                    <p><span className="muted">v2 shadow reason: </span><code>{v2ShadowTranscript.lastReason}</code></p>
-                    <p><span className="muted">v2 shadow finales: </span><code>{v2ShadowFinalCount}</code></p>
-                    <p><span className="muted">v2 shadow último segmentId: </span><code>{v2ShadowLastSegmentId ?? '—'}</code></p>
-                  </div>
-                </details>
-              )}
-              {ledgerDebugGroups.length > 0 && (
-                <div className="ledger-debug">
-                  <h3>Alternativas ASR (debug)</h3>
-                  <ol className="ledger-group-list">
-                    {ledgerDebugGroups.map((group) => (
-                      <li key={group.segmentId}>
-                        <div className="segment-meta">
-                          <time>{formatMs(group.startMs)} - {formatMs(group.endMs)}</time>
-                          <span className={group.committed ? 'source-tag' : 'source-tag warning-tag'}>
-                            {group.committed ? 'confirmado' : 'editable'}
-                          </span>
-                          {group.reasons.map((reason) => (
-                            <span className="source-tag" key={reason}>{reason}</span>
-                          ))}
-                        </div>
-                        <p className="ledger-choice">{group.chosenText}</p>
-                        <ul className="ledger-candidate-list">
-                          {group.candidates.map((candidate) => (
-                            <li key={candidate.id} className={candidate.id === group.chosenCandidateId ? 'ledger-candidate chosen' : 'ledger-candidate'}>
-                              <div className="segment-meta">
-                                <span className="source-tag">{candidate.mode}</span>
-                                <span className="source-tag">score {candidate.score}</span>
-                                {candidate.modelName && <span className="source-tag">{candidate.modelName}</span>}
-                                {candidate.reasons.map((reason) => (
-                                  <span className="source-tag" key={`${candidate.id}-${reason}`}>{reason}</span>
-                                ))}
-                              </div>
-                              <p>{candidate.text}</p>
-                            </li>
-                          ))}
-                        </ul>
-                      </li>
-                    ))}
-                  </ol>
-                </div>
-              )}
-
-              <ol className="transcript-list raw-list">
-                {rawSegments.map((segment) => (
-                  <li key={segment.id}>
-                    <div className="segment-meta">
-                      <time>{formatMs(segment.startMs)} - {formatMs(segment.endMs)}</time>
-                      <span className="source-tag">{segment.source}</span>
-                      <span className="source-tag">{segment.status}</span>
-                      <span className="source-tag">RMS {segment.rms.toFixed(3)}</span>
-                      {segment.peak !== undefined && <span className="source-tag">Peak {segment.peak.toFixed(3)}</span>}
-                      {segment.whisperGain !== undefined && segment.whisperGain !== 1 && <span className="source-tag">gain {segment.whisperGain.toFixed(3)}</span>}
-                      {segment.sampleCount !== undefined && <span className="source-tag">{segment.sampleCount} samples</span>}
-                      {segment.sampleRate !== undefined && <span className="source-tag">{segment.sampleRate}Hz</span>}
-                      {segment.durationMs !== undefined && <span className="source-tag">{segment.durationMs}ms</span>}
-                      {segment.modelName && <span className="source-tag">{segment.modelName}</span>}
-                      {segment.asrMode && <span className="source-tag">{segment.asrMode}</span>}
-                      {segment.language && <span className="source-tag">{segment.language}</span>}
-                      {segment.segmentId && <span className="source-tag">{segment.segmentId}</span>}
-                      {segment.stabilizationReason && <span className="source-tag">{segment.stabilizationReason}</span>}
-                      {segment.whisperPromptLength !== undefined && <span className="source-tag">prompt {segment.whisperPromptLength}</span>}
-                      {segment.coalesced && <span className="source-tag warning-tag">coalesced</span>}
-                      {segment.suspicious && <span className="source-tag warning-tag">sospechoso</span>}
-                      {segment.possibleClipping && <span className="source-tag warning-tag">possible clipping</span>}
-                    </div>
-                    <p>{segment.text}</p>
-                    <p className="muted">rawText: {segment.rawText ?? segment.text}</p>
-                  </li>
-                ))}
-              </ol>
-            </>
-          )}
-        </div>
-      </section>
-    </main>
+  return (
+    <>
+      {setupOverlay}
+      <FloatingAssistantShell
+        statusLabel={statusLabel}
+        statusTone={statusTone}
+        timerLabel={timerLabel}
+        askShortcutLabel={askShortcutLabel}
+        hideShortcutLabel={hideShortcutLabel}
+        isCapturing={Boolean(captureMode)}
+        overlayCollapsed={overlayCollapsed}
+        aiPanelOpen={aiPanelOpen}
+        transcriptText={visibleTranscriptText}
+        refinedText={refinedTranscript.text}
+        transcriptView={transcriptView}
+        refinementAvailable={Boolean(refinedTranscript.text)}
+        localAiReady={Boolean(polisherSetup?.ok)}
+        chatMessages={chatMessages}
+        chatInput={chatInput}
+        chatBusy={chatBusy}
+        chatError={chatError}
+        reconnectAudioVisible={showReconnectAudio}
+        onTranscriptViewChange={setTranscriptView}
+        onCopyTranscript={copyTranscript}
+        onChatInputChange={setChatInput}
+        onChatSubmit={askLocalAssistant}
+        onCopyLastAiResponse={copyLastAiResponse}
+        onOpenAiPanel={() => setAiPanelOpen(true)}
+        onCloseAiPanel={() => setAiPanelOpen(false)}
+        onReconnectAudio={() => void reconnectAudioCapture('manual')}
+        onToggleCapture={() => {
+          debug('session:topbar-toggle-capture', {
+            captureMode,
+            capturePreference,
+            appMode: appModeRef.current,
+            health: captureHealthRef.current,
+          });
+          if (captureMode) {
+            void finishDashboardSession();
+          } else {
+            void startCapture(capturePreference);
+          }
+        }}
+        onToggleOverlay={() => setOverlayCollapsed((current) => !current)}
+        settingsOpen={sessionSettingsOpen}
+        onSettingsOpenChange={setSessionSettingsOpen}
+        settingsAudioScrollNonce={settingsAudioScrollNonce}
+        onHome={() => {
+          debug('session:home-request', {
+            captureMode,
+            appMode: appModeRef.current,
+            health: captureHealthRef.current,
+          });
+          setHomeConfirmOpen(true);
+        }}
+        onOpenAudioSettings={() => {
+          setSessionSettingsOpen(true);
+          setSettingsAudioScrollNonce((n) => n + 1);
+        }}
+        onEndSession={() => {
+          debug('session:end-request', {
+            captureMode,
+            appMode: appModeRef.current,
+            health: captureHealthRef.current,
+          });
+          setHomeConfirmOpen(true);
+        }}
+        capturePreference={capturePreference}
+        onCapturePreferenceChange={applyCapturePreferenceFromMenu}
+        transcriptListeningHint={transcriptListeningHint}
+        homeConfirmDialog={
+          <HomeConfirmDialog
+            open={homeConfirmOpen}
+            onConfirm={() => {
+              debug('session:home-confirmed', {
+                captureMode,
+                appMode: appModeRef.current,
+                health: captureHealthRef.current,
+              });
+              setHomeConfirmOpen(false);
+              void finishDashboardSession();
+            }}
+            onCancel={() => setHomeConfirmOpen(false)}
+          />
+        }
+        settings={settingsPanel}
+        debug={debugPanel}
+      />
+      <PremiumToast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+    </>
   );
 }
 
@@ -2832,19 +4977,24 @@ function shouldUseForLive(segment: TranscriptSegment) {
   return true;
 }
 
-function prepareWhisperSamples(samples: Float32Array) {
+function prepareWhisperSamples(
+  samples: Float32Array,
+  opts?: { lowRmsDebug?: boolean },
+) {
+  const lowRms = Boolean(opts?.lowRmsDebug ?? isLowRmsDebugEnabled());
+  const boosted = lowRms ? applyGain(samples, 10) : samples;
   let sum = 0;
   let peak = 0;
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = samples[index];
+  for (let index = 0; index < boosted.length; index += 1) {
+    const sample = boosted[index];
     sum += sample * sample;
     peak = Math.max(peak, Math.abs(sample));
   }
 
   const gain = peak > WHISPER_PEAK_TARGET ? WHISPER_PEAK_TARGET / peak : 1;
-  const processedSamples = gain === 1 ? samples : applyGain(samples, gain);
+  const processedSamples = gain === 1 ? boosted : applyGain(boosted, gain);
   return {
-    rms: Math.sqrt(sum / Math.max(1, samples.length)),
+    rms: Math.sqrt(sum / Math.max(1, boosted.length)),
     peak,
     gain,
     processedSamples,

@@ -213,6 +213,17 @@ export class VadEndpointing {
     return snapshot;
   }
 
+  /**
+   * Debug escape hatch (`VITE_OPENWHISPR_FORCE_MIC_WINDOWS`): close the open segment immediately
+   * without waiting for silence, so Whisper can be exercised even if VAD never fires.
+   */
+  forceEmitOpenSegmentForDebug(sampleRate: number): VadClosedSegment | null {
+    if (this.segmentChunks.length === 0) return null;
+    const raw = concatChunks(this.segmentChunks, sampleRate);
+    this.reset();
+    return raw && raw.samples.length > 0 ? raw : null;
+  }
+
   private pushPreRoll(data: Float32Array, frameStartSample: number): void {
     this.preRoll.push({ startSample: frameStartSample, data });
     this.preRollSamples += data.length;

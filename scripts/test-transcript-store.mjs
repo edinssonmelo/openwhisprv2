@@ -74,6 +74,18 @@ const { createTranscriptStore } = await import(path.join(outDir, 'transcriptStor
 }
 
 {
+  const store = createTranscriptStore();
+  store.acceptFinal({ segmentId: 'seg-1', text: '¿Qué veían? ¿Cuál era la mejor opción?' });
+  store.acceptFinal({ segmentId: 'seg-2', text: 'Como que podía ser que en algún punto...' });
+  store.acceptFinal({ segmentId: 'seg-3', text: 'Como un proceso asíncrono...' });
+  assert.equal(
+    store.getState().committedText,
+    '¿Qué veían? ¿Cuál era la mejor opción? Como que podía ser que en algún punto... Como un proceso asíncrono...',
+    'distinct consecutive final segments are appended even when a later segment starts with a repeated word',
+  );
+}
+
+{
   const store = createTranscriptStore({ hiddenPreviewTailWords: 1 });
   store.acceptPreview({ segmentId: 'a', text: 'hola como estas ahora' });
   store.acceptPreview({ segmentId: 'a', text: 'hola como estas bien' });

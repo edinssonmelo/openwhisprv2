@@ -1,0 +1,12 @@
+{
+  "": {
+    "dependencies": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/OpenwhisprCoreAudioTapHelper.d",
+    "object": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/OpenwhisprCoreAudioTapHelper.o",
+    "swift-dependencies": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/master.swiftdeps"
+  },
+  "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/Sources/OpenwhisprCoreAudioTapHelper/main.swift": {
+    "object": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/main.swift.o",
+    "swiftmodule": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/.build/arm64-apple-macosx/release/OpenwhisprCoreAudioTapHelper.build/main.swiftdeps"
+  }
+}

@@ -3,10 +3,24 @@ export {};
 declare global {
   interface Window {
     meetingAssistant: {
+      /** True when Electron started with OPENWHISPR_OVERLAY_WINDOW=true (sync, for first-frame transparency). */
+      overlayWindow: boolean;
+      windowControls: {
+        setAppMode: (mode: 'dashboard' | 'session') => void;
+        expandSessionOverlay: () => void;
+      };
+      clipboard: {
+        writeText: (text: string) => Promise<{ ok: boolean }>;
+      };
+      overlay: {
+        setPointerPassthrough: (ignore: boolean) => void;
+      };
       platform: {
         getInfo: () => Promise<{
           platform: NodeJS.Platform;
           versions: Record<string, string>;
+          /** True when Electron was started with OPENWHISPR_OVERLAY_WINDOW=true */
+          overlayWindow: boolean;
           mediaAccess: {
             microphone: string;
             screen: string;
@@ -22,6 +36,73 @@ declare global {
           }>;
           error: string | null;
         }>;
+      };
+      systemAudioHelper: {
+        check: () => Promise<{
+          ok: boolean;
+          path?: string;
+          error?: string;
+          running?: boolean;
+        }>;
+        start: () => Promise<{
+          ok: boolean;
+          path?: string;
+          error?: string;
+          alreadyRunning?: boolean;
+        }>;
+        stop: () => Promise<{
+          ok: boolean;
+          error?: string;
+        }>;
+        onChunk: (callback: (payload: {
+          sequence: number;
+          version: number;
+          sampleRate: number;
+          channels: number;
+          frameCount: number;
+          pcm: Uint8Array;
+        }) => void) => () => void;
+        onStatus: (callback: (payload: {
+          status: 'stopped' | 'failed';
+          code?: number | null;
+          signal?: string | null;
+          error?: string;
+        }) => void) => () => void;
+      };
+      coreAudioTapHelper: {
+        check: () => Promise<{
+          ok: boolean;
+          path?: string;
+          error?: string;
+          running?: boolean;
+        }>;
+        start: () => Promise<{
+          ok: boolean;
+          path?: string;
+          error?: string;
+          alreadyRunning?: boolean;
+        }>;
+        stop: () => Promise<{
+          ok: boolean;
+          error?: string;
+        }>;
+        onChunk: (callback: (payload: {
+          sequence: number;
+          version: number;
+          sampleRate: number;
+          channels: number;
+          frameCount: number;
+          pcm: Uint8Array;
+        }) => void) => () => void;
+        onStatus: (callback: (payload: {
+          status: 'stopped' | 'failed';
+          code?: number | null;
+          signal?: string | null;
+          error?: string;
+        }) => void) => () => void;
+      };
+      displayCapture: {
+        setPreferredSourceId: (sourceId: string | null) => void;
       };
       files: {
         saveWav: (payload: { bytes: Uint8Array; fileName?: string }) => Promise<{
@@ -42,6 +123,10 @@ declare global {
           pipelineMode?: 'baseline-whisper' | 'moonshine-qwen-v2';
           moonshineConfigured?: boolean;
           qwenConfigured?: boolean;
+          experimentalPreview?: boolean;
+          finalEngine?: 'whisper' | 'qwen' | 'compare';
+          refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
+          refinerModel?: string;
           modelCandidates?: Array<{
             name: string;
             path: string;
@@ -82,6 +167,14 @@ declare global {
           stderr?: string;
           modelName?: string;
           modelPath?: string;
+          engineUsed?: 'whisper-large-v3-turbo' | 'moonshine' | 'qwen3-asr';
+          fallbackUsed?: boolean;
+          fallbackReason?: string;
+          whisperText?: string;
+          qwenText?: string;
+          whisperDurationMs?: number;
+          qwenDurationMs?: number;
+          qwenError?: string;
           whisperDebug?: {
             language: 'es' | 'auto';
             promptLength: number;
@@ -108,14 +201,29 @@ declare global {
             startMs: number;
             endMs: number;
             text: string;
+            qwenText?: string;
             source: 'mic' | 'system' | 'mixed';
             rms: number;
           }>;
           context: string;
           glossary: string;
+          refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
+          prompt?: string;
         }) => Promise<{
           ok: boolean;
           batchId: string;
+          text?: string;
+          error?: string;
+          durationMs: number;
+        }>;
+      };
+      assistant: {
+        ask: (payload: {
+          question: string;
+          transcriptContext: string;
+          refinedContext?: string;
+        }) => Promise<{
+          ok: boolean;
           text?: string;
           error?: string;
           durationMs: number;

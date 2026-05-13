@@ -55,15 +55,41 @@ npm run build
 
 En código existe un modo más experimental (`SAFE_BASELINE = false`) con refinado opcional por **Ollama** en local; el flujo habitual es baseline local sin eso.
 
+### V2: Whisper principal, Qwen comparativo y refinado
+
+La recomendación actual para español conversacional es usar Whisper Large V3 Turbo como ASR principal. Qwen3-ASR queda como motor secundario para comparación y Gemma/Ollama puede refinar puntuación en una capa separada:
+
+```bash
+npm run dev:v2:whisper
+npm run dev:v2:compare
+npm run dev:v2:refine
+npm run qwen:check -- recordings/tmp/final-seg-1778125017430-fgapizy-62903-82688.wav
+```
+
+Variables principales:
+
+- `ASR_FINAL_ENGINE=whisper | qwen | compare` (default: `whisper`)
+- `TRANSCRIPT_REFINEMENT_MODE=off | whisper-only | whisper-qwen` (default: `off`)
+- `TRANSCRIPT_REFINER_MODEL=gemma3:4b`
+
+Comando manual para Qwen:
+
+```bash
+QWEN3_ASR_MODEL=".local/qwen-asr/Qwen3-ASR-1.7B-8bit" \
+QWEN3_ASR_LANGUAGE="Spanish" \
+.venv-qwen-asr/bin/python scripts/asr_qwen3_final.py recordings/tmp/final-seg-1778125017430-fgapizy-62903-82688.wav
+```
+
 ### Preview v2 con Moonshine (opcional)
 
-El baseline sigue siendo Whisper. Para probar Moonshine solo como preview en la v2:
+Moonshine está apagado por defecto. Para probarlo explícitamente como preview experimental:
 
 ```bash
 python3 -m venv .venv-moonshine
 .venv-moonshine/bin/python -m pip install -r requirements-moonshine.txt
 .venv-moonshine/bin/python scripts/asr_moonshine_preview.py .venv-moonshine/lib/python3.13/site-packages/moonshine_voice/assets/two_cities.wav
 ASR_PIPELINE_MODE=moonshine-qwen-v2 \
+ENABLE_EXPERIMENTAL_PREVIEW=true \
 MOONSHINE_ASR_CMD=".venv-moonshine/bin/python scripts/asr_moonshine_preview.py" \
 npm run dev
 ```

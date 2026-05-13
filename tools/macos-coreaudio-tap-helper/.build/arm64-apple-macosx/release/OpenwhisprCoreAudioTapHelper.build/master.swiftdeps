@@ -1,0 +1,7 @@
+version: "Apple Swift version 6.0.3 (swiftlang-6.0.3.1.10 clang-1600.0.30.1)"
+options: "f0d06365ea705ace44cac7c653092ec499ea94f1af7746d877e9d62e0ebeddfe"
+build_start_time: [1778714834, 396656000]
+build_end_time: [1778714835, 483189000]
+inputs:
+  ? "/Users/michaelpage/Documents/Personal/openwhispr_v2/tools/macos-coreaudio-tap-helper/Sources/OpenwhisprCoreAudioTapHelper/main.swift"
+  : [1778714823, 187681031]

@@ -1,8 +1,46 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      html,
+      body,
+      #root {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        /* Solid default avoids a black frame before JS adds dashboard/overlay classes (transparent BrowserWindow). */
+        background: #f7f3ec;
+      }
+
+      html.openwhispr-dashboard-window,
+      html.openwhispr-dashboard-window body,
+      html.openwhispr-dashboard-window #root {
+        background: #f7f3ec;
+      }
+
+      html[data-dashboard-theme='dark'].openwhispr-dashboard-window,
+      html[data-dashboard-theme='dark'].openwhispr-dashboard-window body,
+      html[data-dashboard-theme='dark'].openwhispr-dashboard-window #root {
+        background: #0a0a0c;
+      }
+
+      html.openwhispr-overlay-window,
+      html.openwhispr-overlay-window body,
+      html.openwhispr-overlay-window #root {
+        background: transparent;
+      }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Hanken+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
     <title>Local Meeting Assistant</title>
   </head>
   <body>

@@ -216,9 +216,6 @@ function appendNewWords(visibleWords: string[], candidateWords: string[], maxOve
     }
   }
 
-  const visibleNormalized = new Set(visibleWords.map(normalizeWord).filter(Boolean));
-  const firstCandidate = normalizeWord(candidateWords[0] ?? '');
-  if (firstCandidate && visibleNormalized.has(firstCandidate)) return [];
   return candidateWords;
 }
 
