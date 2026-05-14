@@ -5,9 +5,8 @@ const openwhisprOverlayWindow = process.env.OPENWHISPR_OVERLAY_WINDOW === 'true'
 contextBridge.exposeInMainWorld('meetingAssistant', {
   overlayWindow: openwhisprOverlayWindow,
   windowControls: {
-    setAppMode: (mode: 'dashboard' | 'session') => {
-      ipcRenderer.send('window:set-app-mode', mode);
-    },
+    setAppMode: (mode: 'dashboard' | 'session-boot' | 'session') =>
+      ipcRenderer.invoke('window:set-app-mode', mode) as Promise<{ ok: boolean }>,
     /** After capture/display picker completes — expands overlay to full display (overlay window only). */
     expandSessionOverlay: () => {
       ipcRenderer.send('window:session-overlay-expand');

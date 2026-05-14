@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { useOverlayPointerPassthrough } from '../hooks/useOverlayPointerPassthrough';
 import { AiOverlayPanel } from './AiOverlayPanel';
 import type { AssistantChatMessage } from './AssistantChatPanel';
@@ -9,6 +9,10 @@ import { TopControlBar } from './TopControlBar';
 import type { CapturePreference } from '../storage/appPreferences';
 
 interface FloatingAssistantShellProps {
+  /** Overlay session boot: window stays dashboard-sized until first paint completes. */
+  booting?: boolean;
+  /** Called after two rAFs once `booting` is true (overlay new-session flow). */
+  onFirstPaint?: () => void;
   statusLabel: string;
   statusTone: 'idle' | 'recording' | 'processing' | 'interrupted' | 'recovering';
   timerLabel: string;
@@ -53,6 +57,8 @@ interface FloatingAssistantShellProps {
 }
 
 export function FloatingAssistantShell({
+  booting = false,
+  onFirstPaint,
   statusLabel,
   statusTone,
   timerLabel,
@@ -95,6 +101,63 @@ export function FloatingAssistantShell({
   debug,
 }: FloatingAssistantShellProps) {
   const lastAudioScrollNonceRef = useRef(0);
+  const [glassReady, setGlassReady] = useState(false);
+
+  useEffect(() => {
+    if (!booting || !onFirstPaint) return;
+    let cancelled = false;
+    let innerRaf = 0;
+    const outerRaf = requestAnimationFrame(() => {
+      innerRaf = requestAnimationFrame(() => {
+        if (cancelled) return;
+        try {
+          performance.clearMarks('openwhispr-session-ui-first-paint');
+          performance.mark('openwhispr-session-ui-first-paint');
+        } catch {
+          /* ignore */
+        }
+        onFirstPaint();
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(outerRaf);
+      cancelAnimationFrame(innerRaf);
+    };
+  }, [booting, onFirstPaint]);
+
+  useEffect(() => {
+    if (booting) {
+      setGlassReady(false);
+      return;
+    }
+    setGlassReady(false);
+    let cancelled = false;
+    let timeoutId: number | undefined;
+
+    const schedule = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          timeoutId = window.setTimeout(() => {
+            if (cancelled) return;
+            try {
+              performance.clearMarks('openwhispr-overlay-glass-ready');
+              performance.mark('openwhispr-overlay-glass-ready');
+            } catch {
+              /* ignore duplicate mark / unsupported */
+            }
+            setGlassReady(true);
+          }, 120);
+        });
+      });
+    };
+    schedule();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
+  }, [overlayCollapsed, aiPanelOpen, booting]);
 
   useLayoutEffect(() => {
     if (!settingsOpen) return;
@@ -137,8 +200,13 @@ export function FloatingAssistantShell({
     />
   );
 
+  const glassSurfaceClass = booting ? 'overlay-glass-cold' : glassReady ? 'overlay-glass-ready' : 'overlay-glass-cold';
+  const bootClass = booting ? 'session-booting ' : '';
+
   return (
-    <main className={`floating-page ${overlayCollapsed ? 'overlay-collapsed' : ''} ${settingsOpen ? 'settings-open' : ''}`}>
+    <main
+      className={`floating-page ${bootClass}${glassSurfaceClass} ${overlayCollapsed ? 'overlay-collapsed' : ''} ${settingsOpen ? 'settings-open' : ''}`}
+    >
       {homeConfirmDialog}
       <OverlayStage>
         <SessionFloatingFrame collapsed={overlayCollapsed}>

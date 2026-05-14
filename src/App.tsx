@@ -42,7 +42,7 @@ import { createTranscriptStore } from './transcription/transcriptStore';
 import type { AsrEngineName, AsrFinalEngineMode, AsrPipelineMode, TranscriptRefinementMode, TranscriptViewState } from './transcription/types';
 type SourceKey = 'mic' | 'system' | 'mixed';
 type CaptureMode = 'mic' | 'system' | 'both';
-type AppMode = 'dashboard' | 'session';
+type AppMode = 'dashboard' | 'session-boot' | 'session';
 type CaptureStatus = 'idle' | 'requesting_permission' | 'capturing' | 'silence' | 'failed' | 'stopped';
 type CaptureHealth = 'ok' | 'silent' | 'audio-ended' | 'recovering' | 'failed';
 type TranscriptViewMode = 'verbatim' | 'clean';
@@ -653,6 +653,9 @@ export default function App() {
   const [appMode, setAppMode] = useState<AppMode>('dashboard');
   const appModeRef = useRef<AppMode>(appMode);
   appModeRef.current = appMode;
+  const [pendingSessionStart, setPendingSessionStart] = useState(false);
+  const [sessionCaptureStarting, setSessionCaptureStarting] = useState(false);
+  const pendingSessionStartRef = useRef(false);
   const [savedSessions, setSavedSessions] = useState<DashboardSessionSummary[]>(() => loadSavedSessions());
   const [selectedSavedSessionId, setSelectedSavedSessionId] = useState<string | null>(null);
   const [platform, setPlatform] = useState<NodeJS.Platform | 'unknown'>('unknown');
@@ -1488,21 +1491,39 @@ export default function App() {
     if (appMode === 'session' && overlayCapable) {
       root.classList.remove('openwhispr-dashboard-window');
       body.classList.remove('openwhispr-dashboard-window');
+      root.classList.remove('openwhispr-session-boot-window');
+      body.classList.remove('openwhispr-session-boot-window');
       root.classList.add('openwhispr-overlay-window');
       body.classList.add('openwhispr-overlay-window');
-      window.meetingAssistant.windowControls.setAppMode('session');
       transcriptionTrace('layout:session', {
         htmlClass: root.className,
         overlayCapable,
       });
+    } else if (appMode === 'session-boot' && overlayCapable) {
+      root.classList.remove('openwhispr-overlay-window');
+      body.classList.remove('openwhispr-overlay-window');
+      root.classList.remove('openwhispr-dashboard-window');
+      body.classList.remove('openwhispr-dashboard-window');
+      root.classList.add('openwhispr-session-boot-window');
+      body.classList.add('openwhispr-session-boot-window');
+      void window.meetingAssistant.windowControls.setAppMode('session-boot');
+      try {
+        performance.clearMarks('openwhispr-session-boot-render');
+        performance.mark('openwhispr-session-boot-render');
+      } catch {
+        /* ignore */
+      }
+      transcriptionTrace('layout:session-boot', { htmlClass: root.className, overlayCapable });
     } else {
       root.classList.remove('openwhispr-overlay-window');
       body.classList.remove('openwhispr-overlay-window');
+      root.classList.remove('openwhispr-session-boot-window');
+      body.classList.remove('openwhispr-session-boot-window');
       if (overlayCapable) {
         root.classList.add('openwhispr-dashboard-window');
         body.classList.add('openwhispr-dashboard-window');
         window.meetingAssistant.overlay.setPointerPassthrough(false);
-        window.meetingAssistant.windowControls.setAppMode('dashboard');
+        void window.meetingAssistant.windowControls.setAppMode('dashboard');
       } else {
         root.classList.remove('openwhispr-dashboard-window');
         body.classList.remove('openwhispr-dashboard-window');
@@ -4330,7 +4351,7 @@ export default function App() {
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (appMode !== 'session') return;
+      if (appMode !== 'session' && appMode !== 'session-boot') return;
       const commandOrControl = event.metaKey || event.ctrlKey;
       const editable = isEditableTarget(event.target);
 
@@ -4462,8 +4483,69 @@ export default function App() {
     setSelectedSavedSessionId(session.id);
   }, [captureElapsedSeconds, captureMode, rawSegments, refinedTranscript.text, visibleTranscriptText]);
 
+  const onSessionUiFirstPaint = useCallback(() => {
+    if (appModeRef.current !== 'session-boot' || !pendingSessionStartRef.current) return;
+    if (!window.meetingAssistant.overlayWindow) return;
+    pendingSessionStartRef.current = false;
+    const mode: CapturePreference = 'both';
+
+    void (async () => {
+      try {
+        await window.meetingAssistant.windowControls.setAppMode('session');
+        try {
+          performance.clearMarks('openwhispr-window-session-mode-applied');
+          performance.mark('openwhispr-window-session-mode-applied');
+        } catch {
+          /* ignore */
+        }
+      } catch (error) {
+        debug('session:first-paint:set-app-mode-session-error', String(error));
+      }
+
+      setAppMode('session');
+      setPendingSessionStart(false);
+
+      requestAnimationFrame(() => {
+        if (shouldExpandSessionOverlay()) {
+          window.meetingAssistant.windowControls.expandSessionOverlay();
+          captureWatchdogGraceUntilRef.current = Math.max(
+            captureWatchdogGraceUntilRef.current,
+            Date.now() + CAPTURE_OVERLAY_EXPAND_GRACE_MS,
+          );
+          captureDiag('session:overlay-expand-after-first-paint', {
+            captureMode: mode,
+            timestampMs: Date.now(),
+            performanceMs: Number(performance.now().toFixed(1)),
+            health: captureHealthRef.current,
+          });
+        } else if (window.meetingAssistant.overlayWindow) {
+          captureDiag('session:overlay-expand-skipped-after-first-paint', {
+            reason: 'VITE_OPENWHISPR_DISABLE_OVERLAY_EXPAND=true',
+            captureMode: mode,
+          });
+        }
+        setSessionCaptureStarting(true);
+        try {
+          performance.clearMarks('openwhispr-capture-start');
+          performance.mark('openwhispr-capture-start');
+        } catch {
+          /* ignore */
+        }
+        void startCapture(mode).finally(() => {
+          setSessionCaptureStarting(false);
+        });
+      });
+    })();
+  }, [startCapture]);
+
   const startDashboardSession = useCallback(() => {
     const mode: CapturePreference = 'both';
+    try {
+      performance.clearMarks('openwhispr-new-session-click');
+      performance.mark('openwhispr-new-session-click');
+    } catch {
+      /* ignore */
+    }
     const startPayload = {
       requestedMode: mode,
       previousCapturePreference: capturePreference,
@@ -4479,53 +4561,51 @@ export default function App() {
       persistCapturePreference('both');
     }
     transcriptionTrace('startDashboardSession:begin', { captureMode: mode });
-    setAppMode('session');
     setOverlayCollapsed(false);
     setAiPanelOpen(false);
-    // Expand overlay before capture so the first session layout uses full-display bounds (avoids a visible jump after capture settles).
-    if (window.meetingAssistant.overlayWindow && shouldExpandSessionOverlay()) {
-      window.meetingAssistant.windowControls.setAppMode('session');
-      window.meetingAssistant.windowControls.expandSessionOverlay();
-      captureWatchdogGraceUntilRef.current = Math.max(
-        captureWatchdogGraceUntilRef.current,
-        Date.now() + CAPTURE_OVERLAY_EXPAND_GRACE_MS,
-      );
-      const syncExpandPayload = {
-        captureMode: mode,
-        timestampMs: Date.now(),
-        performanceMs: Number(performance.now().toFixed(1)),
-        health: captureHealthRef.current,
-      };
-      captureDiag('session:overlay-expand-sync', syncExpandPayload);
-      transcriptionTrace('startDashboardSession:overlay-expand-sync', syncExpandPayload);
-    } else if (window.meetingAssistant.overlayWindow) {
-      captureDiag('session:overlay-expand-sync-skipped', {
-        reason: 'VITE_OPENWHISPR_DISABLE_OVERLAY_EXPAND=true',
-        captureMode: mode,
-      });
+
+    if (!window.meetingAssistant.overlayWindow) {
+      setAppMode('session');
+      try {
+        performance.clearMarks('openwhispr-capture-start');
+        performance.mark('openwhispr-capture-start');
+      } catch {
+        /* ignore */
+      }
+      void startCapture(mode)
+        .then(() => {
+          const resolvedPayload = {
+            mode,
+            appMode: appModeRef.current,
+            captureMode: lastCaptureModeRef.current,
+            health: captureHealthRef.current,
+            streams: Object.fromEntries(
+              Object.entries(streamsRef.current).map(([source, stream]) => [source, stream ? describeStream(stream) : null]),
+            ),
+          };
+          captureDiag('session:start-capture-resolved', resolvedPayload);
+          debug('session:start-capture-resolved', resolvedPayload);
+        })
+        .catch((error) => {
+          const errorPayload = {
+            mode,
+            error: String(error),
+            appMode: appModeRef.current,
+            health: captureHealthRef.current,
+          };
+          captureDiag('session:start-capture-error', errorPayload);
+          debug('session:start-capture-error', errorPayload);
+        });
+      if (getOnboardingSystemSkipped() && mode === 'both') {
+        showToast('Note: System audio was skipped in setup; capture may be microphone-only until you enable it in Settings.');
+      }
+      return;
     }
-    void startCapture(mode).then(() => {
-      const resolvedPayload = {
-        mode,
-        appMode: appModeRef.current,
-        captureMode: lastCaptureModeRef.current,
-        health: captureHealthRef.current,
-        streams: Object.fromEntries(
-          Object.entries(streamsRef.current).map(([source, stream]) => [source, stream ? describeStream(stream) : null]),
-        ),
-      };
-      captureDiag('session:start-capture-resolved', resolvedPayload);
-      debug('session:start-capture-resolved', resolvedPayload);
-    }).catch((error) => {
-      const errorPayload = {
-        mode,
-        error: String(error),
-        appMode: appModeRef.current,
-        health: captureHealthRef.current,
-      };
-      captureDiag('session:start-capture-error', errorPayload);
-      debug('session:start-capture-error', errorPayload);
-    });
+
+    pendingSessionStartRef.current = true;
+    setPendingSessionStart(true);
+    setAppMode('session-boot');
+
     if (getOnboardingSystemSkipped() && mode === 'both') {
       showToast('Note: System audio was skipped in setup; capture may be microphone-only until you enable it in Settings.');
     }
@@ -4544,6 +4624,9 @@ export default function App() {
     captureDiag('session:finish-request', finishPayload);
     debug('session:finish-request', finishPayload);
     saveCurrentSessionSnapshot();
+    pendingSessionStartRef.current = false;
+    setPendingSessionStart(false);
+    setSessionCaptureStarting(false);
     await stopCapture({ reason: 'sesión finalizada' });
     setAiPanelOpen(false);
     setOverlayCollapsed(false);
@@ -4551,6 +4634,7 @@ export default function App() {
   }, [captureMode, saveCurrentSessionSnapshot, stopCapture]);
 
   const transcriptListeningHint = (() => {
+    if (sessionCaptureStarting && !captureMode) return 'Starting capture…';
     if (!captureMode) return undefined;
     if (systemPcmHelperOnlyRef.current && captureMode === 'system') {
       return 'Listening to system PCM helper…';
@@ -4576,7 +4660,9 @@ export default function App() {
             ? 'recording'
             : 'idle';
   const statusLabel =
-    statusTone === 'interrupted'
+    sessionCaptureStarting && !captureMode
+      ? 'Starting capture…'
+      : statusTone === 'interrupted'
       ? 'Audio interrumpido'
       : statusTone === 'recovering'
         ? 'Reconectando…'
@@ -4873,6 +4959,8 @@ export default function App() {
     <>
       {setupOverlay}
       <FloatingAssistantShell
+        booting={appMode === 'session-boot' && window.meetingAssistant.overlayWindow}
+        onFirstPaint={onSessionUiFirstPaint}
         statusLabel={statusLabel}
         statusTone={statusTone}
         timerLabel={timerLabel}

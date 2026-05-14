@@ -486,6 +486,20 @@ function applyDashboardWindowMode() {
   debugLog('window:mode', { mode: 'dashboard', bounds: mainWindow.getBounds() });
 }
 
+/** Dashboard-sized overlay window before session chrome; renderer uses transparent root + solid panels only. */
+function applySessionBootWindowMode() {
+  if (!mainWindow || !OPENWHISPR_OVERLAY_WINDOW) return;
+  currentWindowMode = 'dashboard';
+  mainWindow.setBounds(getDashboardWindowBounds());
+  mainWindow.setMinimumSize(DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT);
+  mainWindow.setResizable(true);
+  mainWindow.setAlwaysOnTop(false);
+  overlayPointerPassthroughIgnore = false;
+  mainWindow.setIgnoreMouseEvents(false);
+  mainWindow.setBackgroundColor('#00000000');
+  debugLog('window:mode', { mode: 'session-boot', bounds: mainWindow.getBounds() });
+}
+
 /** Session overlay: chrome + always-on-top, but keep current bounds until capture is ready (avoids black fullscreen during macOS display picker). */
 function applySessionOverlayChromeOnly() {
   if (!mainWindow || !OPENWHISPR_OVERLAY_WINDOW) return;
@@ -735,17 +749,28 @@ function registerIpc() {
     mainWindow.setIgnoreMouseEvents(ignore, ignore ? { forward: true } : undefined);
   });
 
-  ipcMain.on('window:set-app-mode', (_event, mode: unknown) => {
-    if (!mainWindow) return;
+  ipcMain.handle('window:set-app-mode', (_event, mode: unknown) => {
+    if (!mainWindow) return { ok: false };
     if (mode === 'session') {
+      debugLog('window:mode', { mode: 'session' });
       if (OPENWHISPR_OVERLAY_WINDOW) {
         applySessionOverlayChromeOnly();
       }
-      return;
+      return { ok: true };
+    }
+    if (mode === 'session-boot') {
+      debugLog('window:mode', { mode: 'session-boot' });
+      if (OPENWHISPR_OVERLAY_WINDOW) {
+        applySessionBootWindowMode();
+      }
+      return { ok: true };
     }
     if (mode === 'dashboard') {
+      debugLog('window:mode', { mode: 'dashboard' });
       applyDashboardWindowMode();
+      return { ok: true };
     }
+    return { ok: false };
   });
 
   ipcMain.on('window:session-overlay-expand', () => {

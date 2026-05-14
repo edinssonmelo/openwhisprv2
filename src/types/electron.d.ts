@@ -6,7 +6,7 @@ declare global {
       /** True when Electron started with OPENWHISPR_OVERLAY_WINDOW=true (sync, for first-frame transparency). */
       overlayWindow: boolean;
       windowControls: {
-        setAppMode: (mode: 'dashboard' | 'session') => void;
+        setAppMode: (mode: 'dashboard' | 'session-boot' | 'session') => Promise<{ ok: boolean }>;
         expandSessionOverlay: () => void;
       };
       clipboard: {

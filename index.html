@@ -32,6 +32,14 @@
       html.openwhispr-overlay-window #root {
         background: transparent;
       }
+
+      /* Session boot: transparent document; only panels paint (see styles.css). */
+      html.openwhispr-session-boot-window,
+      html.openwhispr-session-boot-window body,
+      html.openwhispr-session-boot-window #root {
+        background: transparent !important;
+        background-color: transparent !important;
+      }
     </style>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
