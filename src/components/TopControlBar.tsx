@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject } from 'react';
+import { CONTROL_BAR_WAVEFORM_BARS } from '../audio/controlBarSpectrum';
 import {
   CLAMP_MARGIN_FLOATING_BAR,
   clampControlBarPosition,
@@ -6,8 +7,6 @@ import {
   persistControlBarPosition,
 } from '../hooks/usePersistedControlBarPosition';
 import type { CapturePreference } from '../storage/appPreferences';
-
-const WAVE_COLORS = ['#8B5CF6', '#A855F7', '#c084fc', '#4BFBBA'] as const;
 
 export type TopControlBarVariant = 'floating' | 'embedded';
 
@@ -21,6 +20,8 @@ interface TopControlBarProps {
   isCollapsed: boolean;
   aiPanelOpen: boolean;
   reconnectAudioVisible?: boolean;
+  /** Live FFT-derived levels (0–1), updated in the capture meter loop; bar heights read in rAF. */
+  controlBarSpectrumRef?: MutableRefObject<Float32Array> | null;
   onToggleCapture: () => void;
   onToggleAiPanel: () => void;
   onToggleCollapse: () => void;
@@ -43,6 +44,7 @@ export function TopControlBar({
   isCollapsed,
   aiPanelOpen,
   reconnectAudioVisible = false,
+  controlBarSpectrumRef = null,
   onToggleCapture,
   onToggleAiPanel,
   onToggleCollapse,
@@ -55,16 +57,7 @@ export function TopControlBar({
   onReconnectAudio,
 }: TopControlBarProps) {
   const embedded = variant === 'embedded';
-  const waveformActive = isCapturing && statusTone !== 'processing';
-  const bars = useMemo(
-    () =>
-      Array.from({ length: 28 }, (_, i) => ({
-        h: 4 + ((i * 13) % 13),
-        delay: (i * 37) % 1000,
-        c: WAVE_COLORS[i % WAVE_COLORS.length],
-      })),
-    [],
-  );
+  const waveformMiniRef = useRef<HTMLDivElement | null>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const barSizeRef = useRef({ width: 640, height: 52 });
@@ -91,6 +84,37 @@ export function TopControlBar({
     document.addEventListener('pointerdown', onDocPointerDown, true);
     return () => document.removeEventListener('pointerdown', onDocPointerDown, true);
   }, [menuOpen]);
+
+  useEffect(() => {
+    const specRef = controlBarSpectrumRef;
+    if (!isCapturing || !specRef?.current) return;
+    const MIN_H = 2;
+    const MAX_H = 20;
+    const dim = statusTone === 'processing' ? 0.45 : 1;
+    let id = 0;
+    const tick = () => {
+      const root = waveformMiniRef.current;
+      const spec = specRef.current;
+      if (root && spec) {
+        const els = root.querySelectorAll<HTMLElement>('[data-wave-mini]');
+        els.forEach((el, i) => {
+          const v = Math.max(0, Math.min(1, (spec[i] ?? 0) * dim));
+          el.style.height = `${MIN_H + v * (MAX_H - MIN_H)}px`;
+        });
+      }
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(id);
+      const root = waveformMiniRef.current;
+      if (root) {
+        root.querySelectorAll<HTMLElement>('[data-wave-mini]').forEach((el) => {
+          el.style.height = '';
+        });
+      }
+    };
+  }, [isCapturing, controlBarSpectrumRef, statusTone]);
 
   useEffect(() => {
     positionRef.current = position;
@@ -175,6 +199,7 @@ export function TopControlBar({
   return (
     <div
       ref={rootRef}
+      data-session-bar-anchor={embedded ? 'true' : undefined}
       className={`top-control-bar-float-root ${embedded ? 'top-control-bar-float-root--embedded' : ''}`}
       style={rootStyle}
     >
@@ -204,17 +229,9 @@ export function TopControlBar({
           </button>
 
           {isCapturing ? (
-            <div className="waveform-mini" aria-hidden>
-              {bars.map((bar, i) => (
-                <span
-                  key={i}
-                  className={`waveform-mini-bar ${waveformActive ? 'waveform-mini-bar--anim' : ''}`}
-                  style={{
-                    height: `${bar.h}px`,
-                    background: bar.c,
-                    animationDelay: waveformActive ? `${bar.delay}ms` : undefined,
-                  }}
-                />
+            <div ref={waveformMiniRef} className="waveform-mini" aria-hidden>
+              {Array.from({ length: CONTROL_BAR_WAVEFORM_BARS }, (_, i) => (
+                <span key={i} data-wave-mini className="waveform-mini-bar" />
               ))}
             </div>
           ) : null}
@@ -225,47 +242,48 @@ export function TopControlBar({
         <div className="control-bar-drag-spacer" aria-hidden />
 
         <div className="control-bar-right">
-          {reconnectAudioVisible && (
-            <button type="button" className="glass-button glass-button-tight warning" onClick={onReconnectAudio}>
-              Reconectar
+          <div className="control-bar-right-cluster">
+            {reconnectAudioVisible && (
+              <button type="button" className="glass-button glass-button-tight warning" onClick={onReconnectAudio}>
+                Reconectar
+              </button>
+            )}
+
+            <button type="button" className="glass-button glass-button-tight" onClick={onToggleAiPanel}>
+              {aiPanelOpen ? 'Hide AI' : 'Ask AI'} <kbd>{askShortcutLabel}</kbd>
             </button>
-          )}
 
-          <button type="button" className="glass-button glass-button-tight" onClick={onToggleAiPanel}>
-            {aiPanelOpen ? 'Hide AI' : 'Ask AI'} <kbd>{askShortcutLabel}</kbd>
-          </button>
+            <button type="button" className="glass-button glass-button-tight" onClick={onToggleCollapse}>
+              {isCollapsed ? 'Mostrar' : 'Ocultar'} <kbd>{hideShortcutLabel}</kbd>
+            </button>
 
-          <button type="button" className="glass-button glass-button-tight" onClick={onToggleCollapse}>
-            {isCollapsed ? 'Expand' : 'Minimize'} <kbd>{hideShortcutLabel}</kbd>
-          </button>
-
-          <button
-            type="button"
-            className="glass-button-icon glass-home-button"
-            onClick={onHome}
-            aria-label="Home / Dashboard"
-            title="Dashboard"
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
-              <path d="M3 9.5 12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1V9.5z" strokeLinejoin="round" />
-            </svg>
-          </button>
-
-          <div className="top-control-menu-wrap" ref={menuRef}>
             <button
               type="button"
-              className={`glass-menu-dots ${menuOpen ? 'glass-menu-dots--open' : ''}`}
-              aria-label="Menu"
-              aria-expanded={menuOpen}
-              aria-haspopup="menu"
-              onClick={() => setMenuOpen((open) => !open)}
+              className="glass-button-icon glass-home-button"
+              onClick={onHome}
+              aria-label="Home / Dashboard"
+              title="Dashboard"
             >
-              <span />
-              <span />
-              <span />
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <path d="M3 9.5 12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1V9.5z" strokeLinejoin="round" />
+              </svg>
             </button>
-            {menuOpen ? (
-              <div className="top-control-menu-dropdown" role="menu">
+
+            <div className="top-control-menu-wrap" ref={menuRef}>
+              <button
+                type="button"
+                className={`glass-menu-dots ${menuOpen ? 'glass-menu-dots--open' : ''}`}
+                aria-label="Menu"
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                onClick={() => setMenuOpen((open) => !open)}
+              >
+                <span />
+                <span />
+                <span />
+              </button>
+              {menuOpen ? (
+                <div className="top-control-menu-dropdown" role="menu">
                 <button
                   type="button"
                   role="menuitem"
@@ -348,8 +366,9 @@ export function TopControlBar({
                 >
                   End session
                 </button>
-              </div>
-            ) : null}
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
       </header>

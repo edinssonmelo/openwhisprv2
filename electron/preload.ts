@@ -151,6 +151,7 @@ contextBridge.exposeInMainWorld('meetingAssistant', {
       glossary: string;
       refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
       prompt?: string;
+      numPredict?: number;
     }) => ipcRenderer.invoke('polisher:polish-segment', payload),
   },
   assistant: {

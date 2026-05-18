@@ -1,11 +1,14 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
 export function PremiumToast({ message, onDismiss }: { message: string | null; onDismiss: () => void }) {
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
+
   useEffect(() => {
     if (!message) return undefined;
-    const id = window.setTimeout(onDismiss, 2600);
+    const id = window.setTimeout(() => onDismissRef.current(), 2600);
     return () => window.clearTimeout(id);
-  }, [message, onDismiss]);
+  }, [message]);
 
   if (!message) return null;
 

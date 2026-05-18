@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { encodeWav } from './audio/wav';
+import { CONTROL_BAR_WAVEFORM_BARS, fillControlBarSpectrumFromAnalyser } from './audio/controlBarSpectrum';
 import { createVadEndpointing, type VadClosedSegment } from './audio/vadEndpointing';
 import { createTranscriptCandidateLedger, type LedgerDebugGroup, type LedgerSnapshot } from './audio/transcriptCandidateLedger';
 import {
@@ -24,6 +25,7 @@ import { SetupOnboarding } from './components/SetupOnboarding';
 import { PremiumToast } from './components/PremiumToast';
 import type { AssistantChatMessage } from './components/AssistantChatPanel';
 import { copyToClipboard } from './utils/copyToClipboard';
+import { generateMeetingSummaryLine } from './utils/generateMeetingSummary';
 import {
   getOnboardingSystemSkipped,
   isOnboardingComplete,
@@ -658,6 +660,7 @@ export default function App() {
   const pendingSessionStartRef = useRef(false);
   const [savedSessions, setSavedSessions] = useState<DashboardSessionSummary[]>(() => loadSavedSessions());
   const [selectedSavedSessionId, setSelectedSavedSessionId] = useState<string | null>(null);
+  const [meetingSummaryBusy, setMeetingSummaryBusy] = useState(false);
   const [platform, setPlatform] = useState<NodeJS.Platform | 'unknown'>('unknown');
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
@@ -778,6 +781,7 @@ export default function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamsRef = useRef<Partial<Record<SourceKey, MediaStream>>>({});
   const analysersRef = useRef<Partial<Record<SourceKey, AnalyserNode>>>({});
+  const controlBarSpectrumRef = useRef<Float32Array>(new Float32Array(CONTROL_BAR_WAVEFORM_BARS));
   const graphNodesRef = useRef<AudioNode[]>([]);
   const displayVideoSinkRef = useRef<HTMLVideoElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
@@ -1251,21 +1255,20 @@ export default function App() {
     setToastMessage(message);
   }, []);
 
-  const copyTranscript = useCallback(async () => {
+  const dismissToast = useCallback(() => {
+    setToastMessage(null);
+  }, []);
+
+  const copyTranscript = useCallback(async (): Promise<boolean> => {
     const useRefined = transcriptView === 'refined' && Boolean(refinedTranscript.text.trim());
     const text = useRefined ? refinedTranscript.text.trim() : visibleTranscriptText.trim();
-    if (!text) {
-      showToast('Aún no hay transcripción');
-      return;
-    }
+    if (!text) return false;
     const ok = await copyToClipboard(text);
-    if (ok) {
-      showToast('Transcripción copiada al portapapeles');
-    } else {
+    if (!ok) {
       debug('clipboard:transcript-failed');
-      showToast('No se pudo copiar. Prueba de nuevo tras hacer clic en la ventana.');
     }
-  }, [refinedTranscript.text, showToast, transcriptView, visibleTranscriptText]);
+    return ok;
+  }, [refinedTranscript.text, transcriptView, visibleTranscriptText]);
 
   const copyLastAiResponse = useCallback(async () => {
     const lastResponse = [...chatMessages].reverse().find((message) => message.role === 'assistant')?.text.trim();
@@ -1275,11 +1278,6 @@ export default function App() {
       debug('clipboard:ai-error');
     }
   }, [chatMessages]);
-
-  const clearSavedSessions = useCallback(() => {
-    setSavedSessions([]);
-    setSelectedSavedSessionId(null);
-  }, []);
 
   const patchMeter = useCallback((source: SourceKey, patch: Partial<MeterState>) => {
     setMeters((current) => {
@@ -1734,6 +1732,31 @@ export default function App() {
           error: silence ? 'rms-zero: stream activo, pero RMS bajo/silencioso' : null,
         });
       });
+      const spectrum = controlBarSpectrumRef.current;
+      const mode = lastCaptureModeRef.current;
+      if (spectrum) {
+        if (mode) {
+          const order: SourceKey[] =
+            mode === 'mic' ? ['mic', 'mixed'] : mode === 'system' ? ['system', 'mixed'] : ['mixed', 'mic', 'system'];
+          const preferred = liveTranscriptionSourceRef.current;
+          const seen = new Set<SourceKey>();
+          const ordered: SourceKey[] = [];
+          for (const s of [preferred, ...order]) {
+            if (seen.has(s)) continue;
+            seen.add(s);
+            ordered.push(s);
+          }
+          let primaryAnalyser: AnalyserNode | undefined;
+          for (const s of ordered) {
+            primaryAnalyser = analysersRef.current[s];
+            if (primaryAnalyser) break;
+          }
+          if (primaryAnalyser) fillControlBarSpectrumFromAnalyser(primaryAnalyser, spectrum);
+          else spectrum.fill(0);
+        } else {
+          spectrum.fill(0);
+        }
+      }
       if (now - lastMeterDebugAt > 2000) {
         lastMeterDebugAt = now;
         debug('meters', meterSnapshot);
@@ -1746,6 +1769,7 @@ export default function App() {
   const stopMeterLoop = useCallback(() => {
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     animationFrameRef.current = null;
+    controlBarSpectrumRef.current.fill(0);
   }, []);
 
   function runCaptureLifecycle<T>(label: string, task: () => Promise<T>): Promise<T> {
@@ -4461,27 +4485,59 @@ export default function App() {
     }, 250);
   }, [addLog, captureMode]);
 
-  const saveCurrentSessionSnapshot = useCallback(() => {
+  const saveCurrentSessionSnapshot = useCallback((options?: { aiSummary?: string }) => {
     const transcriptText = visibleTranscriptText.trim();
     const refinedText = refinedTranscript.text.trim();
-    if (!transcriptText && rawSegments.length === 0) return;
+    if (!transcriptText && !refinedText && rawSegments.length === 0) return;
 
-    const createdAt = Date.now();
+    const createdAt = captureStartedAt ?? Date.now();
+    const endedAt = Date.now();
     const source = rawSegments[0]?.source ?? captureMode ?? 'system';
+    const explicitAi = options?.aiSummary?.trim();
+    const meetingSummary =
+      explicitAi && explicitAi.length > 0 ? explicitAi.slice(0, 12_000) : undefined;
+    const flatOneLine = (s: string, max: number) => {
+      const t = s.replace(/\s+/g, ' ').trim();
+      if (t.length <= max) return t;
+      return `${t.slice(0, max - 1)}…`;
+    };
+    const refinedSummaryLine = meetingSummary
+      ? flatOneLine(meetingSummary, 220)
+      : refinedText
+        ? refinedText
+            .split('\n')
+            .map((l) => l.trim())
+            .find(Boolean)
+            ?.slice(0, 280)
+        : undefined;
     const session: DashboardSessionSummary = {
-      id: `session-${createdAt}`,
+      id: `session-${endedAt}`,
       title: createSessionTitle(createdAt),
       createdAt,
       durationSeconds: captureElapsedSeconds,
-      transcriptPreview: transcriptText.slice(0, 180),
+      transcriptPreview: (meetingSummary || transcriptText || refinedText).slice(0, 220),
       transcriptText,
       refinedText: refinedText || undefined,
+      refinedSummaryLine: refinedSummaryLine || undefined,
+      meetingSummary,
       source,
       status: 'completed',
     };
     setSavedSessions((current) => [session, ...current].slice(0, 20));
     setSelectedSavedSessionId(session.id);
-  }, [captureElapsedSeconds, captureMode, rawSegments, refinedTranscript.text, visibleTranscriptText]);
+  }, [
+    captureElapsedSeconds,
+    captureMode,
+    captureStartedAt,
+    rawSegments,
+    refinedTranscript.text,
+    visibleTranscriptText,
+  ]);
+
+  const deleteSavedSession = useCallback((id: string) => {
+    setSavedSessions((current) => current.filter((s) => s.id !== id));
+    setSelectedSavedSessionId((cur) => (cur === id ? null : cur));
+  }, []);
 
   const onSessionUiFirstPaint = useCallback(() => {
     if (appModeRef.current !== 'session-boot' || !pendingSessionStartRef.current) return;
@@ -4623,15 +4679,56 @@ export default function App() {
     };
     captureDiag('session:finish-request', finishPayload);
     debug('session:finish-request', finishPayload);
-    saveCurrentSessionSnapshot();
     pendingSessionStartRef.current = false;
     setPendingSessionStart(false);
     setSessionCaptureStarting(false);
-    await stopCapture({ reason: 'sesión finalizada' });
+    setMeetingSummaryBusy(true);
+    try {
+      await stopCapture({ reason: 'sesión finalizada' });
+    } catch (error) {
+      captureDiag('session:finish-stop-error', { error: String(error) });
+      debug('session:finish-stop-error', String(error));
+      setMeetingSummaryBusy(false);
+      showToast('No se pudo detener la captura.');
+      return;
+    }
     setAiPanelOpen(false);
     setOverlayCollapsed(false);
     setAppMode('dashboard');
-  }, [captureMode, saveCurrentSessionSnapshot, stopCapture]);
+
+    const transcriptForSummary = visibleTranscriptText.trim();
+    const refinedForSummary = refinedTranscript.text.trim();
+    const hasMeetingPayload =
+      Boolean(transcriptForSummary || refinedForSummary) || rawSegments.length > 0;
+
+    let aiSummary: string | undefined;
+    if (hasMeetingPayload) {
+      try {
+        aiSummary = await generateMeetingSummaryLine({
+          transcript: transcriptForSummary,
+          refined: refinedForSummary,
+          glossary,
+          polisherOk: Boolean(polisherSetup?.ok),
+          polishSegment: window.meetingAssistant.polisher.polishSegment,
+        });
+      } catch (error) {
+        debug('session:finish-summary-error', String(error));
+      }
+    }
+
+    saveCurrentSessionSnapshot(hasMeetingPayload ? { aiSummary } : undefined);
+    setMeetingSummaryBusy(false);
+  }, [
+    captureMode,
+    glossary,
+    polisherSetup?.ok,
+    rawSegments.length,
+    refinedTranscript.text,
+    saveCurrentSessionSnapshot,
+    showToast,
+    stopCapture,
+    visibleTranscriptText,
+  ]);
 
   const transcriptListeningHint = (() => {
     if (sessionCaptureStarting && !captureMode) return 'Starting capture…';
@@ -4946,11 +5043,12 @@ export default function App() {
           sessions={savedSessions}
           onStartSession={startDashboardSession}
           onOpenSession={(session) => setSelectedSavedSessionId(session.id)}
-          onClearSessions={clearSavedSessions}
+          onDeleteSession={deleteSavedSession}
           onNotify={showToast}
           onRerunSetup={() => setSetupWizardOpen(true)}
+          meetingSummaryBusy={meetingSummaryBusy}
         />
-        <PremiumToast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+        <PremiumToast message={toastMessage} onDismiss={dismissToast} />
       </>
     );
   }
@@ -4979,6 +5077,7 @@ export default function App() {
         chatBusy={chatBusy}
         chatError={chatError}
         reconnectAudioVisible={showReconnectAudio}
+        controlBarSpectrumRef={controlBarSpectrumRef}
         onTranscriptViewChange={setTranscriptView}
         onCopyTranscript={copyTranscript}
         onChatInputChange={setChatInput}
@@ -5045,7 +5144,7 @@ export default function App() {
         settings={settingsPanel}
         debug={debugPanel}
       />
-      <PremiumToast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+      <PremiumToast message={toastMessage} onDismiss={dismissToast} />
     </>
   );
 }

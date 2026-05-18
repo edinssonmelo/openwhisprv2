@@ -209,6 +209,7 @@ declare global {
           glossary: string;
           refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
           prompt?: string;
+          numPredict?: number;
         }) => Promise<{
           ok: boolean;
           batchId: string;

@@ -514,6 +514,8 @@ function applySessionOverlayChromeOnly() {
 function expandSessionOverlayToFullDisplay() {
   if (!mainWindow || !OPENWHISPR_OVERLAY_WINDOW) return;
   mainWindow.setBounds(getOverlayTargetBounds());
+  mainWindow.setMinimumSize(520, 300);
+  mainWindow.setResizable(true);
   mainWindow.setBackgroundColor('#00000000');
   setTimeout(() => {
     mainWindow?.setBackgroundColor('#00000000');
@@ -937,6 +939,8 @@ function registerIpc() {
     glossary: string;
     refinementMode?: TranscriptRefinementMode;
     prompt?: string;
+    /** Ollama `num_predict`; default 700. Use higher values for meeting summaries. */
+    numPredict?: number;
   }) => {
     return polishSegment(payload);
   });
@@ -1746,6 +1750,7 @@ async function polishSegment(payload: {
   glossary: string;
   refinementMode?: TranscriptRefinementMode;
   prompt?: string;
+  numPredict?: number;
 }) {
   const setup = await checkPolisherSetup();
   const startedAt = Date.now();
@@ -1812,7 +1817,7 @@ async function polishSegment(payload: {
         options: {
           temperature: 0.1,
           top_p: 0.8,
-          num_predict: 700,
+          num_predict: Math.min(Math.max(payload.numPredict ?? 700, 64), 8192),
         },
       }),
     });
@@ -1827,7 +1832,10 @@ async function polishSegment(payload: {
     }
 
     const data = await response.json() as { response?: string };
-    const text = sanitizePolishedText(data.response ?? '');
+    const rawResponse = data.response ?? '';
+    const text = payload.batchId.startsWith('meeting-summary-')
+      ? sanitizeMeetingSummaryText(rawResponse)
+      : sanitizePolishedText(rawResponse);
     debugLog('polisher:result', {
       batchId: payload.batchId,
       durationMs: Date.now() - startedAt,
@@ -1857,6 +1865,16 @@ function sanitizePolishedText(text: string) {
   return text
     .replace(/^["'“”]+|["'“”]+$/g, '')
     .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Keeps paragraph breaks for meeting summaries (avoid collapsing to one line). */
+function sanitizeMeetingSummaryText(text: string) {
+  return text
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
     .trim();
 }
 

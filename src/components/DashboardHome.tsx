@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
-import { DASHBOARD_PREVIEW_MOCKS } from '../data/dashboardPreviewMocks';
 import { copyToClipboard } from '../utils/copyToClipboard';
-import { getSessionCopyText } from '../utils/meetingDetailCopy';
+import { groupDashboardSessionsByDay } from '../utils/dashboardMeetingsGroup';
+import { getSessionCopyText, getMeetingSummaryCopyText } from '../utils/meetingDetailCopy';
 import { formatDurationMins } from '../utils/meetingDetailFormat';
 import type { DashboardSessionSummary } from '../types/dashboardSession';
 import { readDashboardTheme, writeDashboardTheme, type DashboardTheme } from '../storage/dashboardTheme';
@@ -20,27 +20,21 @@ interface DashboardHomeProps {
   sessions: DashboardSessionSummary[];
   onStartSession: () => void;
   onOpenSession: (session: DashboardSessionSummary) => void;
-  onClearSessions: () => void;
+  onDeleteSession?: (sessionId: string) => void;
   onNotify?: (message: string) => void;
   onRerunSetup?: () => void;
-}
-
-function formatSessionDateRow(value: number) {
-  return new Intl.DateTimeFormat('en-GB', {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-  })
-    .format(new Date(value))
-    .toLowerCase();
+  /** Small spinner in the top bar while the last meeting summary is being saved. */
+  meetingSummaryBusy?: boolean;
 }
 
 function sessionSummaryLine(session: DashboardSessionSummary): string {
+  const sum = session.meetingSummary?.trim() || session.refinedSummaryLine?.trim();
+  if (sum) return sum.length > 140 ? `${sum.slice(0, 137)}…` : sum;
   const p = session.transcriptPreview?.trim();
   if (p) return p;
   const t = session.transcriptText?.trim();
   if (t) return t.length > 140 ? `${t.slice(0, 137)}…` : t;
-  const r = session.refinedSummaryLine?.trim() || session.refinedText?.trim();
+  const r = session.refinedText?.trim();
   if (r) return r.length > 140 ? `${r.slice(0, 137)}…` : r;
   return 'No description yet.';
 }
@@ -96,9 +90,10 @@ export function DashboardHome({
   sessions,
   onStartSession,
   onOpenSession,
-  onClearSessions,
+  onDeleteSession,
   onNotify,
   onRerunSetup,
+  meetingSummaryBusy,
 }: DashboardHomeProps) {
   const profileWrapRef = useRef<HTMLDivElement>(null);
   const [profileOpen, setProfileOpen] = useState(false);
@@ -112,29 +107,34 @@ export function DashboardHome({
   const [librarySearch, setLibrarySearch] = useState('');
   const [dashboardTheme, setDashboardTheme] = useState<DashboardTheme>(() => readDashboardTheme());
 
-  const usingMocks = sessions.length === 0;
-  const sourceList = usingMocks ? DASHBOARD_PREVIEW_MOCKS : sessions;
-
   const filteredSessions = useMemo(() => {
+    const sorted = [...sessions].sort((a, b) => b.createdAt - a.createdAt);
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return sourceList;
-    return sourceList.filter((session) => {
-      return `${session.title} ${session.transcriptPreview} ${session.transcriptText}`.toLowerCase().includes(query);
+    if (!query) return sorted;
+    return sorted.filter((session) => {
+      const hay = `${session.title} ${session.transcriptPreview ?? ''} ${session.transcriptText ?? ''} ${session.refinedText ?? ''} ${session.refinedSummaryLine ?? ''} ${session.meetingSummary ?? ''}`.toLowerCase();
+      return hay.includes(query);
     });
-  }, [sourceList, searchQuery]);
+  }, [sessions, searchQuery]);
 
   const filteredLibrarySessions = useMemo(() => {
+    const sorted = [...sessions].sort((a, b) => b.createdAt - a.createdAt);
     const q = librarySearch.trim().toLowerCase();
-    if (!q) return sourceList;
-    return sourceList.filter((session) => {
-      return `${session.title} ${session.transcriptPreview} ${session.transcriptText}`.toLowerCase().includes(q);
+    if (!q) return sorted;
+    return sorted.filter((session) => {
+      const hay = `${session.title} ${session.transcriptPreview ?? ''} ${session.transcriptText ?? ''} ${session.refinedText ?? ''} ${session.refinedSummaryLine ?? ''} ${session.meetingSummary ?? ''}`.toLowerCase();
+      return hay.includes(q);
     });
-  }, [sourceList, librarySearch]);
+  }, [sessions, librarySearch]);
 
-  const homeVisibleSessions = useMemo(
+  const homeSessionsLimited = useMemo(
     () => filteredSessions.slice(0, MEETINGS_RECENT_VISIBLE),
     [filteredSessions],
   );
+
+  const homeDayGroups = useMemo(() => groupDashboardSessionsByDay(homeSessionsLimited), [homeSessionsLimited]);
+
+  const libraryDayGroups = useMemo(() => groupDashboardSessionsByDay(filteredLibrarySessions), [filteredLibrarySessions]);
 
   const hasMoreMeetings = filteredSessions.length > MEETINGS_RECENT_VISIBLE;
 
@@ -201,6 +201,15 @@ export function DashboardHome({
 
   const closeProfileModal = () => setProfileModal(null);
 
+  const confirmDeleteSession = (session: DashboardSessionSummary) => {
+    if (!onDeleteSession) return;
+    if (!window.confirm('¿Eliminar esta reunión? Esta acción no se puede deshacer.')) return;
+    if (openedSession?.id === session.id) setOpenedSession(null);
+    onDeleteSession(session.id);
+    setRowMenuKey(null);
+    onNotify?.('Reunión eliminada.');
+  };
+
   const openMeetingDetail = (session: DashboardSessionSummary) => {
     onOpenSession(session);
     setOpenedSession(session);
@@ -218,7 +227,7 @@ export function DashboardHome({
   };
 
   const copySummaryForSession = async (session: DashboardSessionSummary) => {
-    const s = session.refinedSummaryLine?.trim() || session.refinedText?.trim();
+    const s = getMeetingSummaryCopyText(session);
     if (!s) {
       onNotify?.('No summary for this meeting.');
       return;
@@ -244,13 +253,7 @@ export function DashboardHome({
         <button type="button" className="dashboard-meeting-card-main" onClick={handleOpen}>
           <div className="dashboard-meeting-card-top">
             <h3 className="dashboard-meeting-card-title">{session.title}</h3>
-            <div className="dashboard-meeting-card-datetime" aria-label="Date and duration">
-              <time className="dashboard-meeting-card-date" dateTime={new Date(session.createdAt).toISOString()}>
-                {formatSessionDateRow(session.createdAt)}
-              </time>
-              <span className="dashboard-meeting-card-meta-sep" aria-hidden>
-                ·
-              </span>
+            <div className="dashboard-meeting-card-datetime" aria-label="Duración">
               <span className="dashboard-meeting-card-duration">{formatDurationMins(session.durationSeconds)}</span>
             </div>
           </div>
@@ -304,6 +307,11 @@ export function DashboardHome({
               >
                 Copy summary
               </button>
+              {onDeleteSession ? (
+                <button type="button" role="menuitem" className="is-danger" onClick={() => confirmDeleteSession(session)}>
+                  Eliminar
+                </button>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -328,6 +336,17 @@ export function DashboardHome({
           </label>
         </div>
         <div className="dashboard-top-nav-actions">
+          {meetingSummaryBusy ? (
+            <span
+              className="dashboard-top-nav-saving"
+              role="status"
+              aria-live="polite"
+              aria-label="Guardando resumen de la reunión"
+              title="Guardando resumen…"
+            >
+              <span className="dashboard-top-nav-saving-spinner" aria-hidden />
+            </span>
+          ) : null}
           <button type="button" className="dashboard-top-nav-icon" aria-label="Notifications">
             <IconBell className="dashboard-shadcn-icon" />
           </button>
@@ -398,22 +417,20 @@ export function DashboardHome({
               </button>
             </div>
 
-            <div className="dashboard-meetings-head">
-              <h2 className="dashboard-meetings-title">Recent meetings</h2>
-              {!usingMocks && sessions.length > 0 ? (
-                <div className="dashboard-meetings-head-actions">
-                  <button type="button" className="dashboard-shadcn-clear" onClick={onClearSessions}>
-                    Clear all
-                  </button>
-                </div>
-              ) : null}
-            </div>
-
             <div className="dashboard-meetings-list">
               {filteredSessions.length === 0 ? (
-                <div className="dashboard-meetings-empty">No meetings match your search.</div>
+                <div className="dashboard-meetings-empty">
+                  {sessions.length === 0 && !searchQuery.trim()
+                    ? 'Aún no hay reuniones. Pulsa «Nueva sesión» para grabar y transcribir.'
+                    : 'Ninguna reunión coincide con la búsqueda.'}
+                </div>
               ) : (
-                homeVisibleSessions.map((session) => renderMeetingCard(session, false))
+                homeDayGroups.map((group) => (
+                  <div key={group.dayKey} className="dashboard-meetings-day-block">
+                    <h3 className="dashboard-meetings-day-heading">{group.label}</h3>
+                    {group.sessions.map((session) => renderMeetingCard(session, false))}
+                  </div>
+                ))
               )}
             </div>
             {hasMoreMeetings ? (
@@ -486,9 +503,18 @@ export function DashboardHome({
             <div className="dashboard-meetings-library-list-scroll">
               <div className="dashboard-meetings-list">
                 {filteredLibrarySessions.length === 0 ? (
-                  <div className="dashboard-meetings-empty">No meetings match your search.</div>
+                  <div className="dashboard-meetings-empty">
+                    {sessions.length === 0
+                      ? 'Aún no hay reuniones guardadas.'
+                      : 'Ninguna reunión coincide con la búsqueda.'}
+                  </div>
                 ) : (
-                  filteredLibrarySessions.map((session) => renderMeetingCard(session, true))
+                  libraryDayGroups.map((group) => (
+                    <div key={group.dayKey} className="dashboard-meetings-day-block">
+                      <h3 className="dashboard-meetings-day-heading">{group.label}</h3>
+                      {group.sessions.map((session) => renderMeetingCard(session, true))}
+                    </div>
+                  ))
                 )}
               </div>
             </div>

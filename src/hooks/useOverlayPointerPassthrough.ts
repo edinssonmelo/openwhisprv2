@@ -6,6 +6,7 @@ function overlayHitIsInteractive(clientX: number, clientY: number, settingsOpen:
   if (settingsOpen && el.closest('.settings-overlay')) return true;
   if (el.closest('.home-confirm-backdrop')) return true;
   if (el.closest('[data-session-drag-region="true"]')) return true;
+  if (el.closest('.session-peek-reopen-strip')) return true;
   if (el.closest('.top-control-menu-dropdown')) return true;
   const inFrame = el.closest('.session-floating-frame');
   if (inFrame) {

@@ -1,5 +1,11 @@
-import { useEffect, useId, useRef } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef } from 'react';
 import type { AssistantChatMessage } from './AssistantChatPanel';
+
+const AI_NEAR_BOTTOM_PX = 56;
+
+function aiScrollNearBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= AI_NEAR_BOTTOM_PX;
+}
 
 interface AiOverlayPanelProps {
   open: boolean;
@@ -68,14 +74,48 @@ export function AiOverlayPanel({
   onCopyLastResponse,
 }: AiOverlayPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const rawId = useId();
   const gradientId = `ai-grad-${rawId.replace(/[:]/g, '')}`;
   const lastAssistantMessage = [...messages].reverse().find((message) => message.role === 'assistant');
 
   useEffect(() => {
+    if (open) {
+      stickToBottomRef.current = true;
+    }
+  }, [open]);
+
+  useEffect(() => {
     if (!open) return;
     const id = window.setTimeout(() => inputRef.current?.focus(), 80);
     return () => window.clearTimeout(id);
+  }, [open]);
+
+  const onMessagesScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = aiScrollNearBottom(el);
+  };
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const el = scrollRef.current;
+    if (!el || !stickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [open, messages, busy, error]);
+
+  useEffect(() => {
+    if (!open) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (stickToBottomRef.current) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [open]);
 
   if (!open) return null;
@@ -102,7 +142,7 @@ export function AiOverlayPanel({
         </div>
       </header>
 
-      <div className="ai-panel-body custom-scrollbar">
+      <div ref={scrollRef} className="ai-panel-body custom-scrollbar" onScroll={onMessagesScroll}>
         {messages.length === 0 ? (
           <p className="ai-panel-hint">
             Escribe una pregunta o pulsa Enter para pedir ayuda sobre lo último dicho.

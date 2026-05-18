@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { DashboardSessionSummary } from '../../types/dashboardSession';
 import { copyToClipboard } from '../../utils/copyToClipboard';
-import { getSessionCopyText } from '../../utils/meetingDetailCopy';
+import { getMeetingSummaryCopyText, getSessionCopyText } from '../../utils/meetingDetailCopy';
 
 function IconCopy({ className }: { className?: string }) {
   return (
@@ -30,6 +30,15 @@ function InlineSpinner({ className }: { className?: string }) {
   return <span className={`dashboard-inline-spinner ${className ?? ''}`} aria-hidden />;
 }
 
+function summaryBodyText(session: DashboardSessionSummary): string {
+  const fromMeeting = session.meetingSummary?.trim();
+  if (fromMeeting) return fromMeeting;
+  const line = session.refinedSummaryLine?.trim() || session.refinedText?.trim();
+  if (line) return line;
+  const t = session.transcriptText?.trim() || session.transcriptPreview?.trim();
+  return t || '';
+}
+
 export function MeetingTranscriptPane({
   session,
   onNotify,
@@ -41,6 +50,10 @@ export function MeetingTranscriptPane({
 }) {
   const [copyTranscriptPending, setCopyTranscriptPending] = useState(false);
   const [copySummaryPending, setCopySummaryPending] = useState(false);
+
+  const summaryText = summaryBodyText(session);
+  const showRefinedSection =
+    Boolean(session.refinedText?.trim()) && !session.meetingSummary?.trim();
 
   const onCopyTranscript = async () => {
     if (copyTranscriptPending) return;
@@ -60,7 +73,7 @@ export function MeetingTranscriptPane({
 
   const onCopySummary = async () => {
     if (copySummaryPending) return;
-    const s = session.refinedSummaryLine?.trim() || session.refinedText?.trim();
+    const s = getMeetingSummaryCopyText(session);
     if (!s) {
       onNotify?.('No summary for this meeting.');
       return;
@@ -99,23 +112,39 @@ export function MeetingTranscriptPane({
         </button>
       </div>
       <div className="meeting-transcript__body">
-        {session.refinedSummaryLine || session.refinedText ? (
-          <p className="meeting-transcript__lead">{session.refinedSummaryLine || session.refinedText}</p>
-        ) : null}
-        {session.nextStepsLine ? <p className="meeting-transcript__next">{session.nextStepsLine}</p> : null}
-        {session.dialogueLines && session.dialogueLines.length > 0 ? (
-          <div className="meeting-transcript__dialogue">
-            {session.dialogueLines.map((line, i) => (
-              <p key={`${line.speaker}-${i}`}>
-                <span className="meeting-transcript__speaker">{line.speaker}:</span> {line.text}
-              </p>
-            ))}
+        <div className="meeting-transcript__section meeting-transcript__section--summary">
+          <h4 className="meeting-transcript__section-label">Summary</h4>
+          {summaryText ? (
+            <p className="meeting-transcript__summary-body">{summaryText}</p>
+          ) : (
+            <p className="meeting-transcript__plain meeting-transcript__muted">No summary yet.</p>
+          )}
+          {session.nextStepsLine ? <p className="meeting-transcript__next">{session.nextStepsLine}</p> : null}
+        </div>
+
+        <div className="meeting-transcript__section">
+          <h4 className="meeting-transcript__section-label">Transcripción</h4>
+          {session.dialogueLines && session.dialogueLines.length > 0 ? (
+            <div className="meeting-transcript__dialogue">
+              {session.dialogueLines.map((line, i) => (
+                <p key={`${line.speaker}-${i}`}>
+                  <span className="meeting-transcript__speaker">{line.speaker}:</span> {line.text}
+                </p>
+              ))}
+            </div>
+          ) : (
+            <p className="meeting-transcript__plain">
+              {session.transcriptText?.trim() || session.transcriptPreview?.trim() || 'Sin transcripción.'}
+            </p>
+          )}
+        </div>
+
+        {showRefinedSection ? (
+          <div className="meeting-transcript__section meeting-transcript__section--refined">
+            <h4 className="meeting-transcript__section-label">Refinado</h4>
+            <p className="meeting-transcript__plain meeting-transcript__plain--refined">{session.refinedText}</p>
           </div>
-        ) : (
-          <p className="meeting-transcript__plain">
-            {session.transcriptText?.trim() || session.transcriptPreview?.trim() || 'No transcript.'}
-          </p>
-        )}
+        ) : null}
       </div>
     </div>
   );

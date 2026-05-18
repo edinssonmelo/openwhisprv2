@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
 import { useOverlayPointerPassthrough } from '../hooks/useOverlayPointerPassthrough';
 import { AiOverlayPanel } from './AiOverlayPanel';
 import type { AssistantChatMessage } from './AssistantChatPanel';
@@ -7,6 +7,7 @@ import { OverlayStage } from './OverlayStage';
 import { SessionFloatingFrame } from './SessionFloatingFrame';
 import { TopControlBar } from './TopControlBar';
 import type { CapturePreference } from '../storage/appPreferences';
+import { TranscriptBrandIcon } from './TranscriptBrandIcon';
 
 interface FloatingAssistantShellProps {
   /** Overlay session boot: window stays dashboard-sized until first paint completes. */
@@ -31,8 +32,9 @@ interface FloatingAssistantShellProps {
   chatBusy: boolean;
   chatError: string | null;
   reconnectAudioVisible?: boolean;
+  controlBarSpectrumRef: MutableRefObject<Float32Array>;
   onTranscriptViewChange: (view: 'live' | 'refined') => void;
-  onCopyTranscript: () => void;
+  onCopyTranscript: () => boolean | Promise<boolean>;
   onChatInputChange: (value: string) => void;
   onChatSubmit: () => void;
   onCopyLastAiResponse: () => void;
@@ -77,6 +79,7 @@ export function FloatingAssistantShell({
   chatBusy,
   chatError,
   reconnectAudioVisible = false,
+  controlBarSpectrumRef,
   onTranscriptViewChange,
   onCopyTranscript,
   onChatInputChange,
@@ -102,6 +105,11 @@ export function FloatingAssistantShell({
 }: FloatingAssistantShellProps) {
   const lastAudioScrollNonceRef = useRef(0);
   const [glassReady, setGlassReady] = useState(false);
+  const [transcriptMinimized, setTranscriptMinimized] = useState(false);
+
+  useEffect(() => {
+    if (overlayCollapsed) setTranscriptMinimized(false);
+  }, [overlayCollapsed]);
 
   useEffect(() => {
     if (!booting || !onFirstPaint) return;
@@ -187,6 +195,7 @@ export function FloatingAssistantShell({
       isCollapsed={overlayCollapsed}
       aiPanelOpen={aiPanelOpen}
       reconnectAudioVisible={reconnectAudioVisible}
+      controlBarSpectrumRef={controlBarSpectrumRef}
       onToggleCapture={onToggleCapture}
       onToggleAiPanel={toggleAiPanel}
       onToggleCollapse={onToggleOverlay}
@@ -203,53 +212,80 @@ export function FloatingAssistantShell({
   const glassSurfaceClass = booting ? 'overlay-glass-cold' : glassReady ? 'overlay-glass-ready' : 'overlay-glass-cold';
   const bootClass = booting ? 'session-booting ' : '';
 
+  const aiSidePanel = aiPanelOpen ? (
+    <div className="overlay-right-stack">
+      <AiOverlayPanel
+        open={aiPanelOpen}
+        messages={chatMessages}
+        input={chatInput}
+        busy={chatBusy}
+        error={chatError}
+        localAiReady={localAiReady}
+        onInputChange={onChatInputChange}
+        onSubmit={onChatSubmit}
+        onClose={onCloseAiPanel}
+        onCopyLastResponse={onCopyLastAiResponse}
+      />
+    </div>
+  ) : null;
+
   return (
     <main
       className={`floating-page ${bootClass}${glassSurfaceClass} ${overlayCollapsed ? 'overlay-collapsed' : ''} ${settingsOpen ? 'settings-open' : ''}`}
     >
       {homeConfirmDialog}
       <OverlayStage>
-        <SessionFloatingFrame collapsed={overlayCollapsed}>
-          {!overlayCollapsed ? (
+        {overlayCollapsed ? (
+          <button
+            type="button"
+            className="session-peek-reopen-strip"
+            onClick={onToggleOverlay}
+            title="Mostrar barra de control"
+            aria-label="Mostrar barra de control"
+          />
+        ) : (
+          <SessionFloatingFrame collapsed={false} transcriptMinimized={transcriptMinimized}>
             <>
-              <div className="session-frame-left">
-                <LiveTranscriptPanel
-                  text={transcriptText}
-                  refinedText={refinedText}
-                  activeView={transcriptView}
-                  onViewChange={onTranscriptViewChange}
-                  refinementAvailable={refinementAvailable}
-                  footerStatusLabel={statusLabel}
-                  listeningHint={transcriptListeningHint}
-                  onCopy={onCopyTranscript}
-                />
-              </div>
-              <div className="session-frame-right">
-                {controlBar}
-                {aiPanelOpen ? (
-                  <div className="overlay-right-stack">
-                    <AiOverlayPanel
-                      open={aiPanelOpen}
-                      messages={chatMessages}
-                      input={chatInput}
-                      busy={chatBusy}
-                      error={chatError}
-                      localAiReady={localAiReady}
-                      onInputChange={onChatInputChange}
-                      onSubmit={onChatSubmit}
-                      onClose={onCloseAiPanel}
-                      onCopyLastResponse={onCopyLastAiResponse}
+              {transcriptMinimized ? (
+                <div className="session-frame-right">
+                  <div className="session-frame-bar-latch-row">
+                    <button
+                      type="button"
+                      className="glass-button-icon glass-home-button transcript-restore-ux-btn"
+                      onClick={() => setTranscriptMinimized(false)}
+                      title="Mostrar transcripción"
+                      aria-label="Mostrar panel de transcripción"
+                    >
+                      <TranscriptBrandIcon className="transcript-restore-ux-btn__icon" size={18} />
+                    </button>
+                    <div className="transcript-restore-bar-slot">{controlBar}</div>
+                  </div>
+                  {aiSidePanel}
+                </div>
+              ) : (
+                <>
+                  <div className="session-frame-left session-frame-left--resizable">
+                    <LiveTranscriptPanel
+                      text={transcriptText}
+                      refinedText={refinedText}
+                      activeView={transcriptView}
+                      onViewChange={onTranscriptViewChange}
+                      refinementAvailable={refinementAvailable}
+                      footerStatusLabel={statusLabel}
+                      listeningHint={transcriptListeningHint}
+                      onCopy={onCopyTranscript}
+                      onMinimize={() => setTranscriptMinimized(true)}
                     />
                   </div>
-                ) : null}
-              </div>
+                  <div className="session-frame-right">
+                    {controlBar}
+                    {aiSidePanel}
+                  </div>
+                </>
+              )}
             </>
-          ) : (
-            <div className="session-frame-right session-frame-right--bar-only">
-              {controlBar}
-            </div>
-          )}
-        </SessionFloatingFrame>
+          </SessionFloatingFrame>
+        )}
 
         <aside className="settings-overlay">
           <div className="settings-shell glass-panel">

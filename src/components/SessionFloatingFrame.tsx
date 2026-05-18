@@ -10,11 +10,13 @@ import {
 interface SessionFloatingFrameProps {
   /** When collapsed, frame height is minimal (bar only); still use same position. */
   collapsed: boolean;
+  /** Transcript column hidden to a chip — participates in bar screen anchoring. */
+  transcriptMinimized: boolean;
   children: ReactNode;
 }
 
 /** Single draggable unit: positions the whole session composition (bar + panels). */
-export function SessionFloatingFrame({ collapsed, children }: SessionFloatingFrameProps) {
+export function SessionFloatingFrame({ collapsed, transcriptMinimized, children }: SessionFloatingFrameProps) {
   const frameRef = useRef<HTMLDivElement>(null);
   const columnsRef = useRef<HTMLDivElement>(null);
   const sizeRef = useRef({ width: 820, height: 400 });
@@ -28,34 +30,72 @@ export function SessionFloatingFrame({ collapsed, children }: SessionFloatingFra
     origY: number;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
+  /** Last stable screen X of the embedded control bar root (`[data-session-bar-anchor]`) before layout changes. */
+  const barScreenLeftRef = useRef<number | null>(null);
+  const prevLayoutSigRef = useRef<string | null>(null);
 
   useEffect(() => {
     positionRef.current = position;
   }, [position]);
 
-  const remeasureAndClamp = () => {
+  const measureColumnsSize = () => {
     const el = columnsRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
     sizeRef.current = { width: r.width, height: r.height };
-    setPosition((prev) => {
-      const c = clampControlBarPosition(prev, r.width, r.height, CLAMP_MARGIN_SESSION_FRAME);
-      if (c.x !== prev.x || c.y !== prev.y) persistControlBarPosition(c, 'sessionFrame');
-      return c;
-    });
   };
 
   useLayoutEffect(() => {
     const el = columnsRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => remeasureAndClamp());
+    const ro = new ResizeObserver(() => {
+      measureColumnsSize();
+    });
     ro.observe(el);
-    remeasureAndClamp();
+    measureColumnsSize();
     return () => ro.disconnect();
-  }, [collapsed]);
+  }, []);
+
+  useLayoutEffect(() => {
+    const layoutSig = `${collapsed}-${transcriptMinimized}`;
+    const columns = columnsRef.current;
+    if (!columns) return;
+
+    measureColumnsSize();
+    const r = columns.getBoundingClientRect();
+    const barAnchor = columns.querySelector('[data-session-bar-anchor="true"]') as HTMLElement | null;
+
+    const sigChanged = prevLayoutSigRef.current !== null && prevLayoutSigRef.current !== layoutSig;
+    prevLayoutSigRef.current = layoutSig;
+
+    if (barAnchor && sigChanged && barScreenLeftRef.current !== null) {
+      const barLeft = barAnchor.getBoundingClientRect().left;
+      const delta = barScreenLeftRef.current - barLeft;
+      if (Math.abs(delta) >= 1) {
+        setPosition((p) => {
+          const next = { x: p.x + delta, y: p.y };
+          const c = clampControlBarPosition(next, r.width, r.height, CLAMP_MARGIN_SESSION_FRAME);
+          if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
+          return c;
+        });
+      }
+    }
+
+    if (barAnchor && !sigChanged) {
+      barScreenLeftRef.current = barAnchor.getBoundingClientRect().left;
+    }
+  }, [collapsed, transcriptMinimized]);
 
   useEffect(() => {
-    const onResize = () => remeasureAndClamp();
+    const onResize = () => {
+      measureColumnsSize();
+      const { width, height } = sizeRef.current;
+      setPosition((p) => {
+        const c = clampControlBarPosition(p, width, height, CLAMP_MARGIN_SESSION_FRAME);
+        if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
+        return c;
+      });
+    };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
@@ -106,6 +146,10 @@ export function SessionFloatingFrame({ collapsed, children }: SessionFloatingFra
       persistControlBarPosition(c, 'sessionFrame');
       return c;
     });
+    const barAnchor = columnsRef.current?.querySelector('[data-session-bar-anchor="true"]') as HTMLElement | null;
+    if (barAnchor) {
+      barScreenLeftRef.current = barAnchor.getBoundingClientRect().left;
+    }
   };
 
   return (
