@@ -20,7 +20,7 @@ npm run dist:mac
 npm run release:publish
 ```
 
-Build on Apple Silicon with the three native helpers already built and `.local/models/parakeet-tdt-0.6b-v3` present. The build compiles current source, bundles the speech model and runtime helpers, and removes personal name aliases from the packaged context. Development caches, source checkouts, meeting history and user settings are not included. The current beta is arm64, macOS 14.2+, version 0.1.2, without Apple notarization. Intel and Windows downloads are not advertised.
+Build on Apple Silicon with the three native helpers already built and `.local/models/parakeet-tdt-0.6b-v3` present. The build compiles current source, bundles the speech model and runtime helpers, and removes personal name aliases from the packaged context. Development caches, source checkouts, meeting history and user settings are not included. The current beta is arm64, macOS 14.2+, version 0.1.3, without Apple notarization. Intel and Windows downloads are not advertised.
 
 The publish script uploads via SSH to ai-server, verifies SHA-256 remotely, then atomically replaces the release manifest. `latest.json.previous` retains the prior manifest when there is one. Set a new package version before publishing a changed binary; do not overwrite an existing published version. The landing enables its buttons only after validating the manifest and checking that the artifact exists with the expected size and a non-HTML content type.
 
@@ -36,7 +36,7 @@ The interactive preview is illustrative, can be paused/replayed, and never recor
 
 ```sh
 curl -fsS https://openwhispr.rootoz.com/releases/latest.json
-curl -I https://openwhispr.rootoz.com/releases/Openwhispr-0.1.2-arm64.dmg
+curl -I https://openwhispr.rootoz.com/releases/Openwhispr-0.1.3-arm64.dmg
 ```
 
 Check that missing downloads return 404, not HTML with status 200. The current download is a beta without Apple notarization; the landing states this explicitly.
@@ -46,3 +46,7 @@ Check that missing downloads return 404, not HTML with status 200. The current d
 The app now includes its own icon and a verified ad-hoc signature for the Electron app, frameworks, native modules and audio helpers. The signing hook signs executable Mach-O code only; model weights and other resources are sealed without modification. The build and publisher both stop if strict codesign verification fails. This fixes the unsigned package but does not provide Developer ID or notarization. macOS may still require the user to authorize this specific beta through Privacy & Security → Open Anyway. System-wide security protections are not changed.
 
 The landing preview recreates the translucent transcription and AI panels. It shows continuous text without speaker identification; its question response is an explicitly labelled simulation.
+
+## Beta 0.1.3 renderer correction
+
+Electron loads the UI from a local HTML file. Vite now uses relative asset paths, and `scripts/check-packaged-assets.mjs` rejects missing files or server-root references before packaging. The packaged application was opened to verify that its dashboard/setup interface actually renders.
