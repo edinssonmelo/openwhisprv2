@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { encodeWav } from './audio/wav';
 import { CONTROL_BAR_WAVEFORM_BARS, fillControlBarSpectrumFromAnalyser } from './audio/controlBarSpectrum';
-import { createVadEndpointing, type VadClosedSegment } from './audio/vadEndpointing';
-import { createTranscriptCandidateLedger, type LedgerDebugGroup, type LedgerSnapshot } from './audio/transcriptCandidateLedger';
 import {
   filterVirtualSystemInputCandidates,
   runSystemAudioEngine,
@@ -11,13 +9,14 @@ import {
   type SystemAudioProviderId,
   type SystemAudioStrategy,
 } from './audio/systemAudioEngine';
-import { LiveTranscriptView } from './components/LiveTranscriptView';
 import {
   buildFinalTranscriptRefinementPrompt,
   shouldCreateRefinementBatch,
   type RefinementSegmentInput,
 } from './transcription/finalTranscriptRefiner';
 import { DashboardHome } from './components/DashboardHome';
+import { NewSessionModal, type NewSessionContext } from './components/NewSessionModal';
+import { ContextSpaceAssignmentModal } from './components/ContextSpaceAssignmentModal';
 import type { DashboardSessionSummary } from './types/dashboardSession';
 import { HomeConfirmDialog } from './components/HomeConfirmDialog';
 import { FloatingAssistantShell } from './components/FloatingAssistantShell';
@@ -25,30 +24,44 @@ import { SetupOnboarding } from './components/SetupOnboarding';
 import { PremiumToast } from './components/PremiumToast';
 import type { AssistantChatMessage } from './components/AssistantChatPanel';
 import { copyToClipboard } from './utils/copyToClipboard';
-import { generateMeetingSummaryLine } from './utils/generateMeetingSummary';
+import { generateMeetingSummaryLine, generateMeetingTitle } from './utils/generateMeetingSummary';
+import { buildMeetingAgentMemory } from './utils/meetingAgentInsights';
 import {
   getOnboardingSystemSkipped,
   isOnboardingComplete,
+  loadAppLanguage,
   loadCapturePreference,
+  loadContextSpaces,
+  loadPromptProfiles,
   loadSelectedSystemInputId,
+  loadSelectedPromptProfileId,
   loadSystemCaptureStrategy,
-  markOnboardingComplete,
+  loadUserProfile,
+  persistAppLanguage,
   persistCapturePreference,
+  persistContextSpaces,
+  persistPromptProfiles,
   persistSelectedSystemInputId,
+  persistSelectedPromptProfileId,
   persistSystemCaptureStrategy,
+  persistUserProfile,
+  type AppLanguage,
   type CapturePreference,
+  type PromptProfile,
+  type ContextSpace,
   type SystemCaptureStrategy,
+  type UserProfile,
 } from './storage/appPreferences';
 import { readDashboardTheme } from './storage/dashboardTheme';
-import { createTranscriptStore } from './transcription/transcriptStore';
-import type { AsrEngineName, AsrFinalEngineMode, AsrPipelineMode, TranscriptRefinementMode, TranscriptViewState } from './transcription/types';
+import { describeEngine, type CommittedSegment } from './transcription/transcriptCoordinator';
+import type { AsrEngineName, AsrLanguage, AsrLiveEvent, TranscriptRefinementMode } from './transcription/types';
+import { useLiveAsr, type LiveAsrFrameInfo } from './hooks/useLiveAsr';
 type SourceKey = 'mic' | 'system' | 'mixed';
 type CaptureMode = 'mic' | 'system' | 'both';
 type AppMode = 'dashboard' | 'session-boot' | 'session';
 type CaptureStatus = 'idle' | 'requesting_permission' | 'capturing' | 'silence' | 'failed' | 'stopped';
 type CaptureHealth = 'ok' | 'silent' | 'audio-ended' | 'recovering' | 'failed';
 type TranscriptViewMode = 'verbatim' | 'clean';
-type WhisperPromptMode = 'empty' | 'minimal' | 'contextual';
 
 interface MeterState {
   rms: number;
@@ -99,7 +112,7 @@ interface TranscriptSegment {
   segmentId?: string;
   whisperPromptLength?: number;
   coalesced?: boolean;
-  language?: 'es' | 'auto';
+  language?: AsrLanguage;
   engineUsed?: AsrEngineName;
   fallbackUsed?: boolean;
   fallbackReason?: string;
@@ -110,42 +123,10 @@ interface TranscriptSegment {
   qwenError?: string;
 }
 
-interface WhisperSetupState {
-  ok: boolean;
-  missing: string[];
-  cliPath: string;
-  modelPath: string;
-  message: string;
-  activeModelName?: string | null;
-  previewModelName?: string | null;
-  finalModelName?: string | null;
-  pipelineMode?: AsrPipelineMode;
-  moonshineConfigured?: boolean;
-  qwenConfigured?: boolean;
-  experimentalPreview?: boolean;
-  finalEngine?: AsrFinalEngineMode;
-  refinementMode?: TranscriptRefinementMode;
-  refinerModel?: string;
-  modelCandidates?: Array<{
-    name: string;
-    path: string;
-    exists: boolean;
-  }>;
-}
-
 interface PolisherSetupState {
   ok: boolean;
   model: string;
   message: string;
-}
-
-interface CleanSegment {
-  id: string;
-  startMs: number;
-  endMs: number;
-  rawSegmentIds: string[];
-  cleanText: string;
-  status: 'final';
 }
 
 interface RefinedTranscriptState {
@@ -155,49 +136,6 @@ interface RefinedTranscriptState {
   model: string | null;
   mode: TranscriptRefinementMode;
   updatedAt: number | null;
-}
-
-interface LiveTranscriptState {
-  committedText: string;
-  unstableSuffix: string;
-  lastReason: string;
-  lastUpdatedAt: number | null;
-}
-
-/** Solo lectura natural: cola + typewriter. Hipótesis cruda en lastRawPreview no va a la vista principal. */
-interface LiveVisualDraft {
-  segmentId: string | null;
-  visibleDraft: string;
-  pendingWords: string[];
-  lastRawPreview: string;
-}
-
-interface TranscriptionWindow {
-  blockId: string;
-  wavBytes: Uint8Array;
-  startMs: number;
-  endMs: number;
-  rms: number;
-  peak: number;
-  source: SourceKey;
-  sampleRate: number;
-  sampleCount: number;
-  coalesced?: boolean;
-  possibleClipping?: boolean;
-  whisperGain?: number;
-  mode: 'preview' | 'final';
-  segmentId: string;
-  verbatimOnly: boolean;
-  language: 'es' | 'auto';
-  enqueuedAtMs?: number;
-}
-
-interface PendingPolishJob {
-  batchId: string;
-  startMs: number;
-  endMs: number;
-  text: string;
-  source: SourceKey;
 }
 
 const initialMeter: MeterState = {
@@ -221,53 +159,10 @@ const initialCaptureHealth: CaptureHealthState = {
   message: null,
 };
 
-/** Baseline estable: solo segmentos VAD cerrados transcritos con whisper.cpp (`ggml-large-v3-turbo.bin`); sin preview en vivo. */
-const SAFE_BASELINE = true;
-/** Observa finales reales del baseline con el store visual v2, sin afectar la vista principal. */
-const V2_TRANSCRIPT_STORE_SHADOW = true;
-/** Tamaño máximo de segmento VAD (final). No bajar por debajo de ~10s sin pruebas; opcional futuro 12_000 si el final se siente muy largo. */
-const MAX_FINAL_SEGMENT_MS = 15_000;
+const METER_REACT_PUBLISH_MS = 250;
 
 const SILENCE_THRESHOLD = 0.01;
 const CLIPPING_THRESHOLD = 0.98;
-const WHISPER_PEAK_TARGET = 0.92;
-const PREVIEW_INTERVAL_MS = 750;
-const MAX_PREVIEW_QUEUE = 1;
-/** Ventana mínima de audio por pasada de preview. */
-const MIN_PREVIEW_AUDIO_MS = 900;
-/**
- * Recorte de cola del segmento abierto para cada pasada de preview (velocidad).
- * Subir si el preview sigue muy inestable; bajar si el rendimiento pesa.
- */
-const MAX_PREVIEW_AUDIO_MS = 2_500;
-const MIN_FINAL_AUDIO_MS = 5_000;
-/** Palabras del final de la hipótesis que no se encolan al usuario (zona inestable). */
-const PREVIEW_HIDDEN_TAIL_WORDS = 1;
-/** Mínimo de palabras en prefijo común draft↔final para fusionar revelado VAD (`planFinalRevealMerge`). */
-const PREVIEW_MIN_COMMON_PREFIX_WORDS = 1;
-/** Typewriter preview: un poco más vivo; visión estable anti-dup sigue con merge/dedupe. */
-const TYPEWRITER_WORD_INTERVAL_MS = 55;
-const TYPEWRITER_MAX_WORDS_PER_TICK = 1;
-const TYPEWRITER_PENDING_CATCHUP_THRESHOLD = 999;
-const TYPEWRITER_CATCHUP_WORDS_PER_TICK = 1;
-/** Máximo de palabras nuevas a encolar por cada merge de hipótesis. */
-const MAX_NEW_PREVIEW_WORDS_PER_MERGE = 4;
-/** Tope duro de la cola `pendingWords` para evitar rachas largas en pantalla. */
-const MAX_PENDING_PREVIEW_WORDS = 12;
-/** Revelado visual del texto final VAD (oficial ya está entero en `committedText`). */
-/** Revelado del final VAD hacia texto visible: un poco más ágil tras preview más frecuente. */
-const FINAL_REVEAL_WORD_INTERVAL_MS = 38;
-const FINAL_REVEAL_WORDS_PER_TICK = 2;
-const FINAL_REVEAL_CATCHUP_THRESHOLD = 40;
-const FINAL_REVEAL_CATCHUP_WORDS_PER_TICK = 3;
-/** Máx palabras solapadas a detectar al anexar texto visible (evita “cuál era cuál era”). */
-const VISIBLE_APPEND_MAX_OVERLAP = 12;
-/** Autoscroll al confirmar o actualizar preview solo si el usuario estaba cerca del fondo. */
-const SCROLL_STICK_THRESHOLD_PX = 72;
-const MIN_WHISPER_RMS_MIC = 0.0008;
-const MIN_WHISPER_RMS_SYSTEM = 0.003;
-const MIN_WHISPER_RMS_HELPER = 0.003;
-const NOTES_POLISH_INTERVAL_MS = 12_000;
 const AUDIO_WATCHDOG_INTERVAL_MS = 1_500;
 const AUDIO_SILENT_WARNING_MS = 12_000;
 const SYSTEM_SIGNAL_CHECK_TIMEOUT_MS = 3500;
@@ -275,6 +170,8 @@ const SYSTEM_SIGNAL_CHECK_INTERVAL_MS = 200;
 const SYSTEM_SIGNAL_CHECK_RMS = 0.003;
 const SYSTEM_SIGNAL_CHECK_PEAK = 0.01;
 const SYSTEM_SIGNAL_CHECK_REQUIRED_HITS = 2;
+/** PCM helpers: consecutive chunk samples that prove IPC is flowing (silence is OK). */
+const SYSTEM_PCM_CHUNK_REQUIRED_HITS = 2;
 const MAX_AUTO_RECOVERY_ATTEMPTS_PER_MINUTE = 2;
 /** Tras captura exitosa: no promover a `audio-ended` ni auto-recover (glitches loopback / transición). */
 const CAPTURE_WATCHDOG_GRACE_MS = 4000;
@@ -285,13 +182,6 @@ const AUDIO_ENDED_DEBOUNCE_TICKS = 2;
 const DEFAULT_GLOSSARY = 'Intel, TSMC, Taiwan, Apple, GPU, Anthropic, OpenAI, chips, servidores, inversión, burbuja, foundry, informática, startups, Silicon Valley, programación, productos, IA';
 const DEFAULT_AI_CONTEXT_PROMPT = 'Con base en lo último que se ha dicho, dame una ayuda breve, útil y contextual.';
 const SAVED_SESSIONS_STORAGE_KEY = 'openwhispr.savedSessions.v1';
-const SUSPICIOUS_PHRASES = [
-  'nos vemos en el próximo video',
-  'gracias por ver el video',
-  'subtítulos realizados',
-  'suscríbete',
-  'dale like',
-];
 const VERBOSE_CAPTURE_STORAGE = 'openwhispr.verboseCaptureDebug';
 const TRANSCRIPTION_TRACE_STORAGE = 'openwhispr.transcriptionTrace';
 const DEBUG_PREFIX = '[audio-diagnostics]';
@@ -303,28 +193,6 @@ const viteEnv = import.meta as unknown as { env?: Record<string, string | undefi
 /** Default on; set `VITE_OPENWHISPR_AUTO_RECOVER_AUDIO=false` to disable auto reconnect on `audio-ended`. */
 function isAutoRecoverSystemAudioEnabled(): boolean {
   return viteEnv.env?.VITE_OPENWHISPR_AUTO_RECOVER_AUDIO !== 'false';
-}
-
-function isLowRmsDebugEnabled(): boolean {
-  return viteEnv.env?.VITE_OPENWHISPR_LOW_RMS_DEBUG === 'true';
-}
-
-function isForceMicWindowsEnabled(): boolean {
-  return viteEnv.env?.VITE_OPENWHISPR_FORCE_MIC_WINDOWS === 'true';
-}
-
-type WhisperRmsProfile = 'mic' | 'system' | 'helper';
-
-function minWhisperRmsForProfile(profile: WhisperRmsProfile): number {
-  if (isLowRmsDebugEnabled()) return 0;
-  if (profile === 'mic') return MIN_WHISPER_RMS_MIC;
-  if (profile === 'helper') return MIN_WHISPER_RMS_HELPER;
-  return MIN_WHISPER_RMS_SYSTEM;
-}
-
-function whisperProfileForLiveSource(source: SourceKey): WhisperRmsProfile {
-  if (source === 'system') return 'system';
-  return 'mic';
 }
 
 /** Explicit opt-in/out for the display video sink. macOS also enables it by default below. */
@@ -429,23 +297,19 @@ function formatTimer(totalSeconds: number) {
   return `${minutes}:${seconds}`;
 }
 
-function loadSavedSessions(): DashboardSessionSummary[] {
+/** Lee las sesiones heredadas de `localStorage` solo para la migración única hacia SQLite. */
+function loadLegacySavedSessionsFromLocalStorage(): DashboardSessionSummary[] {
   try {
     const raw = localStorage.getItem(SAVED_SESSIONS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as DashboardSessionSummary[];
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((session) => typeof session.id === 'string' && typeof session.createdAt === 'number')
-      .slice(0, 20);
+    return parsed.filter((session) => typeof session.id === 'string' && typeof session.createdAt === 'number');
   } catch {
     return [];
   }
 }
 
-function persistSavedSessions(sessions: DashboardSessionSummary[]) {
-  localStorage.setItem(SAVED_SESSIONS_STORAGE_KEY, JSON.stringify(sessions.slice(0, 20)));
-}
 
 function createSessionTitle(createdAt: number) {
   return `Meeting ${new Intl.DateTimeFormat(undefined, {
@@ -454,188 +318,6 @@ function createSessionTitle(createdAt: number) {
     hour: 'numeric',
     minute: '2-digit',
   }).format(new Date(createdAt))}`;
-}
-
-function mergeVadClosedSegments(a: VadClosedSegment, b: VadClosedSegment, sampleRate: number): VadClosedSegment {
-  const startSample = a.startSample;
-  const out = new Float32Array(a.samples.length + b.samples.length);
-  out.set(a.samples, 0);
-  out.set(b.samples, a.samples.length);
-  let sum = 0;
-  let peak = 0;
-  for (let i = 0; i < out.length; i += 1) {
-    const s = out[i];
-    sum += s * s;
-    peak = Math.max(peak, Math.abs(s));
-  }
-  const rms = Math.sqrt(sum / out.length);
-  const endSample = startSample + out.length;
-  const durationMs = (out.length / sampleRate) * 1000;
-  return {
-    startSample,
-    endSample,
-    startMs: (startSample / sampleRate) * 1000,
-    endMs: (endSample / sampleRate) * 1000,
-    samples: out,
-    rms,
-    peak,
-    durationMs,
-  };
-}
-
-/** Limita preview al final del segmento abierto para reducir latencia por llamada a whisper-cli. */
-function trimPreviewSamplesToTail(
-  samples: Float32Array,
-  sampleRate: number,
-  segmentEndSample: number,
-  maxAudioMs: number,
-): { samples: Float32Array; startMs: number; endMs: number } {
-  const maxSamples = Math.max(1, Math.floor((maxAudioMs / 1000) * sampleRate));
-  if (samples.length <= maxSamples) {
-    const startSample = segmentEndSample - samples.length;
-    return {
-      samples,
-      startMs: (startSample / sampleRate) * 1000,
-      endMs: (segmentEndSample / sampleRate) * 1000,
-    };
-  }
-  const tail = samples.subarray(samples.length - maxSamples);
-  const startSample = segmentEndSample - tail.length;
-  return {
-    samples: tail,
-    startMs: (startSample / sampleRate) * 1000,
-    endMs: (segmentEndSample / sampleRate) * 1000,
-  };
-}
-
-const INITIAL_LIVE_VISUAL_DRAFT: LiveVisualDraft = {
-  segmentId: null,
-  visibleDraft: '',
-  pendingWords: [],
-  lastRawPreview: '',
-};
-
-function splitWords(text: string): string[] {
-  return text.trim().split(/\s+/).filter(Boolean);
-}
-
-function joinWords(words: string[]): string {
-  return words.join(' ');
-}
-
-function tailWords(text: string, maxWords: number): string {
-  const words = splitWords(text);
-  if (words.length <= maxWords) return text.trim();
-  return joinWords(words.slice(-maxWords));
-}
-
-/** Anexa palabras a texto existente eliminando solape inicial (preview + cola final). */
-function appendWordsDeduped(existingText: string, wordsToAppend: string[], maxOverlap = VISIBLE_APPEND_MAX_OVERLAP): string {
-  const existingWords = splitWords(existingText);
-  if (wordsToAppend.length === 0) return existingText.trim();
-
-  const max = Math.min(maxOverlap, existingWords.length, wordsToAppend.length);
-  let overlap = 0;
-  for (let n = max; n >= 1; n -= 1) {
-    const tail = existingWords.slice(-n).map(normalizeWord);
-    const head = wordsToAppend.slice(0, n).map(normalizeWord);
-    if (tail.every((w, i) => w === head[i])) {
-      overlap = n;
-      break;
-    }
-  }
-  const finalWords = wordsToAppend.slice(overlap);
-  if (finalWords.length === 0) return existingText.trim();
-  const base = existingText.trim();
-  return base ? `${base} ${joinWords(finalWords)}` : joinWords(finalWords);
-}
-
-function normalizeWord(word: string): string {
-  return word.toLowerCase().replace(/^\p{P}+|\p{P}+$/gu, '');
-}
-
-/** Cola de palabras ya visibles/pending vs inicio del nuevo preview (ventana móvil). */
-function findBestWordOverlap(leftWords: string[], rightWords: string[], maxOverlap = 12): number {
-  const max = Math.min(maxOverlap, leftWords.length, rightWords.length);
-  for (let n = max; n >= 1; n -= 1) {
-    const leftTail = leftWords.slice(leftWords.length - n).map(normalizeWord);
-    const rightHead = rightWords.slice(0, n).map(normalizeWord);
-    if (leftTail.every((w, i) => w === rightHead[i])) return n;
-  }
-  return 0;
-}
-
-/** Cola oculta derivada solo para debug (no estado). */
-function debugHiddenTailFromRaw(raw: string): string {
-  const words = splitWords(raw);
-  if (words.length === 0) return '';
-  return joinWords(words.slice(-PREVIEW_HIDDEN_TAIL_WORDS));
-}
-
-function capPendingPreviewWords(words: string[]): string[] {
-  if (words.length <= MAX_PENDING_PREVIEW_WORDS) return words;
-  return words.slice(0, MAX_PENDING_PREVIEW_WORDS);
-}
-
-/**
- * Alinea revelado del final con el borrador preview: `previewWordsLine` suele ser
- * visibleDraft + pendingWords (misma hipótesis aunque el typewriter aún no la pintó). Prefijo común ≥ MIN_COMMON_PREFIX_WORDS se fusiona ya; el resto va a la cola visual.
- */
-function planFinalRevealMerge(
-  finalText: string,
-  previewWordsLine: string,
-): { mergePrefixWords: string[]; queueTailWords: string[] } {
-  const finalWords = splitWords(finalText);
-  if (finalWords.length === 0) return { mergePrefixWords: [], queueTailWords: [] };
-  const draftWords = splitWords(previewWordsLine.trim());
-  if (draftWords.length === 0) {
-    return { mergePrefixWords: [], queueTailWords: finalWords };
-  }
-  const nFinal = finalWords.map(normalizeWord);
-  const nDraft = draftWords.map(normalizeWord);
-  let k = 0;
-  while (k < nDraft.length && k < nFinal.length && nDraft[k] === nFinal[k]) {
-    k += 1;
-  }
-  if (k < PREVIEW_MIN_COMMON_PREFIX_WORDS) {
-    return { mergePrefixWords: [], queueTailWords: finalWords };
-  }
-  return {
-    mergePrefixWords: finalWords.slice(0, k),
-    queueTailWords: finalWords.slice(k),
-  };
-}
-
-/** Encola solo palabras nuevas tras solape cola↔cabeza; no borra visibleDraft (ventana móvil ASR). */
-function mergeLiveVisualDraft(prev: LiveVisualDraft, newPreview: string, segmentId: string): LiveVisualDraft {
-  const wordsNew = splitWords(newPreview);
-  const candidateWords = wordsNew.slice(0, Math.max(0, wordsNew.length - PREVIEW_HIDDEN_TAIL_WORDS));
-
-  if (segmentId !== prev.segmentId) {
-    const initialWords = candidateWords.slice(0, MAX_NEW_PREVIEW_WORDS_PER_MERGE);
-    return {
-      segmentId,
-      lastRawPreview: newPreview,
-      visibleDraft: '',
-      pendingWords: capPendingPreviewWords(initialWords),
-    };
-  }
-
-  const alreadyWords = [...splitWords(prev.visibleDraft.trim()), ...prev.pendingWords];
-  const overlap = findBestWordOverlap(alreadyWords, candidateWords, VISIBLE_APPEND_MAX_OVERLAP);
-
-  let appendWords: string[] = [];
-  if (overlap > 0) {
-    appendWords = candidateWords.slice(overlap, overlap + MAX_NEW_PREVIEW_WORDS_PER_MERGE);
-  } else if (alreadyWords.length === 0) {
-    appendWords = candidateWords.slice(0, MAX_NEW_PREVIEW_WORDS_PER_MERGE);
-  }
-
-  return {
-    ...prev,
-    lastRawPreview: newPreview,
-    pendingWords: capPendingPreviewWords([...prev.pendingWords, ...appendWords]),
-  };
 }
 
 function describeTrack(track: MediaStreamTrack) {
@@ -658,8 +340,12 @@ export default function App() {
   const [pendingSessionStart, setPendingSessionStart] = useState(false);
   const [sessionCaptureStarting, setSessionCaptureStarting] = useState(false);
   const pendingSessionStartRef = useRef(false);
-  const [savedSessions, setSavedSessions] = useState<DashboardSessionSummary[]>(() => loadSavedSessions());
+  const currentSessionContextRef = useRef<NewSessionContext | null>(null);
+  const [savedSessions, setSavedSessions] = useState<DashboardSessionSummary[]>([]);
+  const savedSessionsHydratedRef = useRef(false);
+  const knownSessionIdsRef = useRef<Set<string>>(new Set());
   const [selectedSavedSessionId, setSelectedSavedSessionId] = useState<string | null>(null);
+  const [newSessionModalOpen, setNewSessionModalOpen] = useState(false);
   const [meetingSummaryBusy, setMeetingSummaryBusy] = useState(false);
   const [platform, setPlatform] = useState<NodeJS.Platform | 'unknown'>('unknown');
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
@@ -668,6 +354,12 @@ export default function App() {
   const [selectedMicId, setSelectedMicId] = useState<string>('');
   const [selectedSystemInputId, setSelectedSystemInputId] = useState<string>(() => loadSelectedSystemInputId());
   const [systemCaptureStrategy, setSystemCaptureStrategy] = useState<SystemCaptureStrategy>(() => loadSystemCaptureStrategy());
+  const [appLanguage, setAppLanguage] = useState<AppLanguage>(() => loadAppLanguage());
+  const [userProfile, setUserProfile] = useState<UserProfile>(() => loadUserProfile());
+  const [promptProfiles, setPromptProfiles] = useState<PromptProfile[]>(() => loadPromptProfiles());
+  const [contextSpaces, setContextSpaces] = useState<ContextSpace[]>(() => loadContextSpaces());
+  const [selectedPromptProfileId, setSelectedPromptProfileId] = useState<string>(() => loadSelectedPromptProfileId());
+  const [contextAssignSession, setContextAssignSession] = useState<DashboardSessionSummary | null>(null);
   const [selectedOutputId, setSelectedOutputId] = useState<string>('');
   const [selectedDesktopSourceId, setSelectedDesktopSourceId] = useState<string>('');
   const [micPermission, setMicPermission] = useState<PermissionState | 'unknown'>('unknown');
@@ -710,12 +402,13 @@ export default function App() {
     system: initialMeter,
     mixed: initialMeter,
   });
+  const meterReactPublishTimerRef = useRef<number | null>(null);
+  const lastMeterReactPublishAtRef = useRef(0);
   const [diagnosticLog, setDiagnosticLog] = useState<string[]>([]);
   const [recording, setRecording] = useState(false);
   const [recordingSecondsLeft, setRecordingSecondsLeft] = useState(30);
   const [savedWav, setSavedWav] = useState<{ path: string; fileUrl: string } | null>(null);
   const [rawSegments, setRawSegments] = useState<TranscriptSegment[]>([]);
-  const [cleanSegments, setCleanSegments] = useState<CleanSegment[]>([]);
   const [refinedTranscript, setRefinedTranscript] = useState<RefinedTranscriptState>({
     status: 'off',
     text: '',
@@ -740,43 +433,20 @@ export default function App() {
   const [captureStartedAt, setCaptureStartedAt] = useState<number | null>(null);
   const [captureElapsedSeconds, setCaptureElapsedSeconds] = useState(0);
   const [captureHealthState, setCaptureHealthState] = useState<CaptureHealthState>(initialCaptureHealth);
-  const [ledgerDebugGroups, setLedgerDebugGroups] = useState<LedgerDebugGroup[]>([]);
-  const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptState>({
-    committedText: '',
-    unstableSuffix: '',
-    lastReason: 'waiting',
-    lastUpdatedAt: null,
-  });
-  const [liveVisualDraft, setLiveVisualDraft] = useState<LiveVisualDraft>(INITIAL_LIVE_VISUAL_DRAFT);
-  /** Texto confirmado ya mostrado en la vista principal (oficial = `liveTranscript.committedText`). */
-  const [visibleCommittedText, setVisibleCommittedText] = useState('');
-  const [finalRevealQueue, setFinalRevealQueue] = useState<string[]>([]);
-  const [whisperSetup, setWhisperSetup] = useState<WhisperSetupState | null>(null);
+  const [whisperSetup, setWhisperSetup] = useState<AsrSetupStatus | null>(null);
   const [polisherSetup, setPolisherSetup] = useState<PolisherSetupState | null>(null);
-  const [glossary, setGlossary] = useState(DEFAULT_GLOSSARY);
+  const [glossary] = useState(DEFAULT_GLOSSARY);
   const [showRawDebug, setShowRawDebug] = useState(false);
   const showRawDebugRef = useRef(showRawDebug);
   showRawDebugRef.current = showRawDebug;
   const [transcriptViewMode, setTranscriptViewMode] = useState<TranscriptViewMode>('verbatim');
-  const [promptMode, setPromptMode] = useState<WhisperPromptMode>('empty');
-  const [whisperLanguage, setWhisperLanguage] = useState<'es' | 'auto'>('es');
-  const [allowWhisperContext, setAllowWhisperContext] = useState(false);
-  const asrPipelineMode = whisperSetup?.pipelineMode ?? 'baseline-whisper';
-  const v2Mode = asrPipelineMode === 'moonshine-qwen-v2';
-  const baselineMode = !v2Mode;
-  const asrFinalEngine = whisperSetup?.finalEngine ?? 'whisper';
+  const whisperLanguage: AsrLanguage = appLanguage;
   const refinementMode = whisperSetup?.refinementMode ?? 'off';
 
-  const allowWhisperContextRef = useRef(allowWhisperContext);
   const whisperLanguageRef = useRef(whisperLanguage);
-  const asrPipelineModeRef = useRef<AsrPipelineMode>(asrPipelineMode);
   const refinementModeRef = useRef<TranscriptRefinementMode>(refinementMode);
-  const moonshineConfiguredRef = useRef(Boolean(whisperSetup?.moonshineConfigured));
-  allowWhisperContextRef.current = allowWhisperContext;
   whisperLanguageRef.current = whisperLanguage;
-  asrPipelineModeRef.current = asrPipelineMode;
   refinementModeRef.current = refinementMode;
-  moonshineConfiguredRef.current = Boolean(whisperSetup?.moonshineConfigured);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamsRef = useRef<Partial<Record<SourceKey, MediaStream>>>({});
@@ -789,10 +459,7 @@ export default function App() {
   const recordingChunksRef = useRef<Float32Array[]>([]);
   const recordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const recordingTimerRef = useRef<number | null>(null);
-  const transcriptionProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const transcriptionFirstFrameLoggedRef = useRef(false);
   const lastProcessorFrameAtRef = useRef<number | null>(null);
-  const lastProcessorRmsTraceAtRef = useRef(0);
   const captureWatchdogRef = useRef<number | null>(null);
   /** Hasta este timestamp (ms): no `audio-ended` definitivo ni auto-recovery por churn de loopback/overlay. */
   const captureWatchdogGraceUntilRef = useRef(0);
@@ -810,199 +477,25 @@ export default function App() {
   const captureLifecycleRef = useRef(Promise.resolve());
   const captureGenerationRef = useRef(0);
   const stoppedTracksRef = useRef<WeakSet<MediaStreamTrack>>(new WeakSet());
-  const transcriptionSampleCursorRef = useRef<number>(0);
-  const enqueueTranscriptionRef = useRef<(request: TranscriptionWindow) => void>(() => undefined);
   const nativeHelperChunkUnsubscribeRef = useRef<(() => void) | null>(null);
   const nativeHelperStatusUnsubscribeRef = useRef<(() => void) | null>(null);
   const nativeHelperActiveRef = useRef(false);
-  const nativeHelperLastChunkAtRef = useRef<number | null>(null);
-  const nativeHelperLastNonSilentAtRef = useRef<number | null>(null);
   const nativeHelperLastRmsRef = useRef(0);
   const nativeHelperLastPeakRef = useRef(0);
-  const nativeHelperSampleCursorRef = useRef(0);
-  const nativeHelperSegmentStartMsRef = useRef<number | null>(null);
-  const nativeHelperSamplesRef = useRef<Float32Array>(new Float32Array(0));
+  const nativeHelperLastChunkAtRef = useRef<number | null>(null);
   const coreTapChunkUnsubscribeRef = useRef<(() => void) | null>(null);
   const coreTapStatusUnsubscribeRef = useRef<(() => void) | null>(null);
   const coreTapActiveRef = useRef(false);
-  /** Last wall time we forced a VAD segment for mic-only debug (`VITE_OPENWHISPR_FORCE_MIC_WINDOWS`). */
-  const forceMicWindowLastAtRef = useRef(0);
   /** Session uses native PCM helper as sole system path (no MediaStream transcription). */
   const systemPcmHelperOnlyRef = useRef(false);
-  const transcriptionBusyRef = useRef<boolean>(false);
-  /** Cola unificada solo para `!SAFE_BASELINE`; en safeBaseline solo cola final (`pendingFinalWindowsRef`). */
-  const pendingTranscriptionWindowsRef = useRef<TranscriptionWindow[]>([]);
-  const finalBusyRef = useRef(false);
-  const pendingFinalWindowsRef = useRef<TranscriptionWindow[]>([]);
-  const previewBlockedByFinalCountRef = useRef(0);
-  const vadRef = useRef(createVadEndpointing(
-    SAFE_BASELINE ? { maxSegmentMs: MAX_FINAL_SEGMENT_MS } : {},
-  ));
-  const candidateLedgerRef = useRef(createTranscriptCandidateLedger());
-  const ledgerFlushTimerRef = useRef<number | null>(null);
-  const vadShortAccumRef = useRef<VadClosedSegment | null>(null);
-  const activeSegmentIdRef = useRef<string | null>(null);
-  const lastPreviewPerfMsRef = useRef<number>(0);
+  /** Mic-only fallback after system providers failed; skip system on auto-reconnect. */
+  const systemCaptureDegradedRef = useRef(false);
+  const sessionAudioSourcesRef = useRef<{ mic: boolean; system: boolean }>({ mic: false, system: false });
+  /** Fuente primaria para métricas/espectro de la barra (mic | system | mixed). */
   const liveTranscriptionSourceRef = useRef<SourceKey>('mixed');
-  const lastNotesPolishAtRef = useRef<number>(0);
-  const lastNotesTextLengthRef = useRef<number>(0);
-  const polisherBusyRef = useRef<boolean>(false);
-  const pendingPolishJobRef = useRef<PendingPolishJob | null>(null);
   const pendingFinalRefinementSegmentsRef = useRef<RefinementSegmentInput[]>([]);
   const finalRefinementBusyRef = useRef(false);
   const cleanContextRef = useRef<string>('');
-  const lastClippingWarningAtRef = useRef<number>(0);
-  /** Solo `preview` | `final` mientras transcribeBlock está en vuelo (para cancelar solo previews). */
-  const transcriptionInFlightModeRef = useRef<'preview' | 'final' | null>(null);
-  const previewDroppedCountRef = useRef(0);
-  const previewReplacedCountRef = useRef(0);
-  const finalAcceptedCountRef = useRef(0);
-  const previewSegmentOpenedAtRef = useRef<Map<string, number>>(new Map());
-  const previewFirstSuccessRef = useRef<Set<string>>(new Set());
-  /** Segmentos VAD ya cerrados con final aceptado (o descartado). */
-  const finalizedSegmentIdsRef = useRef<Set<string>>(new Set());
-  const liveTranscriptScrollRef = useRef<HTMLDivElement>(null);
-  const stickNearBottomRef = useRef(true);
-  const liveVisualDraftRef = useRef<LiveVisualDraft>(INITIAL_LIVE_VISUAL_DRAFT);
-  const liveTranscriptRef = useRef<LiveTranscriptState>({
-    committedText: '',
-    unstableSuffix: '',
-    lastReason: 'waiting',
-    lastUpdatedAt: null,
-  });
-  const v2DemoStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
-  if (v2DemoStoreRef.current === null) {
-    v2DemoStoreRef.current = createTranscriptStore();
-  }
-  const [v2DemoTranscript, setV2DemoTranscript] = useState<TranscriptViewState>(() => v2DemoStoreRef.current!.getState());
-  const v2MainStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
-  if (v2MainStoreRef.current === null) {
-    v2MainStoreRef.current = createTranscriptStore();
-  }
-  const [v2MainTranscript, setV2MainTranscript] = useState<TranscriptViewState>(() => v2MainStoreRef.current!.getState());
-  const [v2MainFinalCount, setV2MainFinalCount] = useState(0);
-  const [v2MainLastSegmentId, setV2MainLastSegmentId] = useState<string | null>(null);
-  const v2ShadowStoreRef = useRef<ReturnType<typeof createTranscriptStore> | null>(null);
-  if (v2ShadowStoreRef.current === null) {
-    v2ShadowStoreRef.current = createTranscriptStore();
-  }
-  const [v2ShadowTranscript, setV2ShadowTranscript] = useState<TranscriptViewState>(() => v2ShadowStoreRef.current!.getState());
-  const [v2ShadowFinalCount, setV2ShadowFinalCount] = useState(0);
-  const [v2ShadowLastSegmentId, setV2ShadowLastSegmentId] = useState<string | null>(null);
-
-  const [asrLiveStats, setAsrLiveStats] = useState({
-    previewLatencyMs: null as number | null,
-    finalLatencyMs: null as number | null,
-    previewQueueSize: 0,
-    finalQueueSize: 0,
-    previewDroppedCount: 0,
-    previewReplacedCount: 0,
-    finalAcceptedCount: 0,
-    lastPreviewSegmentDurationMs: null as number | null,
-    timeToFirstPreviewMs: null as number | null,
-    lastCancelReason: null as string | null,
-    previewBusyLive: false,
-    finalBusyLive: false,
-    previewBlockedByFinalCount: 0,
-  });
-
-  const syncAsrLiveStats = useCallback((patch: Partial<typeof asrLiveStats>) => {
-    setAsrLiveStats((prev) => {
-      const p = pendingTranscriptionWindowsRef.current;
-      const fq = pendingFinalWindowsRef.current;
-      const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-      return {
-        ...prev,
-        ...patch,
-        previewQueueSize: SAFE_BASELINE && !isV2Pipeline ? 0 : p.filter((w) => w.mode === 'preview').length,
-        finalQueueSize: SAFE_BASELINE && !isV2Pipeline ? fq.length : p.filter((w) => w.mode === 'final').length,
-        previewDroppedCount: previewDroppedCountRef.current,
-        previewReplacedCount: previewReplacedCountRef.current,
-        finalAcceptedCount: finalAcceptedCountRef.current,
-        previewBusyLive: SAFE_BASELINE && !isV2Pipeline ? false : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview'),
-        finalBusyLive: SAFE_BASELINE && !isV2Pipeline ? finalBusyRef.current : (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final'),
-        previewBlockedByFinalCount: previewBlockedByFinalCountRef.current,
-      };
-    });
-  }, []);
-
-  const updateV2DemoTranscript = useCallback((next: TranscriptViewState) => {
-    setV2DemoTranscript(next);
-  }, []);
-
-  const runV2DemoPreviewOne = useCallback(() => {
-    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
-      segmentId: 'demo-segment-1',
-      text: 'hola como estas ahora mismo',
-    }));
-  }, [updateV2DemoTranscript]);
-
-  const runV2DemoPreviewTwo = useCallback(() => {
-    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
-      segmentId: 'demo-segment-1',
-      text: 'hola como estas bien ahora',
-    }));
-  }, [updateV2DemoTranscript]);
-
-  const runV2DemoDifferentPreview = useCallback(() => {
-    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptPreview({
-      segmentId: 'demo-segment-1',
-      text: 'esto cambio demasiado y no deberia reemplazar',
-    }));
-  }, [updateV2DemoTranscript]);
-
-  const runV2DemoFinal = useCallback(() => {
-    updateV2DemoTranscript(v2DemoStoreRef.current!.acceptFinal({
-      segmentId: 'demo-segment-1',
-      text: 'hola como estas bien',
-    }));
-  }, [updateV2DemoTranscript]);
-
-  const resetV2Demo = useCallback(() => {
-    updateV2DemoTranscript(v2DemoStoreRef.current!.reset());
-  }, [updateV2DemoTranscript]);
-
-  const resetV2Main = useCallback(() => {
-    setV2MainTranscript(v2MainStoreRef.current!.reset());
-    setV2MainFinalCount(0);
-    setV2MainLastSegmentId(null);
-  }, []);
-
-  const acceptV2MainPreview = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    try {
-      const next = v2MainStoreRef.current!.acceptPreview({
-        segmentId,
-        text: segment.text,
-        engine: segment.engineUsed ?? 'moonshine',
-      });
-      setV2MainTranscript(next);
-      setV2MainLastSegmentId(segmentId);
-    } catch (error) {
-      debug('v2-main-preview:error', {
-        segmentId,
-        error: String(error),
-      });
-    }
-  }, []);
-
-  const acceptV2MainFinal = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    try {
-      const next = v2MainStoreRef.current!.acceptFinal({
-        segmentId,
-        text: segment.text,
-        engine: segment.engineUsed ?? 'whisper-large-v3-turbo',
-      });
-      setV2MainTranscript(next);
-      setV2MainFinalCount((count) => count + 1);
-      setV2MainLastSegmentId(segmentId);
-    } catch (error) {
-      debug('v2-main-final:error', {
-        segmentId,
-        error: String(error),
-      });
-    }
-  }, []);
-
   const runFinalRefinementBatch = useCallback((segments: RefinementSegmentInput[], mode: Exclude<TranscriptRefinementMode, 'off'>) => {
     if (segments.length === 0) return;
     if (!polisherSetup?.ok) {
@@ -1120,31 +613,6 @@ export default function App() {
     runFinalRefinementBatch(pending, mode);
   }, [polisherSetup?.model, runFinalRefinementBatch, whisperSetup?.refinerModel]);
 
-  const resetV2Shadow = useCallback(() => {
-    setV2ShadowTranscript(v2ShadowStoreRef.current!.reset());
-    setV2ShadowFinalCount(0);
-    setV2ShadowLastSegmentId(null);
-  }, []);
-
-  const acceptV2ShadowFinal = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    if (!V2_TRANSCRIPT_STORE_SHADOW) return;
-    try {
-      const next = v2ShadowStoreRef.current!.acceptFinal({
-        segmentId,
-        text: segment.text,
-        engine: 'whisper-large-v3-turbo',
-      });
-      setV2ShadowTranscript(next);
-      setV2ShadowFinalCount((count) => count + 1);
-      setV2ShadowLastSegmentId(segmentId);
-    } catch (error) {
-      debug('v2-shadow:error', {
-        segmentId,
-        error: String(error),
-      });
-    }
-  }, []);
-
   const macSystemFallbackText =
     'Para capturar audio del sistema en este Mac cuando Electron loopback falla, instala BlackHole, enruta la salida del sistema hacia BlackHole y selecciona BlackHole como entrada virtual.';
 
@@ -1173,7 +641,25 @@ export default function App() {
     persistSystemCaptureStrategy(systemCaptureStrategy);
   }, [systemCaptureStrategy]);
 
-  const liveCleanText = useMemo(() => cleanSegments.map((segment) => segment.cleanText).join(' ').trim(), [cleanSegments]);
+  useEffect(() => {
+    persistAppLanguage(appLanguage);
+  }, [appLanguage]);
+
+  useEffect(() => {
+    persistUserProfile(userProfile);
+  }, [userProfile]);
+
+  useEffect(() => {
+    persistPromptProfiles(promptProfiles);
+  }, [promptProfiles]);
+
+  useEffect(() => {
+    persistContextSpaces(contextSpaces);
+  }, [contextSpaces]);
+
+  useEffect(() => {
+    persistSelectedPromptProfileId(selectedPromptProfileId);
+  }, [selectedPromptProfileId]);
 
   const addLog = useCallback((message: string) => {
     debug('ui-log', message);
@@ -1186,15 +672,73 @@ export default function App() {
     setCaptureHealthState(next);
   }, []);
 
-  const visibleTranscriptText = useMemo(() => {
-    if (v2Mode) return v2MainTranscript.visibleText.trim();
-    const baselineText = [visibleCommittedText, liveVisualDraft.visibleDraft].filter(Boolean).join(' ').trim();
-    return baselineText || liveTranscript.committedText.trim() || liveCleanText;
-  }, [liveCleanText, liveTranscript.committedText, liveVisualDraft.visibleDraft, v2MainTranscript.visibleText, v2Mode, visibleCommittedText]);
+  const handleAsrFinal = useCallback((segment: CommittedSegment) => {
+    const transcriptSegment: TranscriptSegment = {
+      id: segment.segmentId,
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      text: segment.text,
+      status: 'final',
+      source: segment.source,
+      rms: 0,
+      durationMs: segment.endMs - segment.startMs,
+      modelName: segment.engine,
+      asrMode: 'final',
+      segmentId: segment.segmentId,
+      language: whisperLanguageRef.current,
+      engineUsed: segment.engine,
+      fallbackUsed: segment.viaFallback,
+    };
+    setRawSegments((current) => [...current, transcriptSegment].slice(-200));
+    queueFinalRefinementSegment(transcriptSegment, segment.segmentId);
+  }, [queueFinalRefinementSegment]);
+
+  const handleAsrFrame = useCallback((info: LiveAsrFrameInfo) => {
+    lastProcessorFrameAtRef.current = info.atMs;
+    if (info.firstFrame) {
+      const payload = { source: info.source, rms: info.rms, peak: info.peak, sampleRate: info.sampleRate, timestampMs: info.atMs };
+      captureDiag('transcription:processor-first-frame', payload);
+      transcriptionTrace('processor-first-frame', payload);
+      debug('transcription:processor-first-frame', payload);
+    }
+  }, []);
+
+  const handleAsrEvent = useCallback((event: AsrLiveEvent, applied: boolean, reason: string) => {
+    if (event.type === 'error') {
+      addLog(`asr ${event.kind}: ${event.message}`);
+    }
+    if (!applied || event.type === 'error' || event.type === 'drained' || event.type === 'segment-dropped') {
+      debug('asr:event', { type: event.type, applied, reason });
+    }
+  }, [addLog]);
+
+  /** Live ASR (main process owns VAD/engines; this hook owns the transcript state and mic PCM streaming). */
+  const liveAsr = useLiveAsr({
+    onFinal: handleAsrFinal,
+    onFrame: handleAsrFrame,
+    onEvent: handleAsrEvent,
+    onLog: addLog,
+  });
+  const liveAsrRef = useRef(liveAsr);
+  liveAsrRef.current = liveAsr;
+  const asrSessionIdRef = useRef<string | null>(null);
+  const asrStatus = liveAsr.status;
+
+  const visibleTranscriptText = liveAsr.transcript.visibleText;
 
   const askLocalAssistant = useCallback((questionOverride?: string) => {
     const question = (questionOverride ?? chatInput).trim() || DEFAULT_AI_CONTEXT_PROMPT;
     if (!question || chatBusy) return;
+    const activePromptProfile = promptProfiles.find((profile) => profile.id === selectedPromptProfileId) ?? promptProfiles[0];
+    const sessionContext = currentSessionContextRef.current;
+    const normalizedQuestion = question.toLowerCase();
+    const wantsFullContext = /\b(full|complete|entire|all|todo|toda|completa|completo|historial|desde el inicio)\b/.test(normalizedQuestion);
+    const relatedContext = sessionContext?.relatedSessionIds?.length
+      ? savedSessions
+          .filter((session) => sessionContext.relatedSessionIds.includes(session.id))
+          .map((session) => `${session.title}: ${session.meetingSummary || session.refinedSummaryLine || session.transcriptPreview || ''}`.trim())
+          .join('\n')
+      : '';
     const userMessage: AssistantChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
@@ -1210,12 +754,25 @@ export default function App() {
       recording: Boolean(captureMode),
       captureHealth: captureHealthRef.current.captureHealth,
     });
-    const rawContext = [
-      visibleTranscriptText,
-      rawSegments.slice(-10).map((segment) => segment.whisperText ?? segment.text).join(' '),
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(-8000);
+    const transcriptSource = wantsFullContext
+      ? visibleTranscriptText
+      : [
+          visibleTranscriptText.slice(-6000),
+          rawSegments.slice(-10).map((segment) => segment.whisperText ?? segment.text).join(' '),
+        ].join(' ');
+    const contextPrelude = [
+      sessionContext?.meetingContext ? `Contexto de la sesión: ${sessionContext.meetingContext}` : '',
+      sessionContext?.topics?.length ? `Temas esperados: ${sessionContext.topics.join(', ')}` : '',
+      relatedContext ? `Reuniones relacionadas:\n${relatedContext}` : '',
+      wantsFullContext ? 'El usuario pidió contexto completo; considera toda la transcripción disponible.' : 'Si la pregunta parece sobre lo último dicho, prioriza el contexto reciente.',
+    ].filter(Boolean).join('\n');
+    const rawContext = [contextPrelude, transcriptSource].join('\n\n').replace(/\s+/g, ' ').trim().slice(-8000);
+    const activePromptText = [activePromptProfile?.systemPrompt, activePromptProfile?.contextPrompt].filter(Boolean).join('\n\n');
+    const profiledQuestion = activePromptText
+      ? `${activePromptText}\n\nPregunta del usuario: ${question}`
+      : question;
     window.meetingAssistant.assistant.ask({
-      question,
+      question: profiledQuestion,
       transcriptContext: rawContext,
       refinedContext: refinedTranscript.text.slice(-4000),
     }).then((result) => {
@@ -1249,7 +806,7 @@ export default function App() {
     }).finally(() => {
       setChatBusy(false);
     });
-  }, [captureMode, chatBusy, chatInput, rawSegments, refinedTranscript.text, visibleTranscriptText]);
+  }, [captureMode, chatBusy, chatInput, promptProfiles, rawSegments, refinedTranscript.text, savedSessions, selectedPromptProfileId, visibleTranscriptText]);
 
   const showToast = useCallback((message: string) => {
     setToastMessage(message);
@@ -1280,24 +837,50 @@ export default function App() {
   }, [chatMessages]);
 
   const patchMeter = useCallback((source: SourceKey, patch: Partial<MeterState>) => {
-    setMeters((current) => {
-      const next = {
-        ...current,
-        [source]: {
-          ...current[source],
-          ...patch,
-        },
-      };
-      metersRef.current = next;
-      return next;
-    });
+    const current = metersRef.current;
+    const previousSourceMeter = current[source];
+    const next = {
+      ...current,
+      [source]: {
+        ...previousSourceMeter,
+        ...patch,
+      },
+    };
+    metersRef.current = next;
+
+    const publishImmediately =
+      (patch.status !== undefined && patch.status !== previousSourceMeter.status) ||
+      (patch.error !== undefined && patch.error !== previousSourceMeter.error) ||
+      (patch.sampleRate !== undefined && patch.sampleRate !== previousSourceMeter.sampleRate);
+    const now = performance.now();
+    const publish = () => {
+      if (meterReactPublishTimerRef.current !== null) {
+        window.clearTimeout(meterReactPublishTimerRef.current);
+        meterReactPublishTimerRef.current = null;
+      }
+      lastMeterReactPublishAtRef.current = performance.now();
+      setMeters(metersRef.current);
+    };
+
+    if (publishImmediately || now - lastMeterReactPublishAtRef.current >= METER_REACT_PUBLISH_MS) {
+      publish();
+      return;
+    }
+
+    if (meterReactPublishTimerRef.current !== null) return;
+    meterReactPublishTimerRef.current = window.setTimeout(() => {
+      meterReactPublishTimerRef.current = null;
+      lastMeterReactPublishAtRef.current = performance.now();
+      setMeters(metersRef.current);
+    }, METER_REACT_PUBLISH_MS - (now - lastMeterReactPublishAtRef.current));
   }, []);
 
-  const onLiveTranscriptScroll = useCallback(() => {
-    const el = liveTranscriptScrollRef.current;
-    if (!el) return;
-    stickNearBottomRef.current =
-      el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_THRESHOLD_PX;
+  useEffect(() => {
+    return () => {
+      if (meterReactPublishTimerRef.current !== null) {
+        window.clearTimeout(meterReactPublishTimerRef.current);
+      }
+    };
   }, []);
 
   const refreshDevices = useCallback(async () => {
@@ -1412,6 +995,8 @@ export default function App() {
       setWhisperSetup(setup);
       debug('transcription:setup', setup);
       if (!setup.ok) addLog(setup.message);
+      /* Warm the Parakeet helper (and download models on first run) so the first session starts instantly. */
+      if (setup.parakeetHelperConfigured) void liveAsrRef.current.prepare();
     });
     void window.meetingAssistant.polisher.check().then((setup) => {
       setPolisherSetup(setup);
@@ -1423,51 +1008,77 @@ export default function App() {
     return () => navigator.mediaDevices?.removeEventListener?.('devicechange', refreshDevices);
   }, [addLog, refreshCoreAudioTapHelperCheck, refreshDesktopSources, refreshDevices, refreshPermissions, refreshSystemAudioHelperCheck]);
 
-  useLayoutEffect(() => {
-    if (!SAFE_BASELINE) return;
-    const el = liveTranscriptScrollRef.current;
-    if (!el || !stickNearBottomRef.current) return;
-    requestAnimationFrame(() => {
-      const box = liveTranscriptScrollRef.current;
-      if (box) box.scrollTop = box.scrollHeight;
-    });
-  }, [liveTranscript.committedText, visibleCommittedText, liveVisualDraft.visibleDraft, liveVisualDraft.pendingWords.length, liveVisualDraft.segmentId, finalRevealQueue.length]);
-
-  useEffect(() => {
-    if (SAFE_BASELINE) return;
-    if (liveVisualDraft.pendingWords.length === 0) return;
-    const id = window.setInterval(() => {
-      setLiveVisualDraft((p) => {
-        if (p.pendingWords.length === 0) return p;
-        const n =
-          p.pendingWords.length > TYPEWRITER_PENDING_CATCHUP_THRESHOLD
-            ? TYPEWRITER_CATCHUP_WORDS_PER_TICK
-            : TYPEWRITER_MAX_WORDS_PER_TICK;
-        const take = p.pendingWords.slice(0, n);
-        const rest = p.pendingWords.slice(n);
-        const draftTrim = p.visibleDraft.trim();
-        const newDraft = draftTrim ? `${draftTrim} ${take.join(' ')}` : take.join(' ');
-        return { ...p, visibleDraft: newDraft, pendingWords: rest };
-      });
-    }, TYPEWRITER_WORD_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [liveVisualDraft.pendingWords.length, SAFE_BASELINE]);
-
-  useEffect(() => {
-    liveVisualDraftRef.current = liveVisualDraft;
-  }, [liveVisualDraft]);
-
-  useEffect(() => {
-    liveTranscriptRef.current = liveTranscript;
-  }, [liveTranscript]);
-
   useEffect(() => {
     captureHealthRef.current = captureHealthState;
   }, [captureHealthState]);
 
+  // Carga inicial: base de datos local (SQLite) con migración única desde localStorage.
   useEffect(() => {
-    persistSavedSessions(savedSessions);
+    let cancelled = false;
+    void (async () => {
+      const db = window.meetingAssistant?.db;
+      if (!db) {
+        // Entorno sin Electron (p. ej. tests): mantener el fallback anterior.
+        if (!cancelled) {
+          setSavedSessions(loadLegacySavedSessionsFromLocalStorage());
+          savedSessionsHydratedRef.current = true;
+        }
+        return;
+      }
+      try {
+        const legacy = loadLegacySavedSessionsFromLocalStorage();
+        if (legacy.length > 0) {
+          await db.migrateLegacySessions(legacy as unknown as Record<string, unknown>[]);
+        }
+        const result = await db.listSessions();
+        if (cancelled) return;
+        if (result.ok) {
+          const sessions = result.sessions as unknown as DashboardSessionSummary[];
+          knownSessionIdsRef.current = new Set(sessions.map((s) => s.id));
+          setSavedSessions(sessions);
+          try {
+            localStorage.removeItem(SAVED_SESSIONS_STORAGE_KEY);
+          } catch {
+            /* ignore */
+          }
+        } else {
+          console.error('openwhispr: db:sessions:list failed', result.error);
+          setSavedSessions(legacy);
+        }
+      } catch (error) {
+        console.error('openwhispr: failed to load sessions from local database', error);
+        if (!cancelled) setSavedSessions(loadLegacySavedSessionsFromLocalStorage());
+      } finally {
+        if (!cancelled) savedSessionsHydratedRef.current = true;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Sincroniza cada cambio de `savedSessions` con SQLite (upsert de lo vigente + borrado de lo removido).
+  useEffect(() => {
+    if (!savedSessionsHydratedRef.current) return;
+    const db = window.meetingAssistant?.db;
+    if (!db) return;
+    const currentIds = new Set(savedSessions.map((s) => s.id));
+    const removedIds = [...knownSessionIdsRef.current].filter((id) => !currentIds.has(id));
+    knownSessionIdsRef.current = currentIds;
+    void (async () => {
+      try {
+        for (const session of savedSessions) {
+          await db.upsertSession(session as unknown as Record<string, unknown>);
+        }
+        for (const id of removedIds) {
+          await db.deleteSession(id);
+        }
+      } catch (error) {
+        console.error('openwhispr: failed to persist sessions to local database', error);
+      }
+    })();
   }, [savedSessions]);
+
 
   useLayoutEffect(() => {
     const t = readDashboardTheme();
@@ -1542,34 +1153,6 @@ export default function App() {
     const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
   }, [captureMode, captureStartedAt]);
-
-  useEffect(() => {
-    if (SAFE_BASELINE) return;
-    if (finalRevealQueue.length === 0) return;
-    const id = window.setInterval(() => {
-      setFinalRevealQueue((q) => {
-        if (q.length === 0) return q;
-        const n =
-          q.length > FINAL_REVEAL_CATCHUP_THRESHOLD
-            ? FINAL_REVEAL_CATCHUP_WORDS_PER_TICK
-            : FINAL_REVEAL_WORDS_PER_TICK;
-        const take = q.slice(0, n);
-        const rest = q.slice(n);
-        const chunk = take.join(' ');
-        queueMicrotask(() => {
-          setVisibleCommittedText((vc) => appendWordsDeduped(vc, take));
-        });
-        return rest;
-      });
-    }, FINAL_REVEAL_WORD_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [finalRevealQueue.length, SAFE_BASELINE]);
-
-  useEffect(() => () => {
-    if (ledgerFlushTimerRef.current !== null) {
-      window.clearTimeout(ledgerFlushTimerRef.current);
-    }
-  }, []);
 
   const ensureAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
@@ -1886,13 +1469,6 @@ export default function App() {
       nativeHelperStatusUnsubscribeRef.current?.();
       nativeHelperStatusUnsubscribeRef.current = null;
       nativeHelperActiveRef.current = false;
-      nativeHelperSamplesRef.current = new Float32Array(0);
-      nativeHelperSampleCursorRef.current = 0;
-      nativeHelperSegmentStartMsRef.current = null;
-      nativeHelperLastChunkAtRef.current = null;
-      nativeHelperLastNonSilentAtRef.current = null;
-      nativeHelperLastRmsRef.current = 0;
-      nativeHelperLastPeakRef.current = 0;
       void window.meetingAssistant.systemAudioHelper.stop().catch((error) => {
         debug('system-audio-helper:stop-error', String(error));
       });
@@ -1903,13 +1479,6 @@ export default function App() {
       coreTapStatusUnsubscribeRef.current?.();
       coreTapStatusUnsubscribeRef.current = null;
       coreTapActiveRef.current = false;
-      nativeHelperSamplesRef.current = new Float32Array(0);
-      nativeHelperSampleCursorRef.current = 0;
-      nativeHelperSegmentStartMsRef.current = null;
-      nativeHelperLastChunkAtRef.current = null;
-      nativeHelperLastNonSilentAtRef.current = null;
-      nativeHelperLastRmsRef.current = 0;
-      nativeHelperLastPeakRef.current = 0;
       void window.meetingAssistant.coreAudioTapHelper.stop().catch((error) => {
         debug('core-audio-tap-helper:stop-error', String(error));
       });
@@ -1930,37 +1499,9 @@ export default function App() {
     }
     recordingProcessorRef.current = null;
 
-    try {
-      transcriptionProcessorRef.current?.disconnect();
-    } catch {
-      /* noop */
-    }
-    transcriptionProcessorRef.current = null;
-    transcriptionSampleCursorRef.current = 0;
     lastProcessorFrameAtRef.current = null;
-    lastProcessorRmsTraceAtRef.current = 0;
-    transcriptionBusyRef.current = false;
-    transcriptionInFlightModeRef.current = null;
-    pendingTranscriptionWindowsRef.current = [];
-    pendingFinalWindowsRef.current = [];
-    finalBusyRef.current = false;
-    previewBlockedByFinalCountRef.current = 0;
-    vadRef.current.reset();
-    vadShortAccumRef.current = null;
-    activeSegmentIdRef.current = null;
-    lastPreviewPerfMsRef.current = 0;
-    previewSegmentOpenedAtRef.current.clear();
-    previewFirstSuccessRef.current.clear();
-    finalizedSegmentIdsRef.current.clear();
-    if (!options?.preserveSession) {
-      setVisibleCommittedText(liveTranscriptRef.current.committedText);
-      setFinalRevealQueue([]);
-      setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
-    }
-    pendingPolishJobRef.current = null;
-    void window.meetingAssistant.transcription.cancelPending().catch((error) => {
-      debug('transcription:cancel:error', String(error));
-    });
+    /* Ordered stop: detach renderer PCM pushers, then wait for main to finalise every closed segment. */
+    await liveAsrRef.current.stopSession(options?.reason ?? 'capture-stop');
     setRecording(false);
     lastCaptureModeRef.current = null;
     if (!options?.preserveSession) {
@@ -1998,7 +1539,9 @@ export default function App() {
     metersRef.current = stoppedMeters;
     setMeters(stoppedMeters);
     setSessionAudioSources({ mic: false, system: false });
+    sessionAudioSourcesRef.current = { mic: false, system: false };
     systemPcmHelperOnlyRef.current = false;
+    systemCaptureDegradedRef.current = false;
     captureWatchdogGraceUntilRef.current = 0;
     audioEndedWatchdogStreakRef.current = 0;
     if (!options?.preserveSession) {
@@ -2028,16 +1571,33 @@ export default function App() {
   const captureMic = useCallback(async () => {
     patchMeter('mic', { status: 'requesting_permission', error: null });
 
+    try {
+      const access = await window.meetingAssistant.audio.ensureMicrophoneAccess();
+      debug('capture:mic:os-access', access);
+      if (!access.ok) {
+        throw new Error(`microphone-permission-denied: estado macOS=${access.status}`);
+      }
+    } catch (error) {
+      debug('capture:mic:os-access-error', String(error));
+    }
+
+    const mediaDevices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = mediaDevices.filter((device) => device.kind === 'audioinput');
+    void refreshDevices();
+
     const knownMic = selectedMicId
-      ? inputDevices.find((device) => device.kind === 'audioinput' && device.deviceId === selectedMicId)
+      ? audioInputs.find((device) => device.deviceId === selectedMicId)
       : undefined;
 
-    const makeConstraints = (deviceId?: string): MediaStreamConstraints => ({
+    const makeConstraints = (
+      deviceId?: string,
+      deviceIdMode: 'exact' | 'ideal' = 'exact',
+    ): MediaStreamConstraints => ({
       audio: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
+        deviceId: deviceId ? { [deviceIdMode]: deviceId } : undefined,
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: false,
+        autoGainControl: true,
       },
       video: false,
     });
@@ -2045,7 +1605,8 @@ export default function App() {
     const attempts: Array<{ label: string; constraints: MediaStreamConstraints }> = [];
 
     if (knownMic?.deviceId) {
-      attempts.push({ label: 'selected-exact', constraints: makeConstraints(knownMic.deviceId) });
+      attempts.push({ label: 'selected-ideal', constraints: makeConstraints(knownMic.deviceId, 'ideal') });
+      attempts.push({ label: 'selected-exact', constraints: makeConstraints(knownMic.deviceId, 'exact') });
     } else if (selectedMicId) {
       debug('capture:mic:selected-device-missing', { selectedMicId });
     }
@@ -2062,6 +1623,9 @@ export default function App() {
         if (stream.getAudioTracks().length === 0) {
           throw new Error('empty-stream: no audio tracks returned for microphone');
         }
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
         streamsRef.current.mic = stream;
         connectAnalyser(stream, 'mic');
         await refreshDevices();
@@ -2082,17 +1646,7 @@ export default function App() {
     patchMeter('mic', { status: 'failed', error: message });
     addLog(message);
     throw lastError;
-  }, [addLog, connectAnalyser, inputDevices, patchMeter, refreshDevices, refreshPermissions, selectedMicId]);
-
-  const resetNativeHelperBuffers = useCallback(() => {
-    nativeHelperSamplesRef.current = new Float32Array(0);
-    nativeHelperSampleCursorRef.current = 0;
-    nativeHelperSegmentStartMsRef.current = null;
-    nativeHelperLastChunkAtRef.current = null;
-    nativeHelperLastNonSilentAtRef.current = null;
-    nativeHelperLastRmsRef.current = 0;
-    nativeHelperLastPeakRef.current = 0;
-  }, []);
+  }, [addLog, connectAnalyser, patchMeter, refreshDevices, refreshPermissions, selectedMicId]);
 
   const stopNativeSystemAudioHelper = useCallback((reason: string) => {
     nativeHelperChunkUnsubscribeRef.current?.();
@@ -2100,13 +1654,12 @@ export default function App() {
     nativeHelperStatusUnsubscribeRef.current?.();
     nativeHelperStatusUnsubscribeRef.current = null;
     nativeHelperActiveRef.current = false;
-    resetNativeHelperBuffers();
     captureDiag('system-audio-helper:stop-request', { reason, generation: captureGenerationRef.current });
     debug('system-audio-helper:stop-request', { reason, generation: captureGenerationRef.current });
     void window.meetingAssistant.systemAudioHelper.stop().catch((error) => {
       debug('system-audio-helper:stop-error', String(error));
     });
-  }, [resetNativeHelperBuffers]);
+  }, []);
 
   const stopCoreAudioTapHelper = useCallback((reason: string) => {
     coreTapChunkUnsubscribeRef.current?.();
@@ -2114,85 +1667,10 @@ export default function App() {
     coreTapStatusUnsubscribeRef.current?.();
     coreTapStatusUnsubscribeRef.current = null;
     coreTapActiveRef.current = false;
-    resetNativeHelperBuffers();
     captureDiag('core-audio-tap-helper:stop-request', { reason, generation: captureGenerationRef.current });
     debug('core-audio-tap-helper:stop-request', { reason, generation: captureGenerationRef.current });
     void window.meetingAssistant.coreAudioTapHelper.stop().catch((error) => {
       debug('core-audio-tap-helper:stop-error', String(error));
-    });
-  }, [resetNativeHelperBuffers]);
-
-  const flushNativeHelperWindow = useCallback((force = false) => {
-    const sampleRate = 48_000;
-    const minSamples = Math.floor((MIN_FINAL_AUDIO_MS / 1000) * sampleRate);
-    const targetSamples = Math.floor(6 * sampleRate);
-    const samples = nativeHelperSamplesRef.current;
-    if (samples.length === 0) return;
-    if (!force && samples.length < targetSamples) return;
-    if (samples.length < minSamples) return;
-
-    const windowSamples = force ? samples : samples.slice(0, targetSamples);
-    nativeHelperSamplesRef.current = force ? new Float32Array(0) : samples.slice(targetSamples);
-
-    const startMs = nativeHelperSegmentStartMsRef.current
-      ?? ((Math.max(0, nativeHelperSampleCursorRef.current - windowSamples.length) / sampleRate) * 1000);
-    const endMs = startMs + samplesDurationMs(windowSamples, sampleRate);
-    nativeHelperSegmentStartMsRef.current = force
-      ? null
-      : endMs;
-
-    const { rms, peak, gain, processedSamples } = prepareWhisperSamples(windowSamples, { lowRmsDebug: isLowRmsDebugEnabled() });
-    const durationMs = samplesDurationMs(processedSamples, sampleRate);
-    const minRms = minWhisperRmsForProfile('helper');
-    if (isLowRmsDebugEnabled()) {
-      debug('system-audio-helper:window-rms-debug', { rms, peak, minRms, durationMs, sampleCount: processedSamples.length });
-    }
-    if (rms < minRms || durationMs < MIN_FINAL_AUDIO_MS) {
-      debug('system-audio-helper:skip-low-quality-window', {
-        rms,
-        peak,
-        durationMs,
-        sampleCount: processedSamples.length,
-      });
-      return;
-    }
-
-    const segmentId = `system-helper-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const blockId = `final-${segmentId}-${Math.round(startMs)}-${Math.round(endMs)}`;
-    captureDiag('system-audio-helper:transcription-window', {
-      blockId,
-      segmentId,
-      startMs: Math.round(startMs),
-      endMs: Math.round(endMs),
-      rms,
-      peak,
-      whisperGain: gain,
-      sampleCount: processedSamples.length,
-      generation: captureGenerationRef.current,
-    });
-    debug('system-audio-helper:transcription-window', {
-      blockId,
-      segmentId,
-      rms,
-      peak,
-      sampleCount: processedSamples.length,
-    });
-    enqueueTranscriptionRef.current({
-      blockId,
-      wavBytes: encodeWav(processedSamples, sampleRate),
-      startMs: Math.round(startMs),
-      endMs: Math.round(endMs),
-      rms,
-      peak,
-      source: 'system',
-      sampleRate,
-      sampleCount: processedSamples.length,
-      possibleClipping: peak >= CLIPPING_THRESHOLD,
-      whisperGain: gain,
-      mode: 'final',
-      segmentId,
-      verbatimOnly: true,
-      language: 'es',
     });
   }, []);
 
@@ -2211,7 +1689,6 @@ export default function App() {
     const stereo = new Float32Array(bytes.buffer, bytes.byteOffset, floatCount);
     const channels = Math.max(1, payload.channels || 2);
     const frameCount = Math.min(payload.frameCount, Math.floor(stereo.length / channels));
-    const mono = new Float32Array(frameCount);
     let sumSq = 0;
     let peak = 0;
     for (let frame = 0; frame < frameCount; frame += 1) {
@@ -2221,19 +1698,17 @@ export default function App() {
         value += stereo[base + channel] ?? 0;
       }
       value /= channels;
-      mono[frame] = value;
       const absolute = Math.abs(value);
       if (absolute > peak) peak = absolute;
       sumSq += value * value;
     }
     const rms = frameCount > 0 ? Math.sqrt(sumSq / frameCount) : 0;
     const now = Date.now();
-    nativeHelperLastChunkAtRef.current = now;
+    lastAudioRmsAtRef.current = now;
     nativeHelperLastRmsRef.current = rms;
     nativeHelperLastPeakRef.current = peak;
-    lastAudioRmsAtRef.current = now;
+    nativeHelperLastChunkAtRef.current = now;
     if (rms >= SYSTEM_SIGNAL_CHECK_RMS || peak >= SYSTEM_SIGNAL_CHECK_PEAK) {
-      nativeHelperLastNonSilentAtRef.current = now;
       lastNonSilentAudioAtRef.current = now;
     }
 
@@ -2259,17 +1734,8 @@ export default function App() {
       });
     }
 
-    const current = nativeHelperSamplesRef.current;
-    const next = new Float32Array(current.length + mono.length);
-    next.set(current, 0);
-    next.set(mono, current.length);
-    if (nativeHelperSegmentStartMsRef.current === null) {
-      nativeHelperSegmentStartMsRef.current = (nativeHelperSampleCursorRef.current / (payload.sampleRate || 48_000)) * 1000;
-    }
-    nativeHelperSampleCursorRef.current += mono.length;
-    nativeHelperSamplesRef.current = next;
-    flushNativeHelperWindow(false);
-  }, [flushNativeHelperWindow, patchMeter]);
+    /* ASR: main feeds helper PCM to the live session directly; the renderer only meters it. */
+  }, [patchMeter]);
 
   const startNativeSystemAudioHelper = useCallback(async (reason: string) => {
     stopCoreAudioTapHelper('before-native-helper');
@@ -2284,7 +1750,6 @@ export default function App() {
       });
     }
 
-    resetNativeHelperBuffers();
     nativeHelperChunkUnsubscribeRef.current?.();
     nativeHelperStatusUnsubscribeRef.current?.();
     nativeHelperChunkUnsubscribeRef.current = window.meetingAssistant.systemAudioHelper.onChunk(handleNativeHelperChunk);
@@ -2307,7 +1772,6 @@ export default function App() {
       nativeHelperChunkUnsubscribeRef.current = null;
       nativeHelperStatusUnsubscribeRef.current?.();
       nativeHelperStatusUnsubscribeRef.current = null;
-      resetNativeHelperBuffers();
       void window.meetingAssistant.systemAudioHelper.stop().catch(() => undefined);
       throw new SystemAudioEngineError(started.error ?? 'Native macOS helper failed to start.', {
         status: 'failed',
@@ -2329,7 +1793,6 @@ export default function App() {
     addLog,
     handleNativeHelperChunk,
     patchMeter,
-    resetNativeHelperBuffers,
     stopCoreAudioTapHelper,
   ]);
 
@@ -2346,7 +1809,6 @@ export default function App() {
       });
     }
 
-    resetNativeHelperBuffers();
     coreTapChunkUnsubscribeRef.current?.();
     coreTapStatusUnsubscribeRef.current?.();
     coreTapChunkUnsubscribeRef.current = window.meetingAssistant.coreAudioTapHelper.onChunk(handleNativeHelperChunk);
@@ -2369,7 +1831,6 @@ export default function App() {
       coreTapChunkUnsubscribeRef.current = null;
       coreTapStatusUnsubscribeRef.current?.();
       coreTapStatusUnsubscribeRef.current = null;
-      resetNativeHelperBuffers();
       void window.meetingAssistant.coreAudioTapHelper.stop().catch(() => undefined);
       throw new SystemAudioEngineError(started.error ?? 'CoreAudio Tap helper failed to start.', {
         status: 'failed',
@@ -2389,7 +1850,6 @@ export default function App() {
     addLog,
     handleNativeHelperChunk,
     patchMeter,
-    resetNativeHelperBuffers,
     stopNativeSystemAudioHelper,
   ]);
 
@@ -2413,42 +1873,48 @@ export default function App() {
     debug('capture:system:signal-check:start', startPayload);
 
     return new Promise((resolve) => {
+      let everHadPcmChunk = false;
       const sample = () => {
         if (providerId === 'native-helper' || providerId === 'coreaudio-tap') {
           const elapsedMs = Date.now() - startedAt;
           const rms = nativeHelperLastRmsRef.current;
           const peak = nativeHelperLastPeakRef.current;
           const hasChunk = nativeHelperLastChunkAtRef.current !== null && nativeHelperLastChunkAtRef.current >= startedAt;
-          const usable = Boolean(nativeHelperLastNonSilentAtRef.current && nativeHelperLastNonSilentAtRef.current >= startedAt);
-          if (usable) hitCount += 1;
-          else hitCount = 0;
+          const aliveByChunks = hasChunk;
+          if (aliveByChunks) {
+            everHadPcmChunk = true;
+            hitCount += 1;
+          } else {
+            hitCount = 0;
+          }
           const samplePayload = {
             source,
             providerId,
             elapsedMs,
             rms: Number(rms.toFixed(6)),
             peak: Number(peak.toFixed(6)),
-            usable,
+            aliveByChunks,
             hasChunk,
+            everHadPcmChunk,
             hitCount,
             generation: captureGenerationRef.current,
           };
           captureDiag('capture:system:signal-check:sample', samplePayload);
           debug('capture:system:signal-check:sample', samplePayload);
-          if (hitCount >= SYSTEM_SIGNAL_CHECK_REQUIRED_HITS) {
-            captureDiag('capture:system:signal-check:ok', samplePayload);
-            debug('capture:system:signal-check:ok', samplePayload);
+          if (hitCount >= SYSTEM_PCM_CHUNK_REQUIRED_HITS) {
+            captureDiag('capture:system:signal-check:ok', { ...samplePayload, reason: 'alive-chunks' });
+            debug('capture:system:signal-check:ok', { ...samplePayload, reason: 'alive-chunks' });
             resolve(true);
             return;
           }
           if (elapsedMs >= timeoutMs) {
             const failedPayload = {
               ...samplePayload,
-              reason: hasChunk ? 'timeout-silent-pcm-helper' : 'timeout-no-pcm-helper-chunks',
+              reason: everHadPcmChunk ? 'timeout-chunks-interrupted' : 'timeout-no-pcm-helper-chunks',
             };
-            captureDiag('capture:system:signal-check:failed', failedPayload);
-            debug('capture:system:signal-check:failed', failedPayload);
-            resolve(false);
+            captureDiag(everHadPcmChunk ? 'capture:system:signal-check:ok' : 'capture:system:signal-check:failed', failedPayload);
+            debug(everHadPcmChunk ? 'capture:system:signal-check:ok' : 'capture:system:signal-check:failed', failedPayload);
+            resolve(everHadPcmChunk);
             return;
           }
           window.setTimeout(sample, SYSTEM_SIGNAL_CHECK_INTERVAL_MS);
@@ -2794,15 +2260,11 @@ export default function App() {
     sources.forEach((stream, index) => {
       const source = audioContext.createMediaStreamSource(stream);
       const gain = audioContext.createGain();
-      if (SAFE_BASELINE) {
-        if (sources.length > 1) {
-          /* Slightly louder loopback/display: it often sits below mic in RMS on macOS. */
-          gain.gain.value = index === 0 ? 0.32 : 0.58;
-        } else {
-          gain.gain.value = 0.7;
-        }
+      if (sources.length > 1) {
+        /* Slightly louder loopback/display: it often sits below mic in RMS on macOS. */
+        gain.gain.value = index === 0 ? 0.32 : 0.58;
       } else {
-        gain.gain.value = Math.max(0.45, 1 / Math.max(1, sources.length));
+        gain.gain.value = 0.7;
       }
       source.connect(gain);
       gain.connect(destination);
@@ -2820,1040 +2282,18 @@ export default function App() {
     return destination.stream;
   }, [connectAnalyser, ensureAudioContext]);
 
-  const runPolishJob = useCallback((job: PendingPolishJob) => {
-    polisherBusyRef.current = true;
-    const startedAt = Date.now();
-
-    window.meetingAssistant.polisher.polishSegment({
-      batchId: job.batchId,
-      rawSegments: [{
-        id: job.batchId,
-        startMs: job.startMs,
-        endMs: job.endMs,
-        text: job.text,
-        source: job.source,
-        rms: 0.1,
-      }],
-      context: cleanContextRef.current.slice(-900),
-      glossary,
-    }).then((result) => {
-      debug('polisher:notes-result', {
-        ...result,
-        polishLatency: Date.now() - startedAt,
-        chars: job.text.length,
-        pending: Boolean(pendingPolishJobRef.current),
-      });
-      if (!result.ok) {
-        addLog(`notas Gemma: ${result.error ?? 'error desconocido'}`);
-        return;
-      }
-      const text = (result.text ?? '').trim();
-      if (!text) return;
-      cleanContextRef.current = `${cleanContextRef.current} ${text}`.trim();
-      setCleanSegments((current) => [...current, {
-        id: job.batchId,
-        startMs: job.startMs,
-        endMs: job.endMs,
-        rawSegmentIds: [job.batchId],
-        cleanText: text,
-        status: 'final' as const,
-      }].slice(-20));
-    }).catch((error) => {
-      debug('polisher:notes-error', String(error));
-      addLog(`notas Gemma: ${String(error)}`);
-    }).finally(() => {
-      polisherBusyRef.current = false;
-      const pending = pendingPolishJobRef.current;
-      pendingPolishJobRef.current = null;
-      if (pending) runPolishJob(pending);
-    });
-  }, [addLog, glossary]);
-
-  const maybePolishNotes = useCallback((committedText: string, source: SourceKey, endMs: number) => {
-    if (SAFE_BASELINE) return;
-    if (!polisherSetup?.ok) return;
-    const now = Date.now();
-    const newChars = committedText.length - lastNotesTextLengthRef.current;
-    if (now - lastNotesPolishAtRef.current < NOTES_POLISH_INTERVAL_MS && newChars < 180) return;
-    if (committedText.trim().length < 80) return;
-
-    const newConfirmedText = committedText.slice(Math.max(0, lastNotesTextLengthRef.current)).trim();
-    const textToPolish = newConfirmedText.length >= 80
-      ? newConfirmedText
-      : committedText.slice(Math.max(0, committedText.length - 1600));
-    const batchId = `note-${now}-${endMs}`;
-    const job: PendingPolishJob = {
-      batchId,
-      startMs: Math.max(0, endMs - 40_000),
-      endMs,
-      text: textToPolish,
-      source,
-    };
-
-    lastNotesPolishAtRef.current = now;
-    lastNotesTextLengthRef.current = committedText.length;
-
-    if (polisherBusyRef.current) {
-      pendingPolishJobRef.current = job;
-      debug('polisher:notes-queued-latest', {
-        batchId,
-        chars: textToPolish.length,
-        action: 'replace-pending-polish',
-      });
-      return;
-    }
-
-    runPolishJob(job);
-  }, [polisherSetup, runPolishJob]);
-
-  const warnPossibleClipping = useCallback((source: SourceKey, peak: number) => {
-    if (peak < CLIPPING_THRESHOLD) return;
-    const now = Date.now();
-    if (now - lastClippingWarningAtRef.current < 12_000) return;
-    lastClippingWarningAtRef.current = now;
-    addLog(`${source}: audio está clipeando (peak ${peak.toFixed(3)}); baja el volumen de la fuente para mejorar Whisper`);
-  }, [addLog]);
-
-  const scheduleLedgerFlush = useCallback((delayMs: number | null) => {
-    if (ledgerFlushTimerRef.current !== null) {
-      window.clearTimeout(ledgerFlushTimerRef.current);
-      ledgerFlushTimerRef.current = null;
-    }
-    if (delayMs === null) return;
-    ledgerFlushTimerRef.current = window.setTimeout(() => {
-      ledgerFlushTimerRef.current = null;
-      const snapshot = candidateLedgerRef.current.flush();
-      setLedgerDebugGroups(snapshot.debugGroups);
-      const source = liveTranscriptionSourceRef.current;
-      setLiveTranscript((prev) => {
-        if (snapshot.committedText && snapshot.committedText.length > prev.committedText.length) {
-          queueMicrotask(() => maybePolishNotes(snapshot.committedText, source, snapshot.committedThroughMs));
-        }
-        return {
-          committedText: snapshot.committedText,
-          unstableSuffix: snapshot.unstableText,
-          lastReason: snapshot.lastReason,
-          lastUpdatedAt: Date.now(),
-        };
-      });
-      scheduleLedgerFlush(snapshot.nextFlushDelayMs);
-    }, Math.max(50, delayMs));
-  }, [maybePolishNotes]);
-
-  const applyLedgerSnapshot = useCallback((snapshot: LedgerSnapshot, source: SourceKey) => {
-    setLedgerDebugGroups(snapshot.debugGroups);
-    setLiveTranscript((prev) => {
-      if (snapshot.committedText && snapshot.committedText.length > prev.committedText.length) {
-        queueMicrotask(() => maybePolishNotes(snapshot.committedText, source, snapshot.committedThroughMs));
-      }
-      return {
-        committedText: snapshot.committedText,
-        unstableSuffix: snapshot.unstableText,
-        lastReason: snapshot.lastReason,
-        lastUpdatedAt: Date.now(),
-      };
-    });
-    scheduleLedgerFlush(snapshot.nextFlushDelayMs);
-  }, [maybePolishNotes, scheduleLedgerFlush]);
-
-  const handlePreviewSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-    if (SAFE_BASELINE && !isV2Pipeline) return;
-
-    if (!shouldUseForLive(segment)) {
-      setRawSegments((current) => [...current, { ...segment, stabilizationReason: 'filtered' }].slice(-120));
-      return;
-    }
-    setRawSegments((current) => [...current, { ...segment, asrMode: 'preview' as const, segmentId }].slice(-120));
-    if (isV2Pipeline) {
-      acceptV2MainPreview(segment, segmentId);
-      return;
-    }
-    const snapshot = candidateLedgerRef.current.addCandidate({
-      id: segment.id,
-      segmentId,
-      startMs: segment.startMs,
-      endMs: segment.endMs,
-      text: segment.text,
-      mode: 'preview',
-      source: segment.source,
-      rms: segment.rms,
-      peak: segment.peak,
-      modelName: segment.modelName,
-      durationMs: segment.durationMs,
-      suspicious: segment.suspicious,
-      language: segment.language,
-    });
-    applyLedgerSnapshot(snapshot, segment.source);
-  }, [acceptV2MainPreview, applyLedgerSnapshot, showRawDebug]);
-
-  const handleFinalSegment = useCallback((segment: TranscriptSegment, segmentId: string) => {
-    const finalText = segment.text.trim();
-    if (!finalText) return;
-    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-
-    if (SAFE_BASELINE && !isV2Pipeline) {
-      const pk = segment.peak ?? 0;
-      if (pk >= CLIPPING_THRESHOLD) {
-        finalizedSegmentIdsRef.current.add(segmentId);
-        addLog(`${segment.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${pk.toFixed(3)})`);
-        debug('transcription:final-audit', {
-          startMs: segment.startMs,
-          endMs: segment.endMs,
-          durationMs: segment.durationMs,
-          rms: segment.rms,
-          peak: pk,
-          whisperGain: segment.whisperGain,
-          promptLength: segment.whisperPromptLength ?? 0,
-          language: segment.language ?? 'es',
-          acceptedFinal: false,
-          rejectReason: 'clipping',
-        });
-        return;
-      }
-      setRawSegments((current) => [...current, {
-        ...segment,
-        status: 'final' as const,
-        asrMode: 'final' as const,
-        segmentId,
-        stabilizationReason: 'vad-final-direct',
-      }].slice(-120));
-      finalizedSegmentIdsRef.current.add(segmentId);
-      setLiveTranscript((prev) => ({
-        committedText: `${prev.committedText} ${finalText}`.trim(),
-        unstableSuffix: '',
-        lastReason: 'vad-final-direct',
-        lastUpdatedAt: Date.now(),
-      }));
-      setVisibleCommittedText((vc) => appendWordsDeduped(vc, splitWords(finalText)));
-      setFinalRevealQueue([]);
-      setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
-      acceptV2ShadowFinal(segment, segmentId);
-      finalAcceptedCountRef.current += 1;
-      syncAsrLiveStats({});
-      const snapshot = candidateLedgerRef.current.addCandidate({
-        id: segment.id,
-        segmentId,
-        startMs: segment.startMs,
-        endMs: segment.endMs,
-        text: segment.text,
-        mode: 'final',
-        source: segment.source,
-        rms: segment.rms,
-        peak: segment.peak,
-        modelName: segment.modelName,
-        durationMs: segment.durationMs,
-        suspicious: segment.suspicious,
-        language: segment.language,
-      });
-      setLedgerDebugGroups(snapshot.debugGroups);
-      debug('transcription:final-audit', {
-        startMs: segment.startMs,
-        endMs: segment.endMs,
-        durationMs: segment.durationMs,
-        rms: segment.rms,
-        peak: pk,
-        whisperGain: segment.whisperGain,
-        promptLength: segment.whisperPromptLength ?? 0,
-        language: segment.language ?? 'es',
-        acceptedFinal: true,
-        rejectReason: null,
-      });
-      return;
-    }
-
-    if (isV2Pipeline) {
-      setRawSegments((current) => [...current, {
-        ...segment,
-        status: 'final' as const,
-        asrMode: 'final' as const,
-        segmentId,
-        stabilizationReason: segment.fallbackUsed ? 'v2-final-fallback' : 'v2-final',
-      }].slice(-120));
-      finalizedSegmentIdsRef.current.add(segmentId);
-      acceptV2MainFinal(segment, segmentId);
-      queueFinalRefinementSegment(segment, segmentId);
-      finalAcceptedCountRef.current += 1;
-      syncAsrLiveStats({});
-      debug('transcription:v2-final-accepted', {
-        segmentId,
-        engineUsed: segment.engineUsed ?? segment.modelName,
-        fallbackUsed: segment.fallbackUsed ?? false,
-        fallbackReason: segment.fallbackReason,
-        modelName: segment.modelName,
-      });
-      return;
-    }
-
-    setRawSegments((current) => [...current, {
-      ...segment,
-      status: 'final' as const,
-      asrMode: 'final' as const,
-      segmentId,
-      stabilizationReason: 'vad-endpoint',
-    }].slice(-120));
-    const snapshot = candidateLedgerRef.current.addCandidate({
-      id: segment.id,
-      segmentId,
-      startMs: segment.startMs,
-      endMs: segment.endMs,
-      text: segment.text,
-      mode: 'final',
-      source: segment.source,
-      rms: segment.rms,
-      peak: segment.peak,
-      modelName: segment.modelName,
-      durationMs: segment.durationMs,
-      suspicious: segment.suspicious,
-      language: segment.language,
-    });
-    applyLedgerSnapshot(snapshot, segment.source);
-  }, [acceptV2MainFinal, acceptV2ShadowFinal, addLog, applyLedgerSnapshot, queueFinalRefinementSegment, syncAsrLiveStats]);
-
-
-  /** safeBaseline: whisper.cpp transcribe cada segmento VAD cerrado (solo final). */
-  const processNextFinalWindow = useCallback(() => {
-    if (!SAFE_BASELINE) return;
-    if (finalBusyRef.current) return;
-    const request = pendingFinalWindowsRef.current.shift();
-    if (!request) return;
-
-    finalBusyRef.current = true;
-
-    const effectiveVerbatimOnly = true;
-    const effectiveLanguage = 'es';
-
-    debug('transcription:window-send', {
-      blockId: request.blockId,
-      mode: request.mode,
-      segmentId: request.segmentId,
-      source: request.source,
-      startMs: request.startMs,
-      endMs: request.endMs,
-      rms: request.rms,
-      peak: request.peak,
-      verbatimOnly: effectiveVerbatimOnly,
-      language: effectiveLanguage,
-      promptMode: 'empty',
-      glossaryChars: 0,
-      safeBaseline: true,
-      lane: 'final',
-      sampleRate: request.sampleRate,
-      sampleCount: request.sampleCount,
-      bytes: request.wavBytes.byteLength,
-      coalesced: request.coalesced ?? false,
-      possibleClipping: request.possibleClipping ?? false,
-      whisperGain: request.whisperGain,
-      finalQueuePending: pendingFinalWindowsRef.current.length,
-    });
-
-    window.meetingAssistant.transcription.transcribeBlock({
-      blockId: request.blockId,
-      wavBytes: request.wavBytes,
-      startMs: request.startMs,
-      endMs: request.endMs,
-      rms: request.rms,
-      peak: request.peak,
-      source: request.source,
-      glossary: undefined,
-      promptMode: 'empty',
-      sampleRate: request.sampleRate,
-      sampleCount: request.sampleCount,
-      whisperGain: request.whisperGain,
-      mode: 'final',
-      modelRole: 'final',
-      language: effectiveLanguage,
-      verbatimOnly: effectiveVerbatimOnly,
-    }).then((result) => {
-      debug('transcription:whisper-invocation', result.whisperDebug ?? {
-        language: effectiveLanguage,
-        promptLength: 0,
-        verbatimOnly: effectiveVerbatimOnly,
-        translateEnabled: false,
-        argsSanitized: [],
-      });
-      debug('transcription:window-result', {
-        ...result,
-        mode: request.mode,
-        lane: 'final',
-      });
-      if (!result.ok) {
-        const err = result.error ?? 'error desconocido';
-        addLog(`transcription error: ${err}`);
-        debug('transcription:final-audit', {
-          startMs: request.startMs,
-          endMs: request.endMs,
-          durationMs: request.endMs - request.startMs,
-          rms: request.rms,
-          peak: request.peak,
-          whisperGain: request.whisperGain,
-          promptLength: 0,
-          language: effectiveLanguage,
-          acceptedFinal: false,
-          rejectReason: `whisper-error: ${result.error ?? 'unknown'}`,
-        });
-        return;
-      }
-
-      const text = (result.text ?? '').trim();
-      if (!text) {
-        addLog(`transcription: segmento final sin texto (${result.durationMs}ms)`);
-        debug('transcription:final-audit', {
-          startMs: request.startMs,
-          endMs: request.endMs,
-          durationMs: result.durationMs,
-          rms: request.rms,
-          peak: request.peak,
-          whisperGain: request.whisperGain,
-          promptLength: result.whisperPromptLength ?? 0,
-          language: effectiveLanguage,
-          acceptedFinal: false,
-          rejectReason: 'empty-transcript',
-        });
-        return;
-      }
-
-      if ((request.peak ?? 0) >= CLIPPING_THRESHOLD) {
-        addLog(`${request.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${(request.peak ?? 0).toFixed(3)})`);
-        debug('transcription:final-audit', {
-          startMs: request.startMs,
-          endMs: request.endMs,
-          durationMs: result.durationMs,
-          rms: request.rms,
-          peak: request.peak,
-          whisperGain: request.whisperGain,
-          promptLength: result.whisperPromptLength ?? 0,
-          language: effectiveLanguage,
-          acceptedFinal: false,
-          rejectReason: 'clipping',
-        });
-        return;
-      }
-
-      const queueWaitMs = request.enqueuedAtMs !== undefined ? Date.now() - request.enqueuedAtMs : 0;
-      const wallLatencyMs = queueWaitMs + result.durationMs;
-      syncAsrLiveStats({ finalLatencyMs: wallLatencyMs });
-      debug('transcription:latency-metrics', {
-        kind: 'final',
-        wallLatencyMs,
-        timeToFinalMs: wallLatencyMs,
-        modelName: result.modelName,
-      });
-
-      const baseSegment: TranscriptSegment = {
-        id: request.blockId,
-        startMs: request.startMs,
-        endMs: request.endMs,
-        text,
-        rawText: result.text,
-        status: 'final',
-        source: request.source,
-        rms: request.rms,
-        peak: request.peak,
-        durationMs: result.durationMs,
-        modelName: result.modelName,
-        suspicious: false,
-        sampleRate: request.sampleRate,
-        sampleCount: request.sampleCount,
-        possibleClipping: request.possibleClipping,
-        whisperGain: request.whisperGain,
-        whisperPromptLength: result.whisperPromptLength,
-        segmentId: request.segmentId,
-        asrMode: 'final',
-        language: effectiveLanguage,
-        engineUsed: result.engineUsed,
-        fallbackUsed: result.fallbackUsed,
-        fallbackReason: result.fallbackReason,
-        whisperText: result.whisperText,
-        qwenText: result.qwenText,
-        whisperDurationMs: result.whisperDurationMs,
-        qwenDurationMs: result.qwenDurationMs,
-        qwenError: result.qwenError,
-      };
-      handleFinalSegment(baseSegment, request.segmentId);
-    }).catch((error) => {
-      debug('transcription:window-error', String(error));
-      addLog(`transcription error: ${String(error)}`);
-    }).finally(() => {
-      finalBusyRef.current = false;
-      syncAsrLiveStats({});
-      processNextFinalWindow();
-    });
-  }, [addLog, handleFinalSegment, syncAsrLiveStats]);
-
-  const processNextTranscriptionWindow = useCallback(() => {
-    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-    if (SAFE_BASELINE && !isV2Pipeline) return;
-    if (transcriptionBusyRef.current) return;
-    const request = pendingTranscriptionWindowsRef.current.shift();
-    if (!request) return;
-    const isBaselineMode = !isV2Pipeline;
-
-    transcriptionBusyRef.current = true;
-    transcriptionInFlightModeRef.current = request.mode;
-
-    const effectiveGlossary = SAFE_BASELINE && isBaselineMode ? undefined : (request.verbatimOnly ? undefined : glossary);
-    const effectivePromptMode = SAFE_BASELINE && isBaselineMode ? 'empty' : (request.verbatimOnly ? 'empty' : promptMode);
-    const effectiveVerbatimOnly = SAFE_BASELINE && isBaselineMode ? true : request.verbatimOnly;
-    const effectiveLanguage = SAFE_BASELINE && isBaselineMode ? 'es' : request.language;
-
-    debug('transcription:window-send', {
-      blockId: request.blockId,
-      mode: request.mode,
-      segmentId: request.segmentId,
-      source: request.source,
-      startMs: request.startMs,
-      endMs: request.endMs,
-      rms: request.rms,
-      peak: request.peak,
-      verbatimOnly: effectiveVerbatimOnly,
-      language: effectiveLanguage,
-      promptMode: effectivePromptMode,
-      glossaryChars: effectiveGlossary?.length ?? 0,
-      safeBaseline: SAFE_BASELINE && isBaselineMode,
-      v2Mode: isV2Pipeline,
-      sampleRate: request.sampleRate,
-      sampleCount: request.sampleCount,
-      bytes: request.wavBytes.byteLength,
-      asrQueue: pendingTranscriptionWindowsRef.current.length,
-      coalesced: request.coalesced ?? false,
-      possibleClipping: request.possibleClipping ?? false,
-      whisperGain: request.whisperGain,
-    });
-
-    window.meetingAssistant.transcription.transcribeBlock({
-      blockId: request.blockId,
-      wavBytes: request.wavBytes,
-      startMs: request.startMs,
-      endMs: request.endMs,
-      rms: request.rms,
-      peak: request.peak,
-      source: request.source,
-      glossary: effectiveGlossary,
-      promptMode: effectivePromptMode,
-      sampleRate: request.sampleRate,
-      sampleCount: request.sampleCount,
-      whisperGain: request.whisperGain,
-      mode: request.mode,
-      modelRole: request.mode === 'preview' ? 'preview' as const : 'final' as const,
-      language: effectiveLanguage,
-      verbatimOnly: effectiveVerbatimOnly,
-    }).then((result) => {
-      debug('transcription:whisper-invocation', result.whisperDebug ?? {
-        language: effectiveLanguage,
-        promptLength: 0,
-        verbatimOnly: effectiveVerbatimOnly,
-        translateEnabled: false,
-        argsSanitized: [],
-      });
-      debug('transcription:window-result', {
-        ...result,
-        mode: request.mode,
-        asrQueue: pendingTranscriptionWindowsRef.current.length,
-      });
-      if (!result.ok) {
-        const err = result.error ?? 'error desconocido';
-        if (request.mode === 'preview') {
-          debug('transcription:preview-error', { blockId: request.blockId, segmentId: request.segmentId, error: err });
-          if (/code null|exited with code|killed|SIGTERM|cancel/i.test(err)) {
-            debug('transcription:preview-cancelled-or-killed', { blockId: request.blockId, segmentId: request.segmentId });
-          }
-        } else {
-          addLog(`transcription error: ${err}`);
-        }
-        if (SAFE_BASELINE && isBaselineMode && request.mode === 'final') {
-          debug('transcription:final-audit', {
-            startMs: request.startMs,
-            endMs: request.endMs,
-            durationMs: request.endMs - request.startMs,
-            rms: request.rms,
-            peak: request.peak,
-            whisperGain: request.whisperGain,
-            promptLength: 0,
-            language: effectiveLanguage,
-            acceptedFinal: false,
-            rejectReason: `whisper-error: ${result.error ?? 'unknown'}`,
-          });
-        }
-        return;
-      }
-
-      const text = (result.text ?? '').trim();
-      if (!text) {
-        if (request.mode === 'final') {
-          addLog(`transcription: segmento final sin texto (${result.durationMs}ms)`);
-          if (SAFE_BASELINE && isBaselineMode) {
-            debug('transcription:final-audit', {
-              startMs: request.startMs,
-              endMs: request.endMs,
-              durationMs: result.durationMs,
-              rms: request.rms,
-              peak: request.peak,
-              whisperGain: request.whisperGain,
-              promptLength: result.whisperPromptLength ?? 0,
-              language: effectiveLanguage,
-              acceptedFinal: false,
-              rejectReason: 'empty-transcript',
-            });
-          }
-        }
-        return;
-      }
-
-      if (SAFE_BASELINE && isBaselineMode && request.mode === 'final' && (request.peak ?? 0) >= CLIPPING_THRESHOLD) {
-        addLog(`${request.source}: segmento final descartado por clipping; baja volumen de la fuente (peak ${(request.peak ?? 0).toFixed(3)})`);
-        debug('transcription:final-audit', {
-          startMs: request.startMs,
-          endMs: request.endMs,
-          durationMs: result.durationMs,
-          rms: request.rms,
-          peak: request.peak,
-          whisperGain: request.whisperGain,
-          promptLength: result.whisperPromptLength ?? 0,
-          language: effectiveLanguage,
-          acceptedFinal: false,
-          rejectReason: 'clipping',
-        });
-        return;
-      }
-
-      const queueWaitMs = request.enqueuedAtMs !== undefined ? Date.now() - request.enqueuedAtMs : 0;
-      const wallLatencyMs = queueWaitMs + result.durationMs;
-      if (request.mode === 'preview') {
-        let timeToFirstPreviewMs: number | undefined;
-        if (!previewFirstSuccessRef.current.has(request.segmentId)) {
-          previewFirstSuccessRef.current.add(request.segmentId);
-          const openedAt = previewSegmentOpenedAtRef.current.get(request.segmentId);
-          if (openedAt !== undefined) {
-            timeToFirstPreviewMs = Math.round(performance.now() - openedAt);
-          }
-        }
-        syncAsrLiveStats({
-          previewLatencyMs: wallLatencyMs,
-          lastPreviewSegmentDurationMs: request.endMs - request.startMs,
-          ...(timeToFirstPreviewMs !== undefined ? { timeToFirstPreviewMs } : {}),
-        });
-        debug('transcription:latency-metrics', {
-          kind: 'preview',
-          wallLatencyMs,
-          timeToFirstPreviewMs,
-          segmentDurationMs: request.endMs - request.startMs,
-          modelName: result.modelName,
-        });
-      } else {
-        syncAsrLiveStats({ finalLatencyMs: wallLatencyMs });
-        debug('transcription:latency-metrics', {
-          kind: 'final',
-          wallLatencyMs,
-          timeToFinalMs: wallLatencyMs,
-          modelName: result.modelName,
-        });
-      }
-
-      const baseSegment: TranscriptSegment = {
-        id: request.blockId,
-        startMs: request.startMs,
-        endMs: request.endMs,
-        text,
-        rawText: result.text,
-        status: request.mode === 'final' ? 'final' : 'partial',
-        source: request.source,
-        rms: request.rms,
-        peak: request.peak,
-        durationMs: result.durationMs,
-        modelName: result.modelName,
-        suspicious: request.mode === 'preview' && isSuspiciousTranscript(text, request.rms),
-        sampleRate: request.sampleRate,
-        sampleCount: request.sampleCount,
-        possibleClipping: request.possibleClipping,
-        whisperGain: request.whisperGain,
-        whisperPromptLength: result.whisperPromptLength,
-        segmentId: request.segmentId,
-        asrMode: request.mode === 'final' ? 'final' as const : 'preview' as const,
-        language: effectiveLanguage,
-        engineUsed: result.engineUsed,
-        fallbackUsed: result.fallbackUsed,
-        fallbackReason: result.fallbackReason,
-        whisperText: result.whisperText,
-        qwenText: result.qwenText,
-        whisperDurationMs: result.whisperDurationMs,
-        qwenDurationMs: result.qwenDurationMs,
-        qwenError: result.qwenError,
-      };
-
-      if (request.mode === 'final') {
-        handleFinalSegment(baseSegment, request.segmentId);
-      } else {
-        handlePreviewSegment(baseSegment, request.segmentId);
-      }
-    }).catch((error) => {
-      const msg = String(error);
-      if (request.mode === 'preview') {
-        debug('transcription:window-error-preview', {
-          blockId: request.blockId,
-          segmentId: request.segmentId,
-          invokeError: msg,
-        });
-      } else {
-        debug('transcription:window-error', msg);
-        addLog(`transcription error: ${msg}`);
-      }
-    }).finally(() => {
-      transcriptionBusyRef.current = false;
-      transcriptionInFlightModeRef.current = null;
-      syncAsrLiveStats({});
-      processNextTranscriptionWindow();
-    });
-  }, [addLog, glossary, handleFinalSegment, handlePreviewSegment, promptMode, syncAsrLiveStats]);
-
-  const enqueueTranscription = useCallback((request: TranscriptionWindow) => {
-    const enqueuedAtMs = Date.now();
-    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-    const r: TranscriptionWindow = SAFE_BASELINE
-      ? { ...request, verbatimOnly: true, language: 'es', enqueuedAtMs }
-      : { ...request, enqueuedAtMs };
-
-    if (SAFE_BASELINE && !isV2Pipeline && r.mode === 'preview') {
-      return;
-    }
-
-    if (SAFE_BASELINE && !isV2Pipeline && r.mode === 'final') {
-      pendingFinalWindowsRef.current.push(r);
-      syncAsrLiveStats({});
-      debug('transcription:window-queued', {
-        blockId: r.blockId,
-        mode: r.mode,
-        segmentId: r.segmentId,
-        finalQueue: pendingFinalWindowsRef.current.length,
-      });
-      processNextFinalWindow();
-      return;
-    }
-
-    if (r.mode === 'final') {
-      pendingTranscriptionWindowsRef.current = [
-        r,
-        ...pendingTranscriptionWindowsRef.current.filter(
-          (w) => !(w.mode === 'preview' && w.segmentId === r.segmentId),
-        ),
-      ];
-      syncAsrLiveStats({});
-    } else {
-      const pending = pendingTranscriptionWindowsRef.current;
-      const lastIdx = pending.length - 1;
-      if (lastIdx >= 0 && pending[lastIdx].mode === 'preview' && pending[lastIdx].segmentId === r.segmentId) {
-        previewReplacedCountRef.current += 1;
-        pending[lastIdx] = { ...r, coalesced: true };
-        syncAsrLiveStats({});
-        debug('transcription:preview-replaced', { blockId: r.blockId, segmentId: r.segmentId });
-        processNextTranscriptionWindow();
-        return;
-      }
-      let previewCount = 0;
-      for (let i = 0; i < pending.length; i += 1) {
-        if (pending[i].mode === 'preview') previewCount += 1;
-      }
-      if (previewCount >= MAX_PREVIEW_QUEUE) {
-        const firstPreview = pending.findIndex((req) => req.mode === 'preview');
-        if (firstPreview >= 0) {
-          previewReplacedCountRef.current += 1;
-          pending.splice(firstPreview, 1);
-        }
-      }
-      pending.push(r);
-      syncAsrLiveStats({});
-    }
-    debug('transcription:window-queued', {
-      blockId: r.blockId,
-      mode: r.mode,
-      segmentId: r.segmentId,
-      asrQueue: pendingTranscriptionWindowsRef.current.length,
-    });
-    processNextTranscriptionWindow();
-  }, [processNextFinalWindow, processNextTranscriptionWindow, syncAsrLiveStats]);
-  enqueueTranscriptionRef.current = enqueueTranscription;
-
-  const startLiveTranscription = useCallback((stream: MediaStream, source: SourceKey) => {
-    const audioContext = ensureAudioContext();
-    transcriptionProcessorRef.current?.disconnect();
-    transcriptionFirstFrameLoggedRef.current = false;
-    lastProcessorFrameAtRef.current = null;
-    lastProcessorRmsTraceAtRef.current = 0;
-    transcriptionSampleCursorRef.current = 0;
-    transcriptionBusyRef.current = false;
-    pendingTranscriptionWindowsRef.current = [];
-    pendingFinalWindowsRef.current = [];
-    finalBusyRef.current = false;
-    previewBlockedByFinalCountRef.current = 0;
-    vadRef.current.reset();
-    vadShortAccumRef.current = null;
-    activeSegmentIdRef.current = null;
-    lastPreviewPerfMsRef.current = 0;
-    transcriptionInFlightModeRef.current = null;
-    liveTranscriptionSourceRef.current = source;
-    polisherBusyRef.current = false;
-    pendingPolishJobRef.current = null;
-    cleanContextRef.current = '';
-    lastNotesPolishAtRef.current = 0;
-    lastNotesTextLengthRef.current = 0;
-    previewDroppedCountRef.current = 0;
-    previewReplacedCountRef.current = 0;
-    finalAcceptedCountRef.current = 0;
-    previewSegmentOpenedAtRef.current.clear();
-    previewFirstSuccessRef.current.clear();
-    finalizedSegmentIdsRef.current.clear();
-    setAsrLiveStats({
-      previewLatencyMs: null,
-      finalLatencyMs: null,
-      previewQueueSize: 0,
-      finalQueueSize: 0,
-      previewDroppedCount: 0,
-      previewReplacedCount: 0,
-      finalAcceptedCount: 0,
-      lastPreviewSegmentDurationMs: null,
-      timeToFirstPreviewMs: null,
-      lastCancelReason: null,
-      previewBusyLive: false,
-      finalBusyLive: false,
-      previewBlockedByFinalCount: 0,
-    });
-
-    const mediaSource = audioContext.createMediaStreamSource(stream);
-    const processor = audioContext.createScriptProcessor(4096, 1, 1);
-    const silentSink = audioContext.createGain();
-    silentSink.gain.value = 0;
-    /* Gain 0: inaudible, but connection to destination keeps ScriptProcessor pulling reliably on macOS/Electron. */
-
-    processor.onaudioprocess = (event) => {
-      const input = new Float32Array(event.inputBuffer.getChannelData(0));
-      if (input.length === 0) {
-        debug('transcription:empty-audio-frame');
-        return;
-      }
-      const nowWall = Date.now();
-      lastProcessorFrameAtRef.current = nowWall;
-      let framePeak = 0;
-      let sumSq = 0;
-      for (let i = 0; i < input.length; i += 1) {
-        const s = input[i]!;
-        const a = Math.abs(s);
-        if (a > framePeak) framePeak = a;
-        sumSq += s * s;
-      }
-      const frameRms = Math.sqrt(sumSq / input.length);
-      if (!transcriptionFirstFrameLoggedRef.current) {
-        transcriptionFirstFrameLoggedRef.current = true;
-        const firstFramePayload = { source, rms: frameRms, peak: framePeak, sampleRate: audioContext.sampleRate, timestampMs: nowWall };
-        captureDiag('transcription:processor-first-frame', firstFramePayload);
-        transcriptionTrace('processor-first-frame', firstFramePayload);
-        debug('transcription:processor-first-frame', firstFramePayload);
-      } else if (isTranscriptionTraceEnabled() && nowWall - lastProcessorRmsTraceAtRef.current > 2_000) {
-        lastProcessorRmsTraceAtRef.current = nowWall;
-        const rmsSamplePayload = { source, rms: frameRms, peak: framePeak, sampleRate: audioContext.sampleRate, timestampMs: nowWall };
-        captureDiag('transcription:processor-rms-sample', rmsSamplePayload);
-        transcriptionTrace('processor-rms-sample', rmsSamplePayload);
-        debug('transcription:processor-rms-sample', rmsSamplePayload);
-      }
-      const frameStartSample = transcriptionSampleCursorRef.current;
-      transcriptionSampleCursorRef.current += input.length;
-
-      const captureSource = liveTranscriptionSourceRef.current;
-      const { closed } = vadRef.current.pushFrame(input, audioContext.sampleRate, frameStartSample);
-
-      const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-      const isBaselineMode = !isV2Pipeline;
-      const verbatimOnly = SAFE_BASELINE && isBaselineMode ? true : !allowWhisperContextRef.current;
-      const language = SAFE_BASELINE && isBaselineMode ? 'es' : whisperLanguageRef.current;
-
-      if (vadRef.current.isSegmentOpen() && !activeSegmentIdRef.current) {
-        const newSegId = `seg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-        activeSegmentIdRef.current = newSegId;
-        previewSegmentOpenedAtRef.current.set(newSegId, performance.now());
-      }
-
-      const closedExtra: VadClosedSegment[] = [];
-      if (isForceMicWindowsEnabled() && lastCaptureModeRef.current === 'mic' && captureSource === 'mic') {
-        if (nowWall - forceMicWindowLastAtRef.current >= 5000) {
-          forceMicWindowLastAtRef.current = nowWall;
-          const forced = vadRef.current.forceEmitOpenSegmentForDebug(audioContext.sampleRate);
-          if (forced) closedExtra.push(forced);
-        }
-      }
-
-      for (const seg of [...closed, ...closedExtra]) {
-        const segmentId = activeSegmentIdRef.current;
-        if (segmentId) {
-          previewFirstSuccessRef.current.delete(segmentId);
-          previewSegmentOpenedAtRef.current.delete(segmentId);
-        }
-        activeSegmentIdRef.current = null;
-
-        let workSeg = seg;
-        if (SAFE_BASELINE && vadShortAccumRef.current) {
-          workSeg = mergeVadClosedSegments(vadShortAccumRef.current, workSeg, audioContext.sampleRate);
-          vadShortAccumRef.current = null;
-        }
-
-        if (SAFE_BASELINE && workSeg.durationMs < MIN_FINAL_AUDIO_MS) {
-          vadShortAccumRef.current = workSeg;
-          debug('vad:accumulate-short', { durationMs: workSeg.durationMs, endMs: workSeg.endMs });
-          continue;
-        }
-
-        const { rms, peak, gain, processedSamples } = prepareWhisperSamples(workSeg.samples, { lowRmsDebug: isLowRmsDebugEnabled() });
-        warnPossibleClipping(captureSource, peak);
-
-        if (SAFE_BASELINE && peak >= CLIPPING_THRESHOLD) {
-          addLog(`${captureSource}: segmento final descartado por clipping; baja volumen de la fuente`);
-          debug('transcription:final-audit', {
-            startMs: workSeg.startMs,
-            endMs: workSeg.endMs,
-            durationMs: workSeg.durationMs,
-            rms,
-            peak,
-            whisperGain: gain,
-            promptLength: 0,
-            language: 'es',
-            acceptedFinal: false,
-            rejectReason: 'clipping',
-          });
-          continue;
-        }
-
-        const audioDurationMs = samplesDurationMs(processedSamples, audioContext.sampleRate);
-        const minWhisper = minWhisperRmsForProfile(whisperProfileForLiveSource(captureSource));
-        if (rms < minWhisper || audioDurationMs < MIN_FINAL_AUDIO_MS) {
-          debug('transcription:vad-skip-low-quality-final', { rms, durationMs: audioDurationMs, vadDurationMs: workSeg.durationMs, minWhisper });
-          continue;
-        }
-        const blockId = `final-${segmentId ?? 'unknown'}-${Math.round(workSeg.startMs)}-${Math.round(workSeg.endMs)}`;
-        const wavBytes = encodeWav(processedSamples, audioContext.sampleRate);
-        enqueueTranscription({
-          blockId,
-          wavBytes,
-          startMs: Math.round(workSeg.startMs),
-          endMs: Math.round(workSeg.endMs),
-          rms,
-          peak,
-          source: captureSource,
-          sampleRate: audioContext.sampleRate,
-          sampleCount: processedSamples.length,
-          possibleClipping: peak >= CLIPPING_THRESHOLD,
-          whisperGain: gain,
-          mode: 'final',
-          segmentId: segmentId ?? 'unknown',
-          verbatimOnly,
-          language,
-        });
-      }
-
-      if (SAFE_BASELINE && !isV2Pipeline) return;
-      if (isV2Pipeline && !moonshineConfiguredRef.current) return;
-
-      if (!vadRef.current.isSegmentOpen()) return;
-
-      const segmentId = activeSegmentIdRef.current;
-      if (!segmentId) return;
-
-      const now = performance.now();
-
-      if (!SAFE_BASELINE || isV2Pipeline) {
-        const pendingQ = pendingTranscriptionWindowsRef.current;
-        if (isV2Pipeline && (finalBusyRef.current || pendingFinalWindowsRef.current.length > 0)) {
-          previewBlockedByFinalCountRef.current += 1;
-          previewDroppedCountRef.current += 1;
-          syncAsrLiveStats({});
-          return;
-        }
-        if (pendingQ.some((w) => w.mode === 'final')) {
-          previewBlockedByFinalCountRef.current += 1;
-          previewDroppedCountRef.current += 1;
-          syncAsrLiveStats({});
-          return;
-        }
-        if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'final') {
-          previewBlockedByFinalCountRef.current += 1;
-          previewDroppedCountRef.current += 1;
-          syncAsrLiveStats({});
-          return;
-        }
-        if (transcriptionBusyRef.current && transcriptionInFlightModeRef.current === 'preview') {
-          lastPreviewPerfMsRef.current = now;
-          return;
-        }
-      }
-
-      if (now - lastPreviewPerfMsRef.current < PREVIEW_INTERVAL_MS) return;
-
-      const snap = vadRef.current.getOpenSegmentSnapshot(audioContext.sampleRate);
-      if (!snap || snap.samples.length === 0) return;
-
-      const tail = trimPreviewSamplesToTail(
-        snap.samples,
-        audioContext.sampleRate,
-        snap.endSample,
-        MAX_PREVIEW_AUDIO_MS,
-      );
-      const { rms, peak, gain, processedSamples } = prepareWhisperSamples(tail.samples, { lowRmsDebug: isLowRmsDebugEnabled() });
-      warnPossibleClipping(captureSource, peak);
-      const audioDurationMs = samplesDurationMs(processedSamples, audioContext.sampleRate);
-      const minWhisper = minWhisperRmsForProfile(whisperProfileForLiveSource(captureSource));
-      if (rms < minWhisper || audioDurationMs < MIN_PREVIEW_AUDIO_MS) {
-        debug('transcription:preview-skip-low-quality', { rms, durationMs: audioDurationMs, minWhisper });
-        return;
-      }
-
-      lastPreviewPerfMsRef.current = now;
-      const wavBytes = encodeWav(processedSamples, audioContext.sampleRate);
-      const previewPayload: TranscriptionWindow = {
-        blockId: `preview-${segmentId}-${Math.round(now)}`,
-        wavBytes,
-        startMs: Math.round(tail.startMs),
-        endMs: Math.round(tail.endMs),
-        rms,
-        peak,
-        source: captureSource,
-        sampleRate: audioContext.sampleRate,
-        sampleCount: processedSamples.length,
-        possibleClipping: peak >= CLIPPING_THRESHOLD,
-        whisperGain: gain,
-        mode: 'preview',
-        segmentId,
-        verbatimOnly,
-        language,
-      };
-
-      enqueueTranscription(previewPayload);
-    };
-
-    mediaSource.connect(processor);
-    processor.connect(silentSink);
-    silentSink.connect(audioContext.destination);
-    transcriptionProcessorRef.current = processor;
-    graphNodesRef.current.push(mediaSource, processor, silentSink);
-
-    debug('transcription:processor-connected', {
-      source,
-      sampleRate: audioContext.sampleRate,
-      stream: describeStream(stream),
-    });
-
-    const isV2Pipeline = asrPipelineModeRef.current === 'moonshine-qwen-v2';
-    addLog(isV2Pipeline
-      ? 'transcripción en vivo lista: Whisper principal; comparación opcional en configuración.'
-      : SAFE_BASELINE
-        ? 'transcripción iniciada con Whisper Large V3 Turbo.'
-        : 'transcripción iniciada con Whisper Large V3 Turbo y contexto activo.');
-  }, [addLog, enqueueTranscription, ensureAudioContext, syncAsrLiveStats, warnPossibleClipping]);
-
   const startCapture = useCallback(
-    (mode: CaptureMode, options?: { preserveSession?: boolean; reconnect?: boolean }) =>
+    (mode: CaptureMode, options?: { preserveSession?: boolean; reconnect?: boolean; skipSystemCapture?: boolean }) =>
       runCaptureLifecycle('start', async () => {
         const generation = ++captureGenerationRef.current;
         const preserveSession = Boolean(options?.preserveSession);
         captureStartInProgressRef.current = true;
 
         try {
+          if (!preserveSession) {
+            systemCaptureDegradedRef.current = false;
+          }
+
           await stopCaptureCore({
             preserveSession,
             reason: options?.reconnect ? 'reconectando audio: captura anterior liberada' : undefined,
@@ -3869,14 +2309,8 @@ export default function App() {
         if (!preserveSession) {
           setSavedWav(null);
           setRawSegments([]);
-          setCleanSegments([]);
-          setLedgerDebugGroups([]);
-          setLiveVisualDraft(INITIAL_LIVE_VISUAL_DRAFT);
-          setLiveTranscript({ committedText: '', unstableSuffix: '', lastReason: 'waiting', lastUpdatedAt: null });
-          setVisibleCommittedText('');
-          setFinalRevealQueue([]);
-          resetV2Main();
-          resetV2Shadow();
+          asrSessionIdRef.current = `asr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          liveAsrRef.current.beginSession(asrSessionIdRef.current, generation);
           pendingFinalRefinementSegmentsRef.current = [];
           finalRefinementBusyRef.current = false;
           setRefinedTranscript({
@@ -3888,45 +2322,14 @@ export default function App() {
             updatedAt: null,
           });
         }
-        pendingTranscriptionWindowsRef.current = [];
-        pendingFinalWindowsRef.current = [];
-        finalBusyRef.current = false;
-        previewBlockedByFinalCountRef.current = 0;
-        transcriptionBusyRef.current = false;
-        vadRef.current.reset();
-        vadShortAccumRef.current = null;
-        forceMicWindowLastAtRef.current = 0;
-        candidateLedgerRef.current.reset();
-        if (ledgerFlushTimerRef.current !== null) {
-          window.clearTimeout(ledgerFlushTimerRef.current);
-          ledgerFlushTimerRef.current = null;
-        }
-        activeSegmentIdRef.current = null;
-        lastPreviewPerfMsRef.current = 0;
-        transcriptionInFlightModeRef.current = null;
-        previewDroppedCountRef.current = 0;
-        previewReplacedCountRef.current = 0;
-        finalAcceptedCountRef.current = 0;
-        previewSegmentOpenedAtRef.current.clear();
-        previewFirstSuccessRef.current.clear();
-        finalizedSegmentIdsRef.current.clear();
-        setAsrLiveStats({
-          previewLatencyMs: null,
-          finalLatencyMs: null,
-          previewQueueSize: 0,
-          finalQueueSize: 0,
-          previewDroppedCount: 0,
-          previewReplacedCount: 0,
-          finalAcceptedCount: 0,
-          lastPreviewSegmentDurationMs: null,
-          timeToFirstPreviewMs: null,
-          lastCancelReason: null,
-          previewBusyLive: false,
-          finalBusyLive: false,
-          previewBlockedByFinalCount: 0,
-        });
-        if (!preserveSession) {
-          pendingPolishJobRef.current = null;
+        if (preserveSession) {
+          if (!asrSessionIdRef.current) {
+            asrSessionIdRef.current = `asr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+            liveAsrRef.current.beginSession(asrSessionIdRef.current, generation);
+          } else {
+            liveAsrRef.current.bumpGeneration(generation);
+          }
+        } else {
           cleanContextRef.current = '';
         }
         setCaptureMode(mode);
@@ -3973,24 +2376,10 @@ export default function App() {
         let systemMediaCaptured = false;
         let systemPcmHelperActive = false;
         let micStream: MediaStream | null = null;
+        let systemStream: MediaStream | null = null;
 
-        /* `both`: system first, then mic. Parallel start caused CoreAudio Tap RMS probe to race with
-         * getUserMedia / permission UI (macOS can re-route I/O), leading to silent probe → tap stop
-         * → fallback to display loopback and broken audio. */
-        if (mode === 'system' || mode === 'both') {
-          try {
-            const result = await captureSystem();
-            if (result.kind === 'pcm-helper') {
-              systemPcmHelperActive = true;
-            } else {
-              captured.push(result.stream);
-              systemMediaCaptured = true;
-            }
-          } catch {
-            addLog('system: no disponible para esta sesión');
-          }
-        }
-
+        /* `both`: mic first, then system. Starting CoreAudio Tap / loopback before getUserMedia can
+         * re-route macOS I/O and leave the mic stream silent or unavailable. */
         if (mode === 'mic' || mode === 'both') {
           try {
             micStream = await captureMic();
@@ -4000,12 +2389,67 @@ export default function App() {
           }
         }
 
+        if ((mode === 'system' || mode === 'both') && !options?.skipSystemCapture) {
+          try {
+            const result = await captureSystem();
+            if (result.kind === 'pcm-helper') {
+              systemPcmHelperActive = true;
+            } else {
+              captured.push(result.stream);
+              systemStream = result.stream;
+              systemMediaCaptured = true;
+            }
+          } catch {
+            addLog('system: no disponible para esta sesión');
+            if (mode === 'both' && micCaptured) {
+              systemCaptureDegradedRef.current = true;
+            }
+          }
+        } else if (options?.skipSystemCapture && mode === 'both') {
+          addLog('system: omitido en reconexión automática (modo micrófono degradado)');
+        }
+
         if (micStream) {
           captured.unshift(micStream);
         }
         const systemCaptured = systemMediaCaptured || systemPcmHelperActive;
         systemPcmHelperOnlyRef.current = mode === 'system' && systemPcmHelperActive;
-        setSessionAudioSources({ mic: micCaptured, system: systemCaptured });
+        if (systemCaptured) {
+          systemCaptureDegradedRef.current = false;
+        }
+        const sessionSources = { mic: micCaptured, system: systemCaptured };
+        sessionAudioSourcesRef.current = sessionSources;
+        setSessionAudioSources(sessionSources);
+
+        if (micCaptured || systemCaptured) {
+          const asrSessionId = asrSessionIdRef.current ?? `asr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          asrSessionIdRef.current = asrSessionId;
+          const asrStart = await liveAsrRef.current.startSession({
+            sessionId: asrSessionId,
+            generation,
+            language: whisperLanguageRef.current,
+            sources: sessionSources,
+          });
+          if (generation !== captureGenerationRef.current) {
+            debug('capture:start-aborted-stale-generation-after-asr', { generation });
+            return;
+          }
+          if (!asrStart.ok) {
+            addLog(`asr: ${asrStart.error ?? asrStart.status.message ?? 'motor no disponible'}`);
+            showToast('Transcription engine unavailable. Run npm run asr:setup and try again.');
+          } else {
+            const audioContext = ensureAudioContext();
+            if (micStream) liveAsrRef.current.attachStream(audioContext, micStream, 'mic');
+            if (systemStream) liveAsrRef.current.attachStream(audioContext, systemStream, 'system');
+            const liveLabel = describeEngine(asrStart.status.liveEngine);
+            const finalLabel = describeEngine(asrStart.status.finalEngine);
+            addLog(
+              liveLabel
+                ? `transcripción en vivo: ${liveLabel}${finalLabel && finalLabel !== liveLabel ? ` · final ${finalLabel}` : ''}`
+                : `transcripción sin preview: finales con ${finalLabel ?? 'motor desconocido'}`,
+            );
+          }
+        }
 
         const hasLiveStreamTranscription = captured.length > 0;
         const hasPcmOnlySystem = systemPcmHelperActive && !systemMediaCaptured;
@@ -4019,7 +2463,8 @@ export default function App() {
               : (captured.length > 1 ? 'mixed' : mode === 'system' ? 'system' : 'mic');
           captureDiag('capture:mixed:stream', { source: transcriptSource, stream: describeStream(mixedStream) });
           debug('capture:mixed:stream', { source: transcriptSource, stream: describeStream(mixedStream) });
-          startLiveTranscription(mixedStream, transcriptSource);
+          liveTranscriptionSourceRef.current = transcriptSource;
+          lastProcessorFrameAtRef.current = null;
           const graceUntil = Date.now() + CAPTURE_WATCHDOG_GRACE_MS;
           captureWatchdogGraceUntilRef.current = Math.max(captureWatchdogGraceUntilRef.current, graceUntil);
           audioEndedWatchdogStreakRef.current = 0;
@@ -4028,7 +2473,7 @@ export default function App() {
             message: null,
             lastCheckedAt: Date.now(),
           });
-          if (mode === 'both') {
+          if (mode === 'both' && !options?.reconnect) {
             if (micCaptured && !systemMediaCaptured && !systemPcmHelperActive) {
               showToast('System audio unavailable. Using microphone only.');
             } else if (micCaptured && systemPcmHelperActive && !systemMediaCaptured) {
@@ -4087,12 +2532,10 @@ export default function App() {
       selectedSystemInputId,
       systemCaptureStrategy,
       startMeterLoop,
-      startLiveTranscription,
+      ensureAudioContext,
       stopCaptureCore,
       systemPermission,
       outputDevices,
-      resetV2Main,
-      resetV2Shadow,
       showToast,
       whisperSetup,
       polisherSetup,
@@ -4134,7 +2577,8 @@ export default function App() {
       health: captureHealthRef.current,
     });
     try {
-      await startCapture(mode, { preserveSession: true, reconnect: true });
+      const skipSystemCapture = source === 'auto' && systemCaptureDegradedRef.current;
+      await startCapture(mode, { preserveSession: true, reconnect: true, skipSystemCapture });
       patchCaptureHealth({
         captureHealth: 'ok',
         message: null,
@@ -4348,9 +2792,16 @@ export default function App() {
         !recoveryInFlightRef.current &&
         now >= captureWatchdogGraceUntilRef.current
       ) {
+        const pcmHelperActive = nativeHelperActiveRef.current || coreTapActiveRef.current;
+        const micTrackLive = streamsRef.current.mic?.getAudioTracks()[0]?.readyState === 'live';
+        const micOnlyDegraded =
+          systemCaptureDegradedRef.current ||
+          (mode === 'both' && micTrackLive && !streamsRef.current.system && !pcmHelperActive);
+        const shouldSkipAutoRecover = pcmHelperActive || micOnlyDegraded;
+
         const recentAttempts = recoveryAttemptTimesRef.current.filter((attemptAt) => now - attemptAt < 60_000);
         recoveryAttemptTimesRef.current = recentAttempts;
-        if (recentAttempts.length < MAX_AUTO_RECOVERY_ATTEMPTS_PER_MINUTE) {
+        if (!shouldSkipAutoRecover && recentAttempts.length < MAX_AUTO_RECOVERY_ATTEMPTS_PER_MINUTE) {
           recoveryAttemptTimesRef.current = [...recentAttempts, now];
           void reconnectAudioCapture('auto');
         }
@@ -4485,14 +2936,15 @@ export default function App() {
     }, 250);
   }, [addLog, captureMode]);
 
-  const saveCurrentSessionSnapshot = useCallback((options?: { aiSummary?: string }) => {
-    const transcriptText = visibleTranscriptText.trim();
+  const saveCurrentSessionSnapshot = useCallback((options?: { aiSummary?: string; aiTitle?: string }) => {
+    const liveState = liveAsrRef.current.getTranscript();
+    const transcriptText = liveState.visibleText.trim();
     const refinedText = refinedTranscript.text.trim();
-    if (!transcriptText && !refinedText && rawSegments.length === 0) return;
+    if (!transcriptText && !refinedText && liveState.finals.length === 0) return null;
 
     const createdAt = captureStartedAt ?? Date.now();
     const endedAt = Date.now();
-    const source = rawSegments[0]?.source ?? captureMode ?? 'system';
+    const source = liveState.finals[0]?.source ?? captureMode ?? 'system';
     const explicitAi = options?.aiSummary?.trim();
     const meetingSummary =
       explicitAi && explicitAi.length > 0 ? explicitAi.slice(0, 12_000) : undefined;
@@ -4510,9 +2962,10 @@ export default function App() {
             .find(Boolean)
             ?.slice(0, 280)
         : undefined;
+    const sessionContext = currentSessionContextRef.current;
     const session: DashboardSessionSummary = {
       id: `session-${endedAt}`,
-      title: createSessionTitle(createdAt),
+      title: sessionContext?.title || options?.aiTitle || createSessionTitle(createdAt),
       createdAt,
       durationSeconds: captureElapsedSeconds,
       transcriptPreview: (meetingSummary || transcriptText || refinedText).slice(0, 220),
@@ -4522,22 +2975,74 @@ export default function App() {
       meetingSummary,
       source,
       status: 'completed',
+      meetingContext: sessionContext?.meetingContext,
+      topics: sessionContext?.topics,
+      relatedSessionIds: sessionContext?.relatedSessionIds,
+      contextSpaceIds: sessionContext?.contextSpaceIds,
+      promptProfileId: sessionContext?.promptProfileId,
+      language: sessionContext?.language,
     };
-    setSavedSessions((current) => [session, ...current].slice(0, 20));
+    session.agentMemory = buildMeetingAgentMemory(session);
+    session.decisions = session.agentMemory.decisions;
+    session.actionItems = session.agentMemory.actionItems;
+    session.openQuestions = session.agentMemory.openQuestions;
+    session.risks = session.agentMemory.risks;
+    session.agentInsights = session.agentMemory.insights;
+    setSavedSessions((current) => [session, ...current]);
     setSelectedSavedSessionId(session.id);
+    return session;
   }, [
     captureElapsedSeconds,
     captureMode,
     captureStartedAt,
-    rawSegments,
     refinedTranscript.text,
-    visibleTranscriptText,
   ]);
 
   const deleteSavedSession = useCallback((id: string) => {
     setSavedSessions((current) => current.filter((s) => s.id !== id));
     setSelectedSavedSessionId((cur) => (cur === id ? null : cur));
+    setContextSpaces((current) => current.map((space) => (
+      space.sessionIds.includes(id)
+        ? { ...space, sessionIds: space.sessionIds.filter((sessionId) => sessionId !== id), updatedAt: Date.now() }
+        : space
+    )));
   }, []);
+
+  const assignSessionToContextSpace = useCallback((session: DashboardSessionSummary, spaceId: string) => {
+    setContextSpaces((current) => current.map((space) => (
+      space.id === spaceId
+        ? { ...space, sessionIds: Array.from(new Set([...space.sessionIds, session.id])), updatedAt: Date.now() }
+        : space
+    )));
+    setSavedSessions((current) => current.map((item) => (
+      item.id === session.id
+        ? { ...item, contextSpaceIds: Array.from(new Set([...(item.contextSpaceIds ?? []), spaceId])) }
+        : item
+    )));
+    setContextAssignSession(null);
+  }, []);
+
+  const createContextSpaceForSession = useCallback((session: DashboardSessionSummary, name: string) => {
+    const id = `context-${Date.now()}`;
+    const nextSpace: ContextSpace = {
+      id,
+      name: name.trim() || 'Nuevo contexto',
+      description: '',
+      sessionIds: [session.id],
+      updatedAt: Date.now(),
+    };
+    setContextSpaces((current) => [...current, nextSpace]);
+    setSavedSessions((current) => current.map((item) => (
+      item.id === session.id
+        ? { ...item, contextSpaceIds: Array.from(new Set([...(item.contextSpaceIds ?? []), id])) }
+        : item
+    )));
+    setContextAssignSession(null);
+  }, []);
+
+  const keepSessionInGeneralContext = useCallback((session: DashboardSessionSummary) => {
+    assignSessionToContextSpace(session, 'general');
+  }, [assignSessionToContextSpace]);
 
   const onSessionUiFirstPaint = useCallback(() => {
     if (appModeRef.current !== 'session-boot' || !pendingSessionStartRef.current) return;
@@ -4594,8 +3099,9 @@ export default function App() {
     })();
   }, [startCapture]);
 
-  const startDashboardSession = useCallback(() => {
-    const mode: CapturePreference = 'both';
+  const startDashboardSession = useCallback((sessionContext?: NewSessionContext) => {
+    const mode: CapturePreference = capturePreference;
+    currentSessionContextRef.current = sessionContext ?? null;
     try {
       performance.clearMarks('openwhispr-new-session-click');
       performance.mark('openwhispr-new-session-click');
@@ -4612,10 +3118,6 @@ export default function App() {
     };
     captureDiag('session:start-request', startPayload);
     debug('session:start-request', startPayload);
-    if (capturePreference !== 'both') {
-      setCapturePreference('both');
-      persistCapturePreference('both');
-    }
     transcriptionTrace('startDashboardSession:begin', { captureMode: mode });
     setOverlayCollapsed(false);
     setAiPanelOpen(false);
@@ -4696,41 +3198,52 @@ export default function App() {
     setOverlayCollapsed(false);
     setAppMode('dashboard');
 
-    const transcriptForSummary = visibleTranscriptText.trim();
+    /* Read after the awaited stop: the drain may have appended finals since this closure rendered. */
+    const liveState = liveAsrRef.current.getTranscript();
+    const transcriptForSummary = liveState.visibleText.trim();
     const refinedForSummary = refinedTranscript.text.trim();
     const hasMeetingPayload =
-      Boolean(transcriptForSummary || refinedForSummary) || rawSegments.length > 0;
+      Boolean(transcriptForSummary || refinedForSummary) || liveState.finals.length > 0;
 
     let aiSummary: string | undefined;
+    let aiTitle: string | undefined;
     if (hasMeetingPayload) {
       try {
-        aiSummary = await generateMeetingSummaryLine({
-          transcript: transcriptForSummary,
-          refined: refinedForSummary,
-          glossary,
-          polisherOk: Boolean(polisherSetup?.ok),
-          polishSegment: window.meetingAssistant.polisher.polishSegment,
-        });
+        [aiSummary, aiTitle] = await Promise.all([
+          generateMeetingSummaryLine({
+            transcript: transcriptForSummary,
+            refined: refinedForSummary,
+            glossary,
+            polisherOk: Boolean(polisherSetup?.ok),
+            polishSegment: window.meetingAssistant.polisher.polishSegment,
+          }),
+          generateMeetingTitle({
+            transcript: transcriptForSummary,
+            refined: refinedForSummary,
+            polisherOk: Boolean(polisherSetup?.ok),
+            polishSegment: window.meetingAssistant.polisher.polishSegment,
+          }),
+        ]);
       } catch (error) {
         debug('session:finish-summary-error', String(error));
       }
     }
 
-    saveCurrentSessionSnapshot(hasMeetingPayload ? { aiSummary } : undefined);
+    const savedSession = saveCurrentSessionSnapshot(hasMeetingPayload ? { aiSummary, aiTitle } : undefined);
+    if (savedSession) setContextAssignSession(savedSession);
     setMeetingSummaryBusy(false);
   }, [
     captureMode,
     glossary,
     polisherSetup?.ok,
-    rawSegments.length,
     refinedTranscript.text,
     saveCurrentSessionSnapshot,
     showToast,
     stopCapture,
-    visibleTranscriptText,
   ]);
 
   const transcriptListeningHint = (() => {
+    if (asrStatus?.state === 'starting' && asrStatus.message) return asrStatus.message;
     if (sessionCaptureStarting && !captureMode) return 'Starting capture…';
     if (!captureMode) return undefined;
     if (systemPcmHelperOnlyRef.current && captureMode === 'system') {
@@ -4751,7 +3264,7 @@ export default function App() {
       ? 'interrupted'
       : captureHealthState.captureHealth === 'recovering'
         ? 'recovering'
-        : transcriptionBusyRef.current || finalBusyRef.current
+        : asrStatus?.state === 'stopping' || asrStatus?.state === 'starting'
           ? 'processing'
           : captureMode
             ? 'recording'
@@ -4769,6 +3282,17 @@ export default function App() {
             ? 'Escuchando'
             : 'Pausado';
   const timerLabel = captureMode ? formatTimer(captureElapsedSeconds) : '00:00';
+  const asrLiveEngineLabel = describeEngine(liveAsr.transcript.liveEngine ?? asrStatus?.liveEngine ?? null);
+  const asrFinalEngineLabel = describeEngine(liveAsr.transcript.finalEngine ?? asrStatus?.finalEngine ?? null);
+  const asrEngineLabel = (() => {
+    if (asrStatus?.engineMode === 'unavailable') return 'Sin motor ASR (npm run asr:setup)';
+    if (asrStatus?.engineMode === 'whisper-fallback') return `Fallback: ${asrFinalEngineLabel ?? 'Whisper Turbo'} (sin preview en vivo)`;
+    if (asrLiveEngineLabel && asrFinalEngineLabel && asrLiveEngineLabel !== asrFinalEngineLabel) {
+      return `Live: ${asrLiveEngineLabel} · Final: ${asrFinalEngineLabel}`;
+    }
+    const single = asrLiveEngineLabel ?? asrFinalEngineLabel ?? 'Parakeet TDT v3';
+    return liveAsr.transcript.fallbackUsed ? `${single} · fallback usado` : `Live/Final: ${single}`;
+  })();
   const askShortcutLabel = platform === 'darwin' ? '⌘ ↵' : 'Ctrl+Enter';
   const hideShortcutLabel = platform === 'darwin' ? '⌘ \\' : 'Ctrl+\\';
   const audioStatus = (() => {
@@ -4941,13 +3465,12 @@ export default function App() {
 
       <div className="settings-section">
         <h3>Estado</h3>
-        <p>ASR principal: Whisper Large V3 Turbo</p>
+        <p>ASR: {asrEngineLabel}</p>
+        {asrStatus?.message && asrStatus.state !== 'running' ? <p className="muted">{asrStatus.message}</p> : null}
         <p>IA local: {polisherSetup?.ok ? 'lista' : 'no disponible'}</p>
         <p>Audio: {audioStatus}</p>
         {captureHealthState.message && <p>{captureHealthState.message}</p>}
         <p>RMS: {meters.mixed.rms.toFixed(3)}</p>
-        {asrFinalEngine === 'compare' && <p>Comparación Qwen activa</p>}
-        {whisperSetup?.experimentalPreview && <p>Preview experimental activo</p>}
         {savedWav && <p className="break-anywhere">WAV: {savedWav.path}</p>}
       </div>
     </div>
@@ -4967,6 +3490,9 @@ export default function App() {
         <span>captureHealth: {captureHealthState.captureHealth}</span>
         <span>rms: {meters.mixed.rms.toFixed(3)}</span>
         <span>audioStatus: {audioStatus}</span>
+        <span>asr: {asrStatus?.state ?? 'unknown'} / {asrStatus?.engineMode ?? '—'}</span>
+        <span>finals: {liveAsr.transcript.stats.finalsApplied} · previews: {liveAsr.transcript.stats.previewsApplied} · stale: {liveAsr.transcript.stats.staleRejected} · errors: {liveAsr.transcript.stats.errors}</span>
+        <span>drain: {liveAsr.transcript.lastDrain ? `${liveAsr.transcript.lastDrain.finalsFlushed} finals / ${liveAsr.transcript.lastDrain.elapsedMs} ms${liveAsr.transcript.lastDrain.timedOut ? ' (timeout)' : ''}` : 'none'}</span>
       </div>
       <details>
         <summary>Eventos</summary>
@@ -4985,36 +3511,13 @@ export default function App() {
                     <time>{formatMs(segment.startMs)} - {formatMs(segment.endMs)}</time>
                     <span className="source-tag">{segment.source}</span>
                     <span className="source-tag">{segment.status}</span>
-                    <span className="source-tag">RMS {segment.rms.toFixed(3)}</span>
-                    {segment.engineUsed && <span className="source-tag">engine {segment.engineUsed}</span>}
-                    {segment.qwenText && <span className="source-tag">qwen</span>}
-                    {segment.qwenError && <span className="source-tag warning-tag">qwen error</span>}
+                    {segment.engineUsed && <span className="source-tag">{describeEngine(segment.engineUsed) ?? segment.engineUsed}</span>}
                     {segment.fallbackUsed && <span className="source-tag warning-tag">fallback</span>}
                   </div>
                   <p>{segment.text}</p>
-                  {segment.whisperText && <p className="muted">whisperText: {segment.whisperText}</p>}
-                  {segment.qwenText && <p className="muted">qwenText: {segment.qwenText}</p>}
-                  {segment.qwenError && <p className="muted">qwenError: {segment.qwenError}</p>}
                 </li>
               ))}
             </ol>
-          </details>
-          <details>
-            <summary>Laboratorio visual</summary>
-            <LiveTranscriptView
-              committedText={v2DemoTranscript.committedText}
-              previewSuffix={v2DemoTranscript.previewSuffix}
-              rawPreview={v2DemoTranscript.rawPreview}
-              showDebug
-              pipelineLabel="Contrato visual"
-            />
-            <div className="button-row v2-demo-buttons">
-              <button className="secondary" type="button" onClick={runV2DemoPreviewOne}>Preview 1</button>
-              <button className="secondary" type="button" onClick={runV2DemoPreviewTwo}>Preview 2</button>
-              <button className="secondary" type="button" onClick={runV2DemoDifferentPreview}>Divergente</button>
-              <button className="secondary" type="button" onClick={runV2DemoFinal}>Final</button>
-              <button className="secondary" type="button" onClick={resetV2Demo}>Reset</button>
-            </div>
           </details>
         </>
       )}
@@ -5028,7 +3531,6 @@ export default function App() {
       aiOk={Boolean(polisherSetup?.ok)}
       aiMessage={polisherSetup?.message ?? 'Optional: configure local AI for Ask AI.'}
       onFinished={() => {
-        markOnboardingComplete();
         setSetupWizardOpen(false);
       }}
     />
@@ -5039,15 +3541,58 @@ export default function App() {
       <>
         {setupOverlay}
         <DashboardHome
-          userName="Michael"
+          userName={userProfile.name}
+          userProfile={userProfile}
           sessions={savedSessions}
-          onStartSession={startDashboardSession}
+          onStartSession={() => setNewSessionModalOpen(true)}
           onOpenSession={(session) => setSelectedSavedSessionId(session.id)}
           onDeleteSession={deleteSavedSession}
           onNotify={showToast}
           onRerunSetup={() => setSetupWizardOpen(true)}
+          capturePreference={capturePreference}
+          onCapturePreferenceChange={(mode) => {
+            setCapturePreference(mode);
+            persistCapturePreference(mode);
+          }}
+          systemCaptureStrategy={systemCaptureStrategy}
+          onSystemCaptureStrategyChange={setSystemCaptureStrategy}
+          appLanguage={appLanguage}
+          onAppLanguageChange={setAppLanguage}
+          promptProfiles={promptProfiles}
+          contextSpaces={contextSpaces}
+          selectedPromptProfileId={selectedPromptProfileId}
+          onPromptProfilesChange={setPromptProfiles}
+          onContextSpacesChange={setContextSpaces}
+          onSelectedPromptProfileIdChange={setSelectedPromptProfileId}
+          onUserProfileChange={setUserProfile}
           meetingSummaryBusy={meetingSummaryBusy}
         />
+        {newSessionModalOpen ? (
+          <NewSessionModal
+            sessions={savedSessions}
+            contextSpaces={contextSpaces}
+            promptProfiles={promptProfiles}
+            selectedPromptProfileId={selectedPromptProfileId}
+            language={appLanguage}
+            onCancel={() => setNewSessionModalOpen(false)}
+            onConfirm={(sessionContext) => {
+              setNewSessionModalOpen(false);
+              setSelectedPromptProfileId(sessionContext.promptProfileId);
+              setAppLanguage(sessionContext.language);
+              startDashboardSession(sessionContext);
+            }}
+          />
+        ) : null}
+        {contextAssignSession ? (
+          <ContextSpaceAssignmentModal
+            session={contextAssignSession}
+            contextSpaces={contextSpaces}
+            onClose={() => keepSessionInGeneralContext(contextAssignSession)}
+            onSkip={() => keepSessionInGeneralContext(contextAssignSession)}
+            onAssign={(spaceId) => assignSessionToContextSpace(contextAssignSession, spaceId)}
+            onCreateAndAssign={(name) => createContextSpaceForSession(contextAssignSession, name)}
+          />
+        ) : null}
         <PremiumToast message={toastMessage} onDismiss={dismissToast} />
       </>
     );
@@ -5068,6 +3613,9 @@ export default function App() {
         overlayCollapsed={overlayCollapsed}
         aiPanelOpen={aiPanelOpen}
         transcriptText={visibleTranscriptText}
+        committedText={liveAsr.transcript.committedText}
+        provisionalText={liveAsr.transcript.provisionalText}
+        engineLabel={asrEngineLabel}
         refinedText={refinedTranscript.text}
         transcriptView={transcriptView}
         refinementAvailable={Boolean(refinedTranscript.text)}
@@ -5154,56 +3702,6 @@ function formatMs(value: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
   const seconds = (totalSeconds % 60).toString().padStart(2, '0');
   return `${minutes}:${seconds}`;
-}
-
-function shouldUseForLive(segment: TranscriptSegment) {
-  const text = segment.text.trim();
-  if (text.length < 4) return false;
-  if (segment.suspicious) return false;
-  if (/^(ah|eh|mmm|um|ok|vale|bueno)[\s.?!]*$/iu.test(text)) return false;
-  return true;
-}
-
-function prepareWhisperSamples(
-  samples: Float32Array,
-  opts?: { lowRmsDebug?: boolean },
-) {
-  const lowRms = Boolean(opts?.lowRmsDebug ?? isLowRmsDebugEnabled());
-  const boosted = lowRms ? applyGain(samples, 10) : samples;
-  let sum = 0;
-  let peak = 0;
-  for (let index = 0; index < boosted.length; index += 1) {
-    const sample = boosted[index];
-    sum += sample * sample;
-    peak = Math.max(peak, Math.abs(sample));
-  }
-
-  const gain = peak > WHISPER_PEAK_TARGET ? WHISPER_PEAK_TARGET / peak : 1;
-  const processedSamples = gain === 1 ? boosted : applyGain(boosted, gain);
-  return {
-    rms: Math.sqrt(sum / Math.max(1, boosted.length)),
-    peak,
-    gain,
-    processedSamples,
-  };
-}
-
-function applyGain(samples: Float32Array, gain: number) {
-  const scaled = new Float32Array(samples.length);
-  for (let index = 0; index < samples.length; index += 1) {
-    scaled[index] = Math.max(-1, Math.min(1, samples[index] * gain));
-  }
-  return scaled;
-}
-
-function samplesDurationMs(samples: Float32Array, sampleRate: number) {
-  return (samples.length / sampleRate) * 1000;
-}
-
-function isSuspiciousTranscript(text: string, rms: number) {
-  const normalized = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  const phraseHit = SUSPICIOUS_PHRASES.some((phrase) => normalized.includes(phrase.normalize('NFD').replace(/[\u0300-\u036f]/g, '')));
-  return phraseHit && rms < 0.04;
 }
 
 function PermissionBadge({ label, state }: { label: string; state: PermissionState | 'unknown' }) {

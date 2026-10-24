@@ -1,7 +1,9 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   markOnboardingComplete,
+  persistPermissionRecord,
   setOnboardingSystemSkipped,
+  type PermissionState,
 } from '../storage/appPreferences';
 
 type Step = 'mic' | 'system' | 'ready';
@@ -43,18 +45,68 @@ export function SetupOnboarding({
   const [system, setSystem] = useState<CheckState>('idle');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [doNotShowAgain, setDoNotShowAgain] = useState(true);
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkExistingPermissions = async () => {
+      let micState: PermissionState = 'unknown';
+      let screenState: PermissionState = 'unknown';
+      try {
+        if (navigator.permissions?.query) {
+          const micPermission = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+          micState = micPermission.state;
+          if (!cancelled && micPermission.state === 'granted') {
+            setMic('ok');
+            setStep('system');
+          }
+        }
+      } catch {
+        micState = 'unknown';
+      }
+      try {
+        const info = await window.meetingAssistant.platform.getInfo();
+        const screen = info.mediaAccess?.screen;
+        if (screen === 'granted' || screen === 'denied' || screen === 'prompt') {
+          screenState = screen;
+          if (!cancelled && screen === 'granted') setSystem('ok');
+        }
+      } catch {
+        screenState = 'unknown';
+      }
+      persistPermissionRecord({ microphone: micState, screenCapture: screenState, systemAudio: screenState });
+    };
+    void checkExistingPermissions();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const tryMic = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
+      const access = await window.meetingAssistant.audio.ensureMicrophoneAccess();
+      if (!access.ok && access.status !== 'n/a') {
+        setMic('error');
+        persistPermissionRecord({ microphone: 'denied' });
+        setError(
+          access.status === 'denied' || access.status === 'restricted'
+            ? 'macOS bloqueó el micrófono. En Ajustes del Sistema → Privacidad y seguridad → Micrófono, activa Electron y vuelve a pulsar Permitir.'
+            : `No se pudo pedir el micrófono (${access.status}).`,
+        );
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       stream.getTracks().forEach((t) => t.stop());
       setMic('ok');
+      persistPermissionRecord({ microphone: 'granted' });
+      setStep('system');
     } catch (e) {
       setMic('error');
+      persistPermissionRecord({ microphone: 'denied' });
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -71,10 +123,15 @@ export function SetupOnboarding({
       } as MediaStreamConstraints);
       stream.getTracks().forEach((t) => t.stop());
       setSystem('ok');
+      persistPermissionRecord({ systemAudio: 'granted', screenCapture: 'granted' });
       setOnboardingSystemSkipped(false);
-    } catch (e) {
-      setSystem('error');
-      setError(e instanceof Error ? e.message : String(e));
+      setStep('ready');
+    } catch {
+      // User cancelled or permission denied – skip silently and advance
+      setSystem('skipped');
+      persistPermissionRecord({ systemAudio: 'prompt', screenCapture: 'prompt' });
+      setOnboardingSystemSkipped(true);
+      setStep('ready');
     } finally {
       setBusy(false);
     }
@@ -82,15 +139,16 @@ export function SetupOnboarding({
 
   const skipSystem = useCallback(() => {
     setSystem('skipped');
+    persistPermissionRecord({ systemAudio: 'prompt', screenCapture: 'prompt' });
     setOnboardingSystemSkipped(true);
     setError(null);
     setStep('ready');
   }, []);
 
   const finish = useCallback(() => {
-    markOnboardingComplete();
+    if (doNotShowAgain) markOnboardingComplete();
     onFinished();
-  }, [onFinished]);
+  }, [doNotShowAgain, onFinished]);
 
   const goSystem = useCallback(() => {
     setError(null);
@@ -102,13 +160,9 @@ export function SetupOnboarding({
       <div className="ob-modal">
         <header className="ob-header">
           <p className="ob-kicker">Openwhispr</p>
-          <p className="ob-header-sub">Configuración rápida · solo en tu equipo</p>
           <div className="ob-stepper" aria-hidden>
             {STEPS.map((s, i) => (
-              <div key={s.id} className="ob-stepper-item">
-                <StepDot active={i === stepIndex} done={i < stepIndex} />
-                <span className={`ob-stepper-label ${i === stepIndex ? 'ob-stepper-label--on' : ''}`}>{s.label}</span>
-              </div>
+              <StepDot key={s.id} active={i === stepIndex} done={i < stepIndex} />
             ))}
           </div>
         </header>
@@ -121,6 +175,7 @@ export function SetupOnboarding({
               </h1>
               <p className="ob-desc">
                 Así podremos transcribir lo que digas en reuniones y sesiones. Solo se usa cuando inicias una sesión.
+                La ventana se oculta un momento para que puedas pulsar Permitir en el aviso de macOS.
               </p>
               <div className={`ob-chip ob-chip--${mic === 'ok' ? 'ok' : mic === 'error' ? 'err' : 'idle'}`}>
                 {mic === 'idle' && 'Sin comprobar'}
@@ -129,22 +184,20 @@ export function SetupOnboarding({
               </div>
               {mic === 'error' && error ? <p className="ob-error">{error}</p> : null}
               <div className="ob-actions">
-                <button type="button" className="ob-btn ob-btn-primary" disabled={busy} onClick={() => void tryMic()}>
-                  {busy ? 'Comprobando…' : 'Permitir micrófono'}
-                </button>
                 <button
                   type="button"
-                  className="ob-btn ob-btn-secondary"
-                  disabled={busy || mic !== 'ok'}
-                  onClick={goSystem}
+                  className="ob-btn ob-btn-primary"
+                  disabled={busy}
+                  onClick={() => {
+                    if (mic === 'ok') goSystem();
+                    else void tryMic();
+                  }}
                 >
-                  Continuar
+                  {busy ? 'Comprobando…' : mic === 'ok' ? 'Continuar' : 'Permitir micrófono'}
                 </button>
-                {mic === 'error' ? (
-                  <button type="button" className="ob-btn ob-btn-ghost" disabled={busy} onClick={goSystem}>
-                    Configurar después →
-                  </button>
-                ) : null}
+                <button type="button" className="ob-btn ob-btn-ghost" onClick={goSystem}>
+                  {mic === 'ok' ? 'Siguiente' : 'Configurar después'}
+                </button>
               </div>
             </>
           )}
@@ -159,30 +212,20 @@ export function SetupOnboarding({
                 capturamos llamadas y reuniones, no solo tu voz.
               </p>
               <p className="ob-tip">
-                En macOS, si no ves audio del sistema, suele hacer falta un dispositivo virtual (p. ej. BlackHole) y
-                enrutar el audio. Puedes saltar este paso y configurarlo después en Ajustes.
+                En macOS, si no ves la opción de audio, puede hacer falta un dispositivo virtual (p. ej. BlackHole).
+                Si cancelas o no aplica, pasamos al siguiente paso automáticamente.
               </p>
-              <div className={`ob-chip ob-chip--${system === 'ok' ? 'ok' : system === 'error' ? 'err' : system === 'skipped' ? 'skip' : 'idle'}`}>
+              <div className={`ob-chip ob-chip--${system === 'ok' ? 'ok' : system === 'skipped' ? 'skip' : 'idle'}`}>
                 {system === 'idle' && 'Sin comprobar'}
                 {system === 'ok' && 'Captura de sistema lista'}
-                {system === 'error' && 'Sin permiso o cancelado'}
                 {system === 'skipped' && 'Omitido'}
               </div>
-              {system === 'error' && error ? <p className="ob-error">{error}</p> : null}
               <div className="ob-actions">
                 <button type="button" className="ob-btn ob-btn-primary" disabled={busy} onClick={() => void trySystem()}>
-                  {busy ? 'Abriendo selector…' : 'Probar captura de sistema'}
+                  {busy ? 'Abriendo selector…' : system === 'ok' ? 'Permiso concedido' : 'Probar pantalla/audio'}
                 </button>
                 <button type="button" className="ob-btn ob-btn-secondary" disabled={busy} onClick={skipSystem}>
                   Omitir por ahora
-                </button>
-                <button
-                  type="button"
-                  className="ob-btn ob-btn-ghost"
-                  disabled={system !== 'ok' && system !== 'error' && system !== 'skipped'}
-                  onClick={() => setStep('ready')}
-                >
-                  Ver resumen →
                 </button>
               </div>
             </>
@@ -191,38 +234,36 @@ export function SetupOnboarding({
           {step === 'ready' && (
             <>
               <h1 id="ob-title" className="ob-title">
-                Todo preparado
+                Todo listo
               </h1>
-              <p className="ob-desc">Resumen local (nada se envía a la nube en este paso).</p>
+              <p className="ob-desc">Permisos registrados localmente. Puedes cambiarlos desde el sistema en cualquier momento.</p>
               <ul className="ob-summary">
                 <li>
                   <span className="ob-summary-label">Micrófono</span>
                   <span className={`ob-summary-val ob-summary-val--${mic === 'ok' ? 'ok' : 'no'}`}>
-                    {mic === 'ok' ? 'Listo' : 'Pendiente / omitido'}
+                    {mic === 'ok' ? 'Listo' : 'Pendiente'}
                   </span>
                 </li>
                 <li>
                   <span className="ob-summary-label">Audio del sistema</span>
                   <span className={`ob-summary-val ob-summary-val--${system === 'ok' ? 'ok' : 'no'}`}>
-                    {system === 'ok' ? 'Listo' : system === 'skipped' ? 'Omitido' : 'Pendiente'}
-                  </span>
-                </li>
-                <li>
-                  <span className="ob-summary-label">Whisper</span>
-                  <span className={`ob-summary-val ob-summary-val--${whisperOk ? 'ok' : 'no'}`}>
-                    {whisperOk ? 'Listo' : whisperMessage}
-                  </span>
-                </li>
-                <li>
-                  <span className="ob-summary-label">Asistente IA</span>
-                  <span className={`ob-summary-val ob-summary-val--${aiOk ? 'ok' : 'no'}`}>
-                    {aiOk ? 'Listo' : `Opcional · ${aiMessage}`}
+                    {system === 'ok' ? 'Listo' : 'Omitido'}
                   </span>
                 </li>
               </ul>
-              <button type="button" className="ob-btn ob-btn-primary ob-btn-wide" onClick={finish}>
-                Ir al panel principal
-              </button>
+              <label className="ob-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={doNotShowAgain}
+                  onChange={(event) => setDoNotShowAgain(event.target.checked)}
+                />
+                <span>No volver a mostrar</span>
+              </label>
+              <div className="ob-actions">
+                <button type="button" className="ob-btn ob-btn-primary ob-btn-wide" onClick={finish}>
+                  Ir al panel
+                </button>
+              </div>
             </>
           )}
         </div>

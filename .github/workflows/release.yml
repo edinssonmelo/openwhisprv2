@@ -1,0 +1,25 @@
+name: Validate source (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # Source checks do not need Electron downloads or native dependency rebuilds.
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run build
+      - run: node scripts/check-packaged-assets.mjs
+      - run: node landing/scripts/check.cjs
+      - run: npx tsc -p landing/tsconfig.json
+      - run: npm run landing:build

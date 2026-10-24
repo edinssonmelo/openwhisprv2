@@ -1,6 +1,10 @@
 import type { MeetingNotesSaveStatus } from '../../hooks/useMeetingNotes';
+import type { MeetingAgentMemory } from '../../types/dashboardSession';
+import { MeetingAgentPane } from './MeetingAgentPane';
 import { MeetingAiPane } from './MeetingAiPane';
 import { MeetingNotesPane } from './MeetingNotesPane';
+
+export type MeetingCompanionTab = 'agent' | 'notes' | 'ai';
 
 export function MeetingCompanionPanel({
   tab,
@@ -9,6 +13,7 @@ export function MeetingCompanionPanel({
   notesSaveStatus,
   onNotesChange,
   onCopyNotes,
+  agentMemory,
   chatThread,
   askDraft,
   onAskDraftChange,
@@ -19,12 +24,13 @@ export function MeetingCompanionPanel({
   className,
   rootHtmlId,
 }: {
-  tab: 'notes' | 'ai';
-  onTabChange: (t: 'notes' | 'ai') => void;
+  tab: MeetingCompanionTab;
+  onTabChange: (t: MeetingCompanionTab) => void;
   notesText: string;
   notesSaveStatus: MeetingNotesSaveStatus;
   onNotesChange: (v: string) => void;
   onCopyNotes: () => void;
+  agentMemory: MeetingAgentMemory;
   chatThread: Array<{ role: 'user' | 'assistant'; text: string }>;
   askDraft: string;
   onAskDraftChange: (v: string) => void;
@@ -54,6 +60,15 @@ export function MeetingCompanionPanel({
           <button
             type="button"
             role="tab"
+            aria-selected={tab === 'agent'}
+            className={`meeting-companion__tab ${tab === 'agent' ? 'is-active' : ''}`}
+            onClick={() => onTabChange('agent')}
+          >
+            Agent
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === 'notes'}
             className={`meeting-companion__tab ${tab === 'notes' ? 'is-active' : ''}`}
             onClick={() => onTabChange('notes')}
@@ -72,7 +87,9 @@ export function MeetingCompanionPanel({
         </div>
       ) : null}
       <div className="meeting-companion__content" role="tabpanel">
-        {tab === 'notes' ? (
+        {tab === 'agent' ? (
+          <MeetingAgentPane memory={agentMemory} />
+        ) : tab === 'notes' ? (
           <MeetingNotesPane value={notesText} onChange={onNotesChange} saveStatus={notesSaveStatus} onCopy={onCopyNotes} />
         ) : (
           <MeetingAiPane

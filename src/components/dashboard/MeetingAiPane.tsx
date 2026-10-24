@@ -47,13 +47,19 @@ export function MeetingAiPane({
   return (
     <div className="meeting-ai">
       <div className="meeting-ai__quick">
-        <button type="button" className="meeting-ai__chip" onClick={() => onSendMessage('Summarize this meeting.')}>
-          Summarize
+        <button type="button" className="meeting-ai__chip" onClick={() => onSendMessage('What decisions were made in this meeting?')}>
+          Decisions
+        </button>
+        <button type="button" className="meeting-ai__chip" onClick={() => onSendMessage('What action items and owners should I track?')}>
+          Actions
+        </button>
+        <button type="button" className="meeting-ai__chip" onClick={() => onSendMessage('What stayed open or risky?')}>
+          Open items
         </button>
       </div>
       <div className="meeting-ai__messages">
         {chatThread.length === 0 ? (
-          <p className="meeting-ai__empty">Ask about this meeting.</p>
+          <p className="meeting-ai__empty">Ask the agent about decisions, actions, risks, or follow-up.</p>
         ) : (
           chatThread.map((m, i) => (
             <div key={`${m.role}-${i}`} className={`meeting-ai__msg meeting-ai__msg--${m.role}`}>
@@ -77,7 +83,7 @@ export function MeetingAiPane({
           value={askDraft}
           onChange={(e) => onAskDraftChange(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && onSend()}
-          placeholder="Ask…"
+          placeholder="Ask the meeting agent..."
           aria-label="Message to assistant"
         />
         <button type="button" className="meeting-ai__send" onClick={onSend} title="Send" aria-label="Send">

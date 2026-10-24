@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
 
+const POINTER_HIT_TEST_MIN_MS = 48;
+
 function overlayHitIsInteractive(clientX: number, clientY: number, settingsOpen: boolean): boolean {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return false;
@@ -28,6 +30,7 @@ export function useOverlayPointerPassthrough(settingsOpen: boolean, layoutEpoch:
   const rafId = useRef(0);
   const flushPending = useRef(false);
   const lastSentIgnore = useRef<boolean | null>(null);
+  const lastHitTestAt = useRef(0);
 
   useEffect(() => {
     if (!window.meetingAssistant.overlayWindow) return;
@@ -38,8 +41,11 @@ export function useOverlayPointerPassthrough(settingsOpen: boolean, layoutEpoch:
       window.meetingAssistant.overlay.setPointerPassthrough(ignore);
     };
 
-    const apply = () => {
+    const apply = (force = false) => {
       flushPending.current = false;
+      const now = performance.now();
+      if (!force && now - lastHitTestAt.current < POINTER_HIT_TEST_MIN_MS) return;
+      lastHitTestAt.current = now;
       const { x, y } = lastPos.current;
       const interactive = overlayHitIsInteractive(x, y, settingsOpen);
       send(!interactive);
@@ -49,16 +55,23 @@ export function useOverlayPointerPassthrough(settingsOpen: boolean, layoutEpoch:
       lastPos.current = { x: event.clientX, y: event.clientY };
       if (!flushPending.current) {
         flushPending.current = true;
-        rafId.current = requestAnimationFrame(apply);
+        rafId.current = requestAnimationFrame(() => apply(false));
       }
     };
 
+    const onPointerDown = (event: PointerEvent) => {
+      lastPos.current = { x: event.clientX, y: event.clientY };
+      apply(true);
+    };
+
     document.addEventListener('pointermove', onMove, { passive: true });
+    document.addEventListener('pointerdown', onPointerDown, true);
     lastSentIgnore.current = null;
-    apply();
+    apply(true);
 
     return () => {
       document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerdown', onPointerDown, true);
       cancelAnimationFrame(rafId.current);
     };
   }, [settingsOpen, layoutEpoch]);

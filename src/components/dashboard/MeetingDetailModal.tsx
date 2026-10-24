@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
 import type { DashboardSessionSummary } from '../../types/dashboardSession';
 import { copyToClipboard } from '../../utils/copyToClipboard';
+import { buildMeetingAgentMemory } from '../../utils/meetingAgentInsights';
 import { formatDurationMins, formatSessionDateShort } from '../../utils/meetingDetailFormat';
 import { useMeetingNotes } from '../../hooks/useMeetingNotes';
 import { useViewportMeetingLayout } from '../../hooks/useViewportMeetingLayout';
-import { MeetingCompanionPanel } from './MeetingCompanionPanel';
+import { MeetingCompanionPanel, type MeetingCompanionTab } from './MeetingCompanionPanel';
 import { MeetingTranscriptPane } from './MeetingTranscriptPane';
 
-export type CompanionMode = 'notes' | 'ai' | null;
+export type CompanionMode = MeetingCompanionTab | null;
 
 const COMPANION_MODE_STORAGE_KEY = 'openwhispr.meetingDetail.companionMode.v1';
 const LEGACY_COMPANION_OPEN_KEY = 'openwhispr.meetingDetail.companionOpen.v1';
@@ -71,7 +72,7 @@ function clampDockRect(rect: DockRect, stageWidth: number, stageHeight: number):
 const DOCK_SNAP_GAP_X = 12;
 const DOCK_SNAP_GAP_Y = 10;
 const TOOLBAR_OFFSET_FROM_SHELL_TOP = 10;
-const TOOLBAR_STACK_PX = 110;
+const TOOLBAR_STACK_PX = 162;
 
 function layoutDockRectBesideModal(
   stageW: number,
@@ -175,7 +176,7 @@ function persistDockRect(rect: DockRect, stageWidth: number, stageHeight: number
 function readCompanionModePref(): CompanionMode {
   try {
     const raw = localStorage.getItem(COMPANION_MODE_STORAGE_KEY);
-    if (raw === 'notes' || raw === 'ai') return raw;
+    if (raw === 'agent' || raw === 'notes' || raw === 'ai') return raw;
     if (raw === 'closed') return null;
     const legacy = localStorage.getItem(LEGACY_COMPANION_OPEN_KEY);
     if (legacy === '1') return 'notes';
@@ -229,6 +230,21 @@ function IconAiTool({ className }: { className?: string }) {
   );
 }
 
+function IconAgentTool({ className }: { className?: string }) {
+  return (
+    <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 3.5a7.5 7.5 0 017.5 7.5v2.25a5.25 5.25 0 01-5.25 5.25h-4.5a5.25 5.25 0 01-5.25-5.25V11A7.5 7.5 0 0112 3.5z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <path d="M9 11.5h.01M15 11.5h.01M9.5 15h5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="M12 1.75v1.75M5.5 20.25 7 18.5M18.5 20.25 17 18.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 /** Feather-style rotate-ccw — reads as “reset / restore”. */
 function IconResetDockPosition({ className }: { className?: string }) {
   return (
@@ -260,7 +276,7 @@ export function MeetingDetailModal({
   const detailBackdropDownOnEmptyRef = useRef(false);
   const { text: noteText, setText: setNoteText, saveStatus } = useMeetingNotes(session.id);
   const [companionMode, setCompanionMode] = useState<CompanionMode>(readCompanionModePref);
-  const [mobileSection, setMobileSection] = useState<'transcript' | 'notes' | 'ai'>('transcript');
+  const [mobileSection, setMobileSection] = useState<'transcript' | MeetingCompanionTab>('transcript');
   const [askDraft, setAskDraft] = useState('');
   const [chatThread, setChatThread] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
 
@@ -285,7 +301,8 @@ export function MeetingDetailModal({
 
   const isWide = layout === 'lg' || layout === 'md';
   const companionOpen = companionMode !== null;
-  const companionTab = companionMode ?? 'notes';
+  const companionTab = companionMode ?? 'agent';
+  const agentMemory = buildMeetingAgentMemory(session);
 
   const getStageSize = () => {
     const el = stageRef.current;
@@ -398,15 +415,16 @@ export function MeetingDetailModal({
     return () => document.removeEventListener('keydown', onKeyDown, true);
   }, [isWide, companionOpen, onClose]);
 
-  const onCompanionTabChange = (t: 'notes' | 'ai') => {
+  const onCompanionTabChange = (t: MeetingCompanionTab) => {
     setCompanionMode(t);
     if (layout === 'sm') {
-      setMobileSection(t === 'notes' ? 'notes' : 'ai');
+      setMobileSection(t);
     }
   };
 
-  const onMobileSectionChange = (s: 'transcript' | 'notes' | 'ai') => {
+  const onMobileSectionChange = (s: 'transcript' | MeetingCompanionTab) => {
     setMobileSection(s);
+    if (s === 'agent') setCompanionMode('agent');
     if (s === 'notes') setCompanionMode('notes');
     if (s === 'ai') setCompanionMode('ai');
   };
@@ -453,6 +471,7 @@ export function MeetingDetailModal({
     notesSaveStatus: saveStatus,
     onNotesChange: setNoteText,
     onCopyNotes: () => void onCopyNotes(),
+    agentMemory,
     chatThread,
     askDraft,
     onAskDraftChange: setAskDraft,
@@ -462,7 +481,7 @@ export function MeetingDetailModal({
   };
 
   const showTranscriptSm = layout === 'sm' && mobileSection === 'transcript';
-  const showCompanionSm = layout === 'sm' && (mobileSection === 'notes' || mobileSection === 'ai');
+  const showCompanionSm = layout === 'sm' && mobileSection !== 'transcript';
 
   const shellClass = ['meeting-detail-shell', `meeting-detail-shell--layout-${layout}`].join(' ');
 
@@ -590,6 +609,10 @@ export function MeetingDetailModal({
   };
 
   const clearCompanionContent = () => {
+    if (companionTab === 'agent') {
+      onNotify?.('Agent memory is read-only for now.');
+      return;
+    }
     if (companionTab === 'notes') {
       setNoteText('');
       onNotify?.('Notes cleared.');
@@ -601,7 +624,11 @@ export function MeetingDetailModal({
   };
 
   const canClearCompanion =
-    companionTab === 'notes' ? noteText.trim().length > 0 : chatThread.length > 0 || askDraft.trim().length > 0;
+    companionTab === 'agent'
+      ? false
+      : companionTab === 'notes'
+        ? noteText.trim().length > 0
+        : chatThread.length > 0 || askDraft.trim().length > 0;
 
   const isInsideMeetingDetailContent = (target: EventTarget | null) => {
     if (!(target instanceof Node)) return false;
@@ -616,6 +643,7 @@ export function MeetingDetailModal({
   const dockClass = [
     'meeting-detail-companion-dock',
     'meeting-detail-companion-dock--user-placed',
+    companionMode === 'agent' ? 'meeting-detail-companion-dock--agent' : '',
     companionMode === 'notes' ? 'meeting-detail-companion-dock--notes' : '',
     companionMode === 'ai' ? 'meeting-detail-companion-dock--ai' : '',
     dockMoving ? 'is-dragging' : '',
@@ -663,6 +691,15 @@ export function MeetingDetailModal({
 
             {layout === 'sm' ? (
               <div className="meeting-detail__seg-tabs" role="tablist" aria-label="Meeting content">
+                <button
+                  type="button"
+                  role="tab"
+                  className={`meeting-detail__seg-tab ${mobileSection === 'agent' ? 'is-active' : ''}`}
+                  aria-selected={mobileSection === 'agent'}
+                  onClick={() => onMobileSectionChange('agent')}
+                >
+                  Agent
+                </button>
                 <button
                   type="button"
                   role="tab"
@@ -731,7 +768,7 @@ export function MeetingDetailModal({
               onPointerUp={endDockInteraction}
               onPointerCancel={endDockInteraction}
             >
-              <span>{companionTab === 'notes' ? 'Notes' : 'Ask AI'}</span>
+              <span>{companionTab === 'agent' ? 'Agent' : companionTab === 'notes' ? 'Notes' : 'Ask AI'}</span>
               <div className="meeting-detail-companion-dragbar__actions">
                 <button
                   type="button"
@@ -742,8 +779,20 @@ export function MeetingDetailModal({
                     event.stopPropagation();
                     clearCompanionContent();
                   }}
-                  aria-label={companionTab === 'notes' ? 'Clear notes in this panel' : 'Clear chat in this panel'}
-                  title={companionTab === 'notes' ? 'Erase notes text (not saved until you type again)' : 'Remove all messages and the draft'}
+                  aria-label={
+                    companionTab === 'agent'
+                      ? 'Agent memory is read-only'
+                      : companionTab === 'notes'
+                        ? 'Clear notes in this panel'
+                        : 'Clear chat in this panel'
+                  }
+                  title={
+                    companionTab === 'agent'
+                      ? 'Agent memory is read-only for now'
+                      : companionTab === 'notes'
+                        ? 'Erase notes text (not saved until you type again)'
+                        : 'Remove all messages and the draft'
+                  }
                 >
                   Clear
                 </button>
@@ -768,8 +817,8 @@ export function MeetingDetailModal({
                     event.stopPropagation();
                     setCompanionMode(null);
                   }}
-                  aria-label={companionTab === 'notes' ? 'Hide notes' : 'Hide assistant'}
-                  title={companionTab === 'notes' ? 'Hide notes' : 'Hide assistant'}
+                  aria-label={companionTab === 'agent' ? 'Hide agent memory' : companionTab === 'notes' ? 'Hide notes' : 'Hide assistant'}
+                  title={companionTab === 'agent' ? 'Hide agent memory' : companionTab === 'notes' ? 'Hide notes' : 'Hide assistant'}
                 >
                   <IconPanelMinimize />
                 </button>
@@ -794,6 +843,17 @@ export function MeetingDetailModal({
 
         {isWide ? (
           <div ref={sideToolsRef} className="meeting-detail-side-tools" role="toolbar" aria-label="Notes and assistant">
+            <button
+              type="button"
+              className={`meeting-detail-tool-button ${companionMode === 'agent' ? 'is-active' : ''}`}
+              aria-label={companionMode === 'agent' ? 'Hide agent memory' : 'Open agent memory'}
+              title="Agent"
+              aria-expanded={companionMode === 'agent'}
+              aria-controls="meeting-companion-panel"
+              onClick={() => setCompanionMode((c) => (c === 'agent' ? null : 'agent'))}
+            >
+              <IconAgentTool />
+            </button>
             <button
               type="button"
               className={`meeting-detail-tool-button ${companionMode === 'notes' ? 'is-active' : ''}`}

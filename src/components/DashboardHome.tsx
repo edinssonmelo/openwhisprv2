@@ -5,7 +5,17 @@ import { getSessionCopyText, getMeetingSummaryCopyText } from '../utils/meetingD
 import { formatDurationMins } from '../utils/meetingDetailFormat';
 import type { DashboardSessionSummary } from '../types/dashboardSession';
 import { readDashboardTheme, writeDashboardTheme, type DashboardTheme } from '../storage/dashboardTheme';
+import {
+  DEFAULT_PROMPT_PROFILE,
+  type AppLanguage,
+  type CapturePreference,
+  type ContextSpace,
+  type PromptProfile,
+  type SystemCaptureStrategy,
+  type UserProfile,
+} from '../storage/appPreferences';
 import { MeetingDetailModal } from './dashboard/MeetingDetailModal';
+import { AddToContextModal } from './AddToContextModal';
 
 export type { DashboardSessionSummary } from '../types/dashboardSession';
 
@@ -17,12 +27,26 @@ function rowMenuKeyFor(scope: 'home' | 'library', sessionId: string) {
 
 interface DashboardHomeProps {
   userName: string;
+  userProfile: UserProfile;
   sessions: DashboardSessionSummary[];
   onStartSession: () => void;
   onOpenSession: (session: DashboardSessionSummary) => void;
   onDeleteSession?: (sessionId: string) => void;
   onNotify?: (message: string) => void;
   onRerunSetup?: () => void;
+  capturePreference: CapturePreference;
+  onCapturePreferenceChange: (mode: CapturePreference) => void;
+  systemCaptureStrategy: SystemCaptureStrategy;
+  onSystemCaptureStrategyChange: (strategy: SystemCaptureStrategy) => void;
+  appLanguage: AppLanguage;
+  onAppLanguageChange: (language: AppLanguage) => void;
+  promptProfiles: PromptProfile[];
+  contextSpaces: ContextSpace[];
+  selectedPromptProfileId: string;
+  onPromptProfilesChange: (profiles: PromptProfile[]) => void;
+  onContextSpacesChange: (spaces: ContextSpace[]) => void;
+  onSelectedPromptProfileIdChange: (id: string) => void;
+  onUserProfileChange: (profile: UserProfile) => void;
   /** Small spinner in the top bar while the last meeting summary is being saved. */
   meetingSummaryBusy?: boolean;
 }
@@ -83,16 +107,30 @@ function IconClose({ className }: { className?: string }) {
   );
 }
 
-type ProfileModal = 'prompts' | 'settings' | 'account' | null;
+type ProfileModal = 'prompts' | 'contexts' | 'settings' | 'account' | null;
 
 export function DashboardHome({
   userName,
+  userProfile,
   sessions,
   onStartSession,
   onOpenSession,
   onDeleteSession,
   onNotify,
   onRerunSetup,
+  capturePreference,
+  onCapturePreferenceChange,
+  systemCaptureStrategy,
+  onSystemCaptureStrategyChange,
+  appLanguage,
+  onAppLanguageChange,
+  promptProfiles,
+  contextSpaces,
+  selectedPromptProfileId,
+  onPromptProfilesChange,
+  onContextSpacesChange,
+  onSelectedPromptProfileIdChange,
+  onUserProfileChange,
   meetingSummaryBusy,
 }: DashboardHomeProps) {
   const profileWrapRef = useRef<HTMLDivElement>(null);
@@ -102,10 +140,24 @@ export function DashboardHome({
   const [profileModal, setProfileModal] = useState<ProfileModal>(null);
   const [rowMenuKey, setRowMenuKey] = useState<string | null>(null);
   const rowMenuRef = useRef<HTMLDivElement | null>(null);
+  const [contextPickerSession, setContextPickerSession] = useState<DashboardSessionSummary | null>(null);
+  const [localToast, setLocalToast] = useState<string | null>(null);
+  const localToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showLocalToast = (msg: string) => {
+    if (localToastTimerRef.current) clearTimeout(localToastTimerRef.current);
+    setLocalToast(msg);
+    localToastTimerRef.current = setTimeout(() => setLocalToast(null), 2600);
+  };
   const libraryBackdropArmRef = useRef(false);
   const [meetingsLibraryOpen, setMeetingsLibraryOpen] = useState(false);
   const [librarySearch, setLibrarySearch] = useState('');
   const [dashboardTheme, setDashboardTheme] = useState<DashboardTheme>(() => readDashboardTheme());
+  const [accountDraft, setAccountDraft] = useState<UserProfile>(userProfile);
+  const [promptDrafts, setPromptDrafts] = useState<PromptProfile[]>(promptProfiles);
+  const [contextDrafts, setContextDrafts] = useState<ContextSpace[]>(contextSpaces);
+  const [selectedContextDraftId, setSelectedContextDraftId] = useState(contextSpaces[0]?.id ?? 'general');
+  const selectedPromptDraft = promptDrafts.find((profile) => profile.id === selectedPromptProfileId) ?? promptDrafts[0] ?? DEFAULT_PROMPT_PROFILE;
+  const selectedContextDraft = contextDrafts.find((space) => space.id === selectedContextDraftId) ?? contextDrafts[0];
 
   const filteredSessions = useMemo(() => {
     const sorted = [...sessions].sort((a, b) => b.createdAt - a.createdAt);
@@ -201,6 +253,117 @@ export function DashboardHome({
 
   const closeProfileModal = () => setProfileModal(null);
 
+  useEffect(() => {
+    if (profileModal === 'account') setAccountDraft(userProfile);
+    if (profileModal === 'prompts') setPromptDrafts(promptProfiles);
+    if (profileModal === 'contexts') {
+      setContextDrafts(contextSpaces);
+      setSelectedContextDraftId(contextSpaces[0]?.id ?? 'general');
+    }
+  }, [contextSpaces, profileModal, promptProfiles, userProfile]);
+
+  const saveAccount = () => {
+    const next = { ...accountDraft, name: accountDraft.name.trim() || userName, updatedAt: Date.now() };
+    onUserProfileChange(next);
+    onNotify?.('Perfil local guardado.');
+    closeProfileModal();
+  };
+
+  const updatePromptDraft = (patch: Partial<PromptProfile>) => {
+    setPromptDrafts((current) => current.map((profile) => (
+      profile.id === selectedPromptDraft.id ? { ...profile, ...patch, updatedAt: Date.now() } : profile
+    )));
+  };
+
+  const addPromptProfile = () => {
+    const id = `prompt-${Date.now()}`;
+    const next: PromptProfile = {
+      ...DEFAULT_PROMPT_PROFILE,
+      id,
+      name: 'Custom assistant',
+      isDefault: false,
+      updatedAt: Date.now(),
+    };
+    setPromptDrafts((current) => [...current, next]);
+    onSelectedPromptProfileIdChange(id);
+  };
+
+  const savePrompts = () => {
+    const normalized = promptDrafts.map((profile) => ({
+      ...profile,
+      name: profile.name.trim() || 'Untitled prompt',
+      systemPrompt: profile.systemPrompt.trim() || DEFAULT_PROMPT_PROFILE.systemPrompt,
+      contextPrompt: profile.contextPrompt.trim() || DEFAULT_PROMPT_PROFILE.contextPrompt,
+      updatedAt: Date.now(),
+    }));
+    onPromptProfilesChange(normalized);
+    if (!normalized.some((profile) => profile.id === selectedPromptProfileId)) {
+      onSelectedPromptProfileIdChange(normalized[0]?.id ?? DEFAULT_PROMPT_PROFILE.id);
+    }
+    onNotify?.('Prompts guardados localmente.');
+    closeProfileModal();
+  };
+
+  const addContextSpace = () => {
+    const id = `context-${Date.now()}`;
+    const next: ContextSpace = {
+      id,
+      name: 'Nuevo contexto',
+      description: '',
+      sessionIds: [],
+      updatedAt: Date.now(),
+    };
+    setContextDrafts((current) => [...current, next]);
+    setSelectedContextDraftId(id);
+  };
+
+  const updateContextDraft = (patch: Partial<ContextSpace>) => {
+    if (!selectedContextDraft) return;
+    setContextDrafts((current) => current.map((space) => (
+      space.id === selectedContextDraft.id ? { ...space, ...patch, updatedAt: Date.now() } : space
+    )));
+  };
+
+  const saveContexts = () => {
+    const normalized = contextDrafts.map((space) => ({
+      ...space,
+      name: space.name.trim() || 'Untitled context',
+      description: space.description?.trim(),
+      sessionIds: Array.from(new Set(space.sessionIds)),
+      updatedAt: Date.now(),
+    }));
+    onContextSpacesChange(normalized);
+    showLocalToast('Context saved.');
+  };
+
+  const addSessionToContext = (session: DashboardSessionSummary, spaceId: string) => {
+    onContextSpacesChange(contextSpaces.map((space) => (
+      space.id === spaceId
+        ? { ...space, sessionIds: Array.from(new Set([...space.sessionIds, session.id])), updatedAt: Date.now() }
+        : space
+    )));
+    setRowMenuKey(null);
+    onNotify?.('Reunión añadida al contexto.');
+  };
+
+  const saveSessionContextSpaces = (session: DashboardSessionSummary, spaceIds: string[]) => {
+    const spaceSet = new Set(spaceIds);
+    onContextSpacesChange(contextSpaces.map((space) => {
+      const hasNow = space.sessionIds.includes(session.id);
+      const wantsNow = spaceSet.has(space.id);
+      if (hasNow === wantsNow) return space;
+      return {
+        ...space,
+        sessionIds: wantsNow
+          ? Array.from(new Set([...space.sessionIds, session.id]))
+          : space.sessionIds.filter((id) => id !== session.id),
+        updatedAt: Date.now(),
+      };
+    }));
+    setContextPickerSession(null);
+    onNotify?.('Contextos actualizados.');
+  };
+
   const confirmDeleteSession = (session: DashboardSessionSummary) => {
     if (!onDeleteSession) return;
     if (!window.confirm('¿Eliminar esta reunión? Esta acción no se puede deshacer.')) return;
@@ -247,7 +410,7 @@ export function DashboardHome({
     const menuOpen = rowMenuKey === menuKey;
     return (
       <div
-        className={`dashboard-meeting-card-group ${menuOpen ? 'is-menu-open' : ''}`}
+        className={`dashboard-meeting-row-wrap ${menuOpen ? 'is-menu-open' : ''}`}
         key={fromLibrary ? `lib-${session.id}` : session.id}
       >
         <button type="button" className="dashboard-meeting-card-main" onClick={handleOpen}>
@@ -285,7 +448,7 @@ export function DashboardHome({
               onMouseDown={(e) => e.stopPropagation()}
             >
               <button type="button" role="menuitem" onClick={handleOpen}>
-                View details
+                Ver detalles
               </button>
               <button
                 type="button"
@@ -295,7 +458,7 @@ export function DashboardHome({
                   void copyTranscriptForSession(session);
                 }}
               >
-                Copy transcription
+                Copiar transcripción
               </button>
               <button
                 type="button"
@@ -305,8 +468,20 @@ export function DashboardHome({
                   void copySummaryForSession(session);
                 }}
               >
-                Copy summary
+                Copiar resumen
               </button>
+              {contextSpaces.length ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setRowMenuKey(null);
+                    setContextPickerSession(session);
+                  }}
+                >
+                  Añadir a contexto…
+                </button>
+              ) : null}
               {onDeleteSession ? (
                 <button type="button" role="menuitem" className="is-danger" onClick={() => confirmDeleteSession(session)}>
                   Eliminar
@@ -336,6 +511,26 @@ export function DashboardHome({
           </label>
         </div>
         <div className="dashboard-top-nav-actions">
+          <div className="dashboard-window-controls" aria-label="Window controls">
+            <button
+              type="button"
+              className="wc-btn wc-btn--close"
+              onClick={() => void window.meetingAssistant.windowControls.close()}
+              aria-label="Close window"
+            />
+            <button
+              type="button"
+              className="wc-btn wc-btn--minimize"
+              onClick={() => void window.meetingAssistant.windowControls.minimize()}
+              aria-label="Minimize window"
+            />
+            <button
+              type="button"
+              className="wc-btn wc-btn--maximize"
+              onClick={() => void window.meetingAssistant.windowControls.toggleMaximize()}
+              aria-label="Maximize window"
+            />
+          </div>
           {meetingSummaryBusy ? (
             <span
               className="dashboard-top-nav-saving"
@@ -364,17 +559,26 @@ export function DashboardHome({
               <div className="dashboard-profile-dropdown" role="menu">
                 <div className="profile-dropdown-head">
                   <strong>{userName}</strong>
-                  <span>Local workspace</span>
+                  <span>Workspace local</span>
                 </div>
-                <button type="button" role="menuitem" onClick={() => openProfileModal('prompts')}>
-                  Prompts
-                </button>
-                <button type="button" role="menuitem" onClick={() => openProfileModal('settings')}>
-                  Settings
-                </button>
-                <button type="button" role="menuitem" onClick={() => openProfileModal('account')}>
-                  Account
-                </button>
+                <div className="profile-dropdown-group" role="group">
+                  <button type="button" role="menuitem" className="profile-dropdown-item" onClick={() => openProfileModal('prompts')}>
+                    <span className="profile-dropdown-item-name">Prompts</span>
+                    <span className="profile-dropdown-item-desc">Instrucciones del asistente</span>
+                  </button>
+                  <button type="button" role="menuitem" className="profile-dropdown-item" onClick={() => openProfileModal('contexts')}>
+                    <span className="profile-dropdown-item-name">Contextos</span>
+                    <span className="profile-dropdown-item-desc">Espacios de reuniones</span>
+                  </button>
+                  <button type="button" role="menuitem" className="profile-dropdown-item" onClick={() => openProfileModal('settings')}>
+                    <span className="profile-dropdown-item-name">Ajustes</span>
+                    <span className="profile-dropdown-item-desc">Audio, idioma y más</span>
+                  </button>
+                  <button type="button" role="menuitem" className="profile-dropdown-item" onClick={() => openProfileModal('account')}>
+                    <span className="profile-dropdown-item-name">Cuenta</span>
+                    <span className="profile-dropdown-item-desc">Perfil local</span>
+                  </button>
+                </div>
                 <div className="dashboard-profile-dropdown-divider" aria-hidden />
                 <button
                   type="button"
@@ -388,7 +592,7 @@ export function DashboardHome({
                     writeDashboardTheme(next);
                   }}
                 >
-                  <span className="dashboard-profile-theme-toggle-label">Dark mode</span>
+                  <span className="dashboard-profile-theme-toggle-label">Modo oscuro</span>
                   <span className={`dashboard-theme-switch ${dashboardTheme === 'dark' ? 'is-on' : ''}`} aria-hidden />
                 </button>
                 <button
@@ -400,7 +604,7 @@ export function DashboardHome({
                     onNotify?.('Signed out (local session)');
                   }}
                 >
-                  Sign out
+                  Cerrar sesión
                 </button>
               </div>
             ) : null}
@@ -438,14 +642,14 @@ export function DashboardHome({
                 <button
                   type="button"
                   className="dashboard-meetings-see-all"
-                  aria-label="Load more meetings"
-                  title="Load more meetings"
+                  aria-label="Ver todas las reuniones"
+                  title="Ver todas las reuniones"
                   onClick={() => {
                     setRowMenuKey((k) => (k?.startsWith('home:') ? null : k));
                     setMeetingsLibraryOpen(true);
                   }}
                 >
-                  Load more
+                  <IconMore />
                 </button>
               </div>
             ) : null}
@@ -526,6 +730,19 @@ export function DashboardHome({
         <MeetingDetailModal session={openedSession} onClose={() => setOpenedSession(null)} onNotify={onNotify} />
       ) : null}
 
+      {contextPickerSession ? (
+        <AddToContextModal
+          session={contextPickerSession}
+          contextSpaces={contextSpaces}
+          onClose={() => setContextPickerSession(null)}
+          onSave={(spaceIds) => saveSessionContextSpaces(contextPickerSession, spaceIds)}
+        />
+      ) : null}
+
+      {localToast ? (
+        <div className="premium-toast" role="status" aria-live="polite">{localToast}</div>
+      ) : null}
+
       {profileModal ? (
         <div className="dashboard-shell-modal-backdrop" role="presentation" onClick={closeProfileModal}>
           <section
@@ -538,6 +755,7 @@ export function DashboardHome({
             <header>
               <h2 id="dashboard-shell-modal-title">
                 {profileModal === 'prompts' && 'Prompts'}
+                {profileModal === 'contexts' && 'Contextos'}
                 {profileModal === 'settings' && 'Settings'}
                 {profileModal === 'account' && 'Account'}
               </h2>
@@ -547,27 +765,154 @@ export function DashboardHome({
             </header>
             <div className="dashboard-shell-modal-body">
               {profileModal === 'settings' ? (
-                <>
-                  <p className="muted">Workspace preferences and defaults.</p>
-                  <button
-                    type="button"
-                    className="dashboard-start-button dashboard-settings-rerun"
-                    onClick={() => {
-                      onRerunSetup?.();
-                      closeProfileModal();
-                    }}
-                  >
-                    Run setup again
-                  </button>
-                  <p className="muted small">
-                    Re-opens microphone and system audio permission steps. Your meetings are not deleted.
-                  </p>
-                </>
+                <div className="dashboard-modal-form">
+                  <p className="muted">Preferencias locales.</p>
+                  <label className="dashboard-modal-field">
+                    <span>Idioma</span>
+                    <select value={appLanguage} onChange={(event) => onAppLanguageChange(event.target.value as AppLanguage)}>
+                      <option value="es">Español</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                  <p className="muted small">Los modelos de transcripción e IA quedan preparados para configurarse aquí más adelante.</p>
+                  <div className="dashboard-modal-inline-actions">
+                    <button type="button" className="dashboard-shadcn-primary" onClick={closeProfileModal}>Guardar</button>
+                  </div>
+                </div>
+              ) : profileModal === 'contexts' ? (
+                <div className="dashboard-contexts-editor">
+                  <aside className="dashboard-contexts-sidebar">
+                    {contextDrafts.map((space) => (
+                      <button
+                        key={space.id}
+                        type="button"
+                        className={space.id === selectedContextDraft?.id ? 'is-active' : ''}
+                        onClick={() => setSelectedContextDraftId(space.id)}
+                      >
+                        {space.name}
+                        {space.sessionIds.length > 0 ? (
+                          <span>{space.sessionIds.length}</span>
+                        ) : null}
+                      </button>
+                    ))}
+                    <button type="button" className="secondary" onClick={addContextSpace}>+ Nuevo espacio</button>
+                  </aside>
+                  <div className="dashboard-contexts-main">
+                    <div className="dashboard-modal-form">
+                    {selectedContextDraft ? (
+                      <>
+                        <label className="dashboard-modal-field">
+                          <span>Nombre</span>
+                          <input
+                            value={selectedContextDraft.name}
+                            disabled={selectedContextDraft.isDefault}
+                            onChange={(event) => updateContextDraft({ name: event.target.value })}
+                          />
+                        </label>
+                        <label className="dashboard-modal-field">
+                          <span>Notas del contexto</span>
+                          <textarea
+                            value={selectedContextDraft.description ?? ''}
+                            onChange={(event) => updateContextDraft({ description: event.target.value })}
+                            rows={4}
+                            placeholder="Objetivo, cliente, tema o decisiones que conectan estas reuniones."
+                          />
+                        </label>
+                        <div className="dashboard-modal-field">
+                          <span>Reuniones incluidas</span>
+                          <div className="dashboard-context-session-list">
+                            {selectedContextDraft.sessionIds.length === 0 ? <p className="muted">Todavía no hay reuniones en este contexto.</p> : selectedContextDraft.sessionIds.map((sessionId) => {
+                              const session = sessions.find((item) => item.id === sessionId);
+                              if (!session) return null;
+                              return (
+                                <div key={sessionId} className="dashboard-context-session-row">
+                                  <span>{session.title}</span>
+                                  <button
+                                    type="button"
+                                    aria-label={`Quitar ${session.title}`}
+                                    onClick={() => updateContextDraft({ sessionIds: selectedContextDraft.sessionIds.filter((id) => id !== sessionId) })}
+                                  >
+                                    × Quitar
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        <div className="dashboard-modal-inline-actions">
+                          {!selectedContextDraft.isDefault ? (
+                            <button
+                              type="button"
+                              className="secondary"
+                              style={{ marginRight: 'auto', color: '#dc2626' }}
+                              onClick={() => {
+                                const remaining = contextDrafts.filter((d) => d.id !== selectedContextDraft.id);
+                                setContextDrafts(remaining);
+                                onContextSpacesChange(remaining);
+                                setSelectedContextDraftId(remaining[0]?.id ?? 'general');
+                                showLocalToast('Context deleted.');
+                              }}
+                            >
+                              Delete
+                            </button>
+                          ) : null}
+                          <button type="button" className="dashboard-shadcn-primary" onClick={saveContexts}>Guardar</button>
+                        </div>
+                      </>
+                    ) : null}
+                    </div>
+                  </div>
+                </div>
+              ) : profileModal === 'account' ? (
+                <div className="dashboard-modal-form">
+                  <p className="muted">Perfil local. No crea una cuenta remota.</p>
+                  <label className="dashboard-modal-field">
+                    <span>Nombre</span>
+                    <input value={accountDraft.name} onChange={(event) => setAccountDraft((current) => ({ ...current, name: event.target.value }))} />
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>Rol</span>
+                    <input value={accountDraft.role ?? ''} onChange={(event) => setAccountDraft((current) => ({ ...current, role: event.target.value }))} placeholder="Founder, PM, engineer..." />
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>Organización</span>
+                    <input value={accountDraft.organization ?? ''} onChange={(event) => setAccountDraft((current) => ({ ...current, organization: event.target.value }))} />
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>Email opcional</span>
+                    <input value={accountDraft.email ?? ''} onChange={(event) => setAccountDraft((current) => ({ ...current, email: event.target.value }))} />
+                  </label>
+                  <div className="dashboard-modal-inline-actions">
+                    <button type="button" className="dashboard-shadcn-primary" onClick={saveAccount}>Guardar</button>
+                  </div>
+                </div>
               ) : (
-                <p className="muted">
-                  {profileModal === 'prompts' && 'Prompt templates and presets will live here.'}
-                  {profileModal === 'account' && 'Local profile details will live here.'}
-                </p>
+                <div className="dashboard-modal-form dashboard-prompts-form">
+                  <p className="muted">Define cómo responde el asistente durante una reunión.</p>
+                  <label className="dashboard-modal-field">
+                    <span>Perfil</span>
+                    <select value={selectedPromptDraft.id} onChange={(event) => onSelectedPromptProfileIdChange(event.target.value)}>
+                      {promptDrafts.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                    </select>
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>Nombre del perfil</span>
+                    <input value={selectedPromptDraft.name} onChange={(event) => updatePromptDraft({ name: event.target.value })} />
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>System prompt</span>
+                    <textarea value={selectedPromptDraft.systemPrompt} onChange={(event) => updatePromptDraft({ systemPrompt: event.target.value })} rows={5} />
+                  </label>
+                  <label className="dashboard-modal-field">
+                    <span>Reglas del asistente</span>
+                    <textarea value={selectedPromptDraft.contextPrompt} onChange={(event) => updatePromptDraft({ contextPrompt: event.target.value })} rows={4} />
+                  </label>
+                  <div className="dashboard-modal-inline-actions">
+                    <button type="button" className="secondary" onClick={addPromptProfile}>Nuevo perfil</button>
+                    <button type="button" className="secondary" onClick={() => updatePromptDraft({ systemPrompt: DEFAULT_PROMPT_PROFILE.systemPrompt, contextPrompt: DEFAULT_PROMPT_PROFILE.contextPrompt })}>Restaurar default</button>
+                    <button type="button" className="dashboard-shadcn-primary" onClick={savePrompts}>Guardar</button>
+                  </div>
+                </div>
               )}
             </div>
           </section>

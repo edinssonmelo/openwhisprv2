@@ -1,3 +1,5 @@
+import type { AsrLanguage } from '../transcription/types';
+
 export type TranscriptCandidateMode = 'preview' | 'final';
 
 export interface TranscriptCandidateInput {
@@ -13,7 +15,7 @@ export interface TranscriptCandidateInput {
   modelName?: string;
   durationMs?: number;
   suspicious?: boolean;
-  language?: 'es' | 'auto';
+  language?: AsrLanguage;
   receivedAtMs?: number;
 }
 
@@ -280,6 +282,7 @@ export class TranscriptCandidateLedger {
   }
 
   private prune(nowMs: number): void {
+    const uncommittedRetentionMs = this.cfg.retentionMs * 2;
     const newestCommittedMs = Math.max(
       0,
       ...this.groups
@@ -287,7 +290,7 @@ export class TranscriptCandidateLedger {
         .map((group) => group.firstSeenAtMs),
     );
     this.groups = this.groups.filter((group) => {
-      if (!group.committedCandidateId) return true;
+      if (!group.committedCandidateId) return nowMs - group.firstSeenAtMs <= uncommittedRetentionMs;
       return nowMs - Math.max(group.firstSeenAtMs, newestCommittedMs) <= this.cfg.retentionMs;
     });
   }
@@ -374,7 +377,7 @@ function jaccard(left: string[], right: string[]): number {
   return intersection / Math.max(1, l.size + r.size - intersection);
 }
 
-function assessTranscriptQuality(text: string, language: 'es' | 'auto'): { scoreDelta: number; reasons: string[]; severe: boolean } {
+function assessTranscriptQuality(text: string, language: AsrLanguage): { scoreDelta: number; reasons: string[]; severe: boolean } {
   const normalized = normalizeForLedger(text);
   const tokens = tokenizeForLedger(text);
   const reasons: string[] = [];
@@ -399,7 +402,7 @@ function assessTranscriptQuality(text: string, language: 'es' | 'auto'): { score
   }
 
   const weirdInitialAcronyms = text.match(/^\s*(?:[A-Z]{2,5}[\s,.:-]+){1,3}/u);
-  if (weirdInitialAcronyms && spanishHints < 2) {
+  if (weirdInitialAcronyms && spanishHints < 2 && language !== 'en') {
     scoreDelta -= 18;
     reasons.push('weird-leading-acronyms');
   } else if (weirdInitialAcronyms) {

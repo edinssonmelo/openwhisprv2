@@ -12,6 +12,8 @@ pnpm-debug.log*
 
 # Local tooling and heavy vendored builds (whisper.cpp lives here after setup)
 .local/
+.venv-asr/
+.venv-qwen-asr/
 
 # Recordings and benchmarks (keep repo small)
 recordings/*.wav
@@ -30,3 +32,23 @@ recordings/benchmarks/
 
 # LLM session memory (not part of the product)
 memory-bank/
+tools/macos-asr-helper/.build/
+
+# Native build caches and generated distributions (keep local, never commit)
+**/.build/
+**/.swiftpm/
+release/
+landing/.vite/
+.venv*/
+
+# Private meeting content and generated runtime databases
+recordings/**
+!recordings/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.dmg
+*.blockmap

@@ -1,101 +1,71 @@
 # Openwhispr
 
-Aplicación de escritorio para **transcribir voz en tu propia máquina**. El audio no se envía a la nube: la transcripción la hace **Whisper** (vía whisper.cpp) de forma local.
+**[View the live demo → openwhispr.rootoz.com](https://openwhispr.rootoz.com/)**
 
-**“Casi en tiempo real”** aquí significa: la app escucha el micrófono (y, si podés, el audio del sistema), detecta **cuándo termina un tramo de habla** (silencio / VAD) y entonces manda ese **segmento** al motor. No es subtitulado palabra a palabra al milisegundo; el retardo depende de la duración del segmento y del tiempo que tarde Whisper en procesarlo.
+A local-first meeting assistant for macOS. Capture microphone and system audio, follow a continuous transcript, save sessions locally, and use the AI companion when a local model is configured.
 
-```
-  Voz  ──▶  Openwhispr  ──▶  segmentos (pausas / VAD)  ──▶  whisper.cpp (local)  ──▶  texto en pantalla
-```
+The website includes an animated preview of the translucent transcription and AI panels. **The browser demo is a simulation:** it does not record audio or call an AI model. It automatically selects Spanish for LATAM and English elsewhere, with a manual language switch.
 
----
+## Current beta
 
-## Instalación del proyecto
+- **Version:** 0.1.3, macOS 14.2+ on Apple Silicon (M1 or newer).
+- **Download:** [Get the current beta](https://openwhispr.rootoz.com/#download). [Release metadata and SHA-256](https://openwhispr.rootoz.com/releases/latest.json).
+- **Speech engine:** Parakeet TDT 0.6B v3 through FluidAudio / Core ML. The downloadable beta includes the model. Whisper Large V3 Turbo is an optional development fallback and requires separate setup.
+- **Privacy:** meeting audio and transcripts stay on the device by default. Optional telemetry is opt-in. See [privacy](docs/PRIVACY.md).
+- **Signing:** verified ad-hoc signature and a custom app icon; **not Apple-notarized**. macOS can require per-app authorization through Privacy & Security → Open Anyway. No system-wide security changes are required. [Apple’s guidance](https://support.apple.com/en-us/102445).
+- Intel and Windows installers are not currently distributed here. Speaker identification is not part of the preview; transcription is shown as continuous text.
 
-```bash
+## Develop on an Apple Silicon Mac
+
+Install Node.js 20+, Xcode Command Line Tools and git. Models, audio recordings and native build outputs are intentionally excluded from Git.
+
+```sh
 npm install
+npm run asr:setup
+npm run asr:check
 npm run dev
 ```
 
-**Importante:** al clonar el repo **no** tenés el modelo de Whisper ni el binario `whisper-cli`. Son archivos grandes y se generan en tu PC. Sin ese paso, la app no puede transcribir.
+For system-audio capture, build the native helpers once and grant macOS permissions when requested:
 
-### Modelo y motor (obligatorio para transcribir)
+```sh
+(cd tools/macos-system-audio-helper && swift build -c release)
+(cd tools/macos-coreaudio-tap-helper && swift build -c release)
+```
 
-1. **Herramientas en el sistema:** [Node.js](https://nodejs.org/) (LTS), **git**, **cmake**, compilador C++ acorde a tu OS, y **ffmpeg** en el `PATH`.
-2. **Compilar whisper.cpp y descargar un modelo base** (clona en `.local/whisper.cpp/` y arma `whisper-cli`):
+Optional Whisper fallback: install CMake, a C++ compiler and ffmpeg, then run `npm run whisper:setup:turbo` and `npm run whisper:check`. The local AI companion has separate model/configuration requirements; it is not the speech-recognition engine.
 
-   ```bash
-   npm run whisper:setup
-   ```
+## Checks and desktop build
 
-3. **Descargar el modelo grande usado por defecto** (Large V3 Turbo → `.local/models/ggml-large-v3-turbo.bin`):
-
-   ```bash
-   npm run whisper:setup:turbo
-   ```
-
-4. **Comprobar** que ffmpeg, CLI y modelo se ven bien:
-
-   ```bash
-   npm run whisper:check
-   ```
-
-Si algo falla, el propio comando indica qué falta.
-
-**Permisos:** micrófono y, si usás captura de sistema, lo que pida el SO para pantalla/audio.
-
----
-
-## Desarrollo y build
-
-```bash
+```sh
 npm run typecheck
 npm run build
+node scripts/check-packaged-assets.mjs
+npm run test:asr
+npm run dist:mac
 ```
 
-En código existe un modo más experimental (`SAFE_BASELINE = false`) con refinado opcional por **Ollama** en local; el flujo habitual es baseline local sin eso.
+`dist:mac` builds the arm64 beta into `release/current/`. It bundles the local Parakeet model and the three native helpers, excludes personal name aliases and development caches, applies an ad-hoc signature, and verifies the app icon and code signature before creating the disk image. It requires the models and native helpers described above.
 
-### V2: Whisper principal, Qwen comparativo y refinado
+The production renderer uses relative asset paths so `file://` loading works in Electron. The packaged-asset check rejects server-root paths and missing files, preventing the blank-window packaging regression.
 
-La recomendación actual para español conversacional es usar Whisper Large V3 Turbo como ASR principal. Qwen3-ASR queda como motor secundario para comparación y Gemma/Ollama puede refinar puntuación en una capa separada:
+## Landing and distribution
 
-```bash
-npm run dev:v2:whisper
-npm run dev:v2:compare
-npm run dev:v2:refine
-npm run qwen:check -- recordings/tmp/final-seg-1778125017430-fgapizy-62903-82688.wav
+```sh
+npm run landing:dev
+node landing/scripts/check.cjs
+npx tsc -p landing/tsconfig.json
+npm run landing:build
 ```
 
-Variables principales:
+The existing deployment is hosted on ai-server behind Nginx, Traefik and Cloudflare Tunnel. It serves versioned installers and an uncached release manifest. Download buttons validate the manifest and the actual file before becoming active.
 
-- `ASR_FINAL_ENGINE=whisper | qwen | compare` (default: `whisper`)
-- `TRANSCRIPT_REFINEMENT_MODE=off | whisper-only | whisper-qwen` (default: `off`)
-- `TRANSCRIPT_REFINER_MODEL=gemma3:4b`
+Maintainers with access to ai-server can use `npm run landing:deploy` and `npm run release:publish`. Publishing verifies the app signature and the transferred artifact before switching the current release. Automatic updates remain disabled until a verified update feed is configured.
 
-Comando manual para Qwen:
+See [deployment](docs/DEPLOY.md), [distribution](docs/DISTRIBUTION.md), [release checklist](docs/RELEASE_CHECKLIST.md), and [launch status](docs/LAUNCH.md).
 
-```bash
-QWEN3_ASR_MODEL=".local/qwen-asr/Qwen3-ASR-1.7B-8bit" \
-QWEN3_ASR_LANGUAGE="Spanish" \
-.venv-qwen-asr/bin/python scripts/asr_qwen3_final.py recordings/tmp/final-seg-1778125017430-fgapizy-62903-82688.wav
-```
+GitHub Actions provides **manual source validation only**. Pushing this repository does not automatically publish installers or trigger a paid distribution workflow.
 
-### Preview v2 con Moonshine (opcional)
+## License
 
-Moonshine está apagado por defecto. Para probarlo explícitamente como preview experimental:
-
-```bash
-python3 -m venv .venv-moonshine
-.venv-moonshine/bin/python -m pip install -r requirements-moonshine.txt
-.venv-moonshine/bin/python scripts/asr_moonshine_preview.py .venv-moonshine/lib/python3.13/site-packages/moonshine_voice/assets/two_cities.wav
-ASR_PIPELINE_MODE=moonshine-qwen-v2 \
-ENABLE_EXPERIMENTAL_PREVIEW=true \
-MOONSHINE_ASR_CMD=".venv-moonshine/bin/python scripts/asr_moonshine_preview.py" \
-npm run dev
-```
-
----
-
-## Licencia
-
-MIT — ver [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The forest photograph used in the demo is credited in [landing assets](landing/public/ASSETS.md).

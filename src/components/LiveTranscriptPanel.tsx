@@ -4,6 +4,8 @@ import { TranscriptBrandIcon } from './TranscriptBrandIcon';
 const COPY_OK_MS = 2200;
 
 const NEAR_BOTTOM_PX = 56;
+const USER_SCROLL_COOLDOWN_MS = 180;
+const PROGRAMMATIC_SCROLL_IGNORE_MS = 120;
 
 function isScrollNearBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
@@ -11,7 +13,11 @@ function isScrollNearBottom(el: HTMLElement) {
 
 interface LiveTranscriptPanelProps {
   text: string;
+  committedText?: string;
+  provisionalText?: string;
   refinedText?: string;
+  /** Real engine in use: `Live/Final: Parakeet TDT v3` or `Fallback: Whisper Turbo`. */
+  engineLabel?: string;
   activeView: 'live' | 'refined';
   onViewChange: (view: 'live' | 'refined') => void;
   refinementAvailable: boolean;
@@ -86,7 +92,10 @@ function WaveIcon({ className }: { className?: string }) {
 
 export function LiveTranscriptPanel({
   text,
+  committedText,
+  provisionalText = '',
   refinedText = '',
+  engineLabel = 'Parakeet TDT v3',
   activeView,
   onViewChange,
   refinementAvailable,
@@ -95,15 +104,35 @@ export function LiveTranscriptPanel({
   onCopy,
   onMinimize,
 }: LiveTranscriptPanelProps) {
-  const displayText = activeView === 'refined' ? refinedText : text;
+  const liveCommitted = (committedText ?? text).trim();
+  const liveProvisional = provisionalText.trim();
+  const displayText = activeView === 'refined'
+    ? refinedText
+    : [liveCommitted, liveProvisional].filter(Boolean).join(' ');
   const scrollRef = useRef<HTMLDivElement>(null);
   const copyOkTimerRef = useRef(0);
   const [copyOk, setCopyOk] = useState(false);
+  const [hasNewContentBelow, setHasNewContentBelow] = useState(false);
   /** Si true, cada actualización de texto hace scroll al final; el usuario lo desactiva al subir y lo reactiva al volver al fondo. */
   const stickToBottomRef = useRef(true);
+  const previousScrollHeightRef = useRef(0);
+  const lastUserScrollAtRef = useRef(0);
+  const lastProgrammaticScrollAtRef = useRef(0);
+
+  const scrollToLiveEdge = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    lastProgrammaticScrollAtRef.current = performance.now();
+    el.scrollTop = el.scrollHeight;
+    previousScrollHeightRef.current = el.scrollHeight;
+    stickToBottomRef.current = true;
+    setHasNewContentBelow(false);
+  };
 
   useEffect(() => {
     stickToBottomRef.current = true;
+    previousScrollHeightRef.current = 0;
+    setHasNewContentBelow(false);
   }, [activeView]);
 
   useEffect(() => {
@@ -124,24 +153,51 @@ export function LiveTranscriptPanel({
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    stickToBottomRef.current = isScrollNearBottom(el);
+    const now = performance.now();
+    if (now - lastProgrammaticScrollAtRef.current > PROGRAMMATIC_SCROLL_IGNORE_MS) {
+      lastUserScrollAtRef.current = now;
+    }
+    const nearBottom = isScrollNearBottom(el);
+    stickToBottomRef.current = nearBottom;
+    if (nearBottom) setHasNewContentBelow(false);
   };
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (!el || !stickToBottomRef.current) return;
-    el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const previousHeight = previousScrollHeightRef.current;
+    const nextHeight = el.scrollHeight;
+    const heightDelta = previousHeight > 0 ? nextHeight - previousHeight : 0;
+    const userRecentlyScrolled = performance.now() - lastUserScrollAtRef.current < USER_SCROLL_COOLDOWN_MS;
+
+    if (stickToBottomRef.current && !userRecentlyScrolled) {
+      scrollToLiveEdge();
+      return;
+    }
+
+    if (!stickToBottomRef.current && heightDelta > 0) {
+      setHasNewContentBelow(true);
+    }
+    previousScrollHeightRef.current = nextHeight;
   }, [displayText, activeView]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const ro = new ResizeObserver(() => {
-      if (stickToBottomRef.current) {
-        el.scrollTop = el.scrollHeight;
+      const previousHeight = previousScrollHeightRef.current;
+      const nextHeight = el.scrollHeight;
+      const heightDelta = previousHeight > 0 ? nextHeight - previousHeight : 0;
+      const userRecentlyScrolled = performance.now() - lastUserScrollAtRef.current < USER_SCROLL_COOLDOWN_MS;
+      if (stickToBottomRef.current && !userRecentlyScrolled) {
+        scrollToLiveEdge();
+      } else if (!stickToBottomRef.current && heightDelta > 0) {
+        setHasNewContentBelow(true);
       }
+      previousScrollHeightRef.current = nextHeight;
     });
     ro.observe(el);
+    previousScrollHeightRef.current = el.scrollHeight;
     return () => ro.disconnect();
   }, []);
 
@@ -201,12 +257,32 @@ export function LiveTranscriptPanel({
         aria-live="polite"
         onScroll={onScroll}
       >
-        {displayText.trim() ? (
-          <p className="transcript-panel-text">{displayText}</p>
+        {activeView === 'refined' ? (
+          refinedText.trim() ? (
+            <p className="transcript-panel-text">{refinedText}</p>
+          ) : (
+            <p className="transcript-panel-placeholder">La transcripción aparecerá aquí cuando empieces a grabar.</p>
+          )
+        ) : liveCommitted || liveProvisional ? (
+          <p className="transcript-panel-text">
+            {liveCommitted ? <span>{liveCommitted}</span> : null}
+            {liveProvisional ? (
+              <>
+                {liveCommitted ? ' ' : null}
+                <span className="transcript-provisional">{liveProvisional}</span>
+              </>
+            ) : null}
+          </p>
         ) : (
           <p className="transcript-panel-placeholder">La transcripción aparecerá aquí cuando empieces a grabar.</p>
         )}
       </div>
+
+      {hasNewContentBelow ? (
+        <button type="button" className="transcript-live-edge-btn" onClick={scrollToLiveEdge}>
+          Ir al final
+        </button>
+      ) : null}
 
       <footer className="transcript-panel-foot">
         <div className="transcript-foot-lines">
@@ -215,7 +291,7 @@ export function LiveTranscriptPanel({
         </div>
         <span className="transcript-foot-engine">
           <WaveIcon />
-          Whisper Large V3 Turbo
+          {engineLabel}
         </span>
       </footer>
     </section>

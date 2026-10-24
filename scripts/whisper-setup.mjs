@@ -7,6 +7,8 @@ const localDir = path.join(root, '.local');
 const whisperRoot = path.join(localDir, 'whisper.cpp');
 const modelsDir = path.join(localDir, 'models');
 const repoUrl = 'https://github.com/ggml-org/whisper.cpp.git';
+const bundledCmake = path.join(root, '.venv-asr', 'bin', 'cmake');
+const cmake = fs.existsSync(bundledCmake) ? bundledCmake : 'cmake';
 
 fs.mkdirSync(localDir, { recursive: true });
 fs.mkdirSync(modelsDir, { recursive: true });
@@ -17,8 +19,8 @@ if (!fs.existsSync(whisperRoot)) {
   run('git', ['pull', '--ff-only'], whisperRoot);
 }
 
-run('cmake', ['-B', 'build', '-S', '.', '-DCMAKE_BUILD_TYPE=Release'], whisperRoot);
-run('cmake', ['--build', 'build', '--config', 'Release', '-j'], whisperRoot);
+run(cmake, ['-B', 'build', '-S', '.', '-DCMAKE_BUILD_TYPE=Release'], whisperRoot);
+run(cmake, ['--build', 'build', '--config', 'Release', '-j'], whisperRoot);
 
 const modelPath = path.join(modelsDir, 'ggml-base.bin');
 if (!fs.existsSync(modelPath)) {

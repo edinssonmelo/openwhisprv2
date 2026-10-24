@@ -1,10 +1,15 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, globalShortcut, ipcMain, screen, session, systemPreferences } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, globalShortcut, ipcMain, screen, session, shell, systemPreferences } from 'electron';
 import { spawn, spawnSync, ChildProcessByStdio, ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
+import { initUpdater } from './updater';
+import { registerTelemetryIpc } from './telemetry';
+import { registerSessionsIpc } from './db';
+import { AsrSessionManager } from './asr/asrSessionManager';
+import type { AsrLanguageCode, AsrSource } from './asr/protocol';
 
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 /** Transparent always-on-top overlay (see README / user env). Default off = normal framed window for dev. */
@@ -30,7 +35,7 @@ const MINIMAL_TRANSCRIPTION_PROMPT = [
 ].join(' ');
 
 type WhisperPromptMode = 'empty' | 'minimal' | 'contextual';
-type AsrPipelineMode = 'baseline-whisper' | 'moonshine-qwen-v2';
+type AsrPipelineMode = 'baseline-whisper' | 'moonshine-qwen-v2' | 'nemotron-whisper';
 type AsrFinalEngineMode = 'whisper' | 'qwen' | 'compare';
 type TranscriptRefinementMode = 'off' | 'whisper-only' | 'whisper-qwen';
 
@@ -127,6 +132,90 @@ let coreAudioTapHelperProcess: ChildProcessByStdio<null, Readable, Readable> | n
 let coreAudioTapHelperStdoutBuffer = Buffer.alloc(0);
 let coreAudioTapHelperChunkSequence = 0;
 
+type NemotronPendingRequest = {
+  startedAt: number;
+  resolve: (result: ExternalAsrResult) => void;
+  timeout: NodeJS.Timeout;
+};
+
+let nemotronWorkerProcess: ChildProcessWithoutNullStreams | null = null;
+let nemotronWorkerStdoutBuffer = '';
+let nemotronWorkerReadyPromise: Promise<void> | null = null;
+let nemotronWorkerReady = false;
+let resolveNemotronWorkerReady: (() => void) | null = null;
+let rejectNemotronWorkerReady: ((error: Error) => void) | null = null;
+const nemotronPendingRequests = new Map<string, NemotronPendingRequest>();
+let nemotronRequestSequence = 0;
+
+function getRuntimeAssetRoot() {
+  const configured = process.env.OPENWHISPR_ASSET_ROOT?.trim();
+  if (configured) return configured;
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'app-assets')
+    : process.cwd();
+}
+
+function getRuntimeDataRoot() {
+  const configured = process.env.OPENWHISPR_DATA_ROOT?.trim();
+  if (configured) return configured;
+  return app.isPackaged
+    ? app.getPath('userData')
+    : process.cwd();
+}
+
+function getRuntimeWorkingDirectory() {
+  return getRuntimeAssetRoot();
+}
+
+let asrManager: AsrSessionManager | null = null;
+
+function getMacosAsrHelperPath() {
+  return path.join(getRuntimeAssetRoot(), 'tools', 'macos-asr-helper', '.build', 'release', 'openwhispr-asr-helper');
+}
+
+function getParakeetModelDir() {
+  // Packaged beta ships its speech model; keep user-installed models as the first choice.
+  const candidates = [getRuntimeDataRoot(), getRuntimeAssetRoot()].map((root) =>
+    path.join(root, '.local', 'models', 'parakeet-tdt-0.6b-v3'));
+  return candidates.find((candidate) => fsSync.existsSync(path.join(candidate, 'config.json'))) ?? candidates[0];
+}
+
+/** Single owner of the ASR engines (Parakeet helper + whisper.cpp fallback) and the active live session. */
+function getAsrManager(): AsrSessionManager {
+  if (asrManager) return asrManager;
+  const whisperPaths = getWhisperPaths();
+  const whisperModel = resolveWhisperModel();
+  const serverPath = path.join(path.dirname(whisperPaths.cliPath), process.platform === 'win32' ? 'whisper-server.exe' : 'whisper-server');
+  asrManager = new AsrSessionManager({
+    helperPath: getMacosAsrHelperPath(),
+    modelDir: getParakeetModelDir(),
+    whisper: whisperModel
+      ? { cliPath: whisperPaths.cliPath, serverPath: fsSync.existsSync(serverPath) ? serverPath : null, modelPath: whisperModel.path }
+      : null,
+    send: (channel, payload) => {
+      mainWindow?.webContents.send(channel, payload);
+    },
+    log: (scope, data) => debugLog(scope, data),
+  });
+  return asrManager;
+}
+
+/** Native system-audio helpers deliver interleaved float32; feed the live session directly (no renderer hop). */
+function feedSystemAudioToAsr(payload: Buffer, channels: number, sampleRate: number, frameCount: number) {
+  if (!asrManager?.systemAudioWanted) return;
+  const sampleCount = frameCount * channels;
+  if (payload.byteLength < sampleCount * 4) return;
+  const pcm = new Float32Array(sampleCount);
+  Buffer.from(pcm.buffer).set(payload.subarray(0, sampleCount * 4));
+  asrManager.pushSystemAudioInterleaved(pcm, channels, sampleRate);
+}
+
+function joinQuotedCommand(command: string, ...args: string[]) {
+  return [command, ...args]
+    .map((segment) => (/[\s"']/u.test(segment) ? `"${segment.replace(/"/g, '\\"')}"` : segment))
+    .join(' ');
+}
+
 const DASHBOARD_WINDOW_WIDTH = 1200;
 const DASHBOARD_WINDOW_HEIGHT = 720;
 const DASHBOARD_MIN_WIDTH = 598;
@@ -155,7 +244,7 @@ function debugLog(scope: string, data?: unknown) {
 
 function getMacosSystemAudioHelperPath() {
   return path.join(
-    process.cwd(),
+    getRuntimeAssetRoot(),
     'tools',
     'macos-system-audio-helper',
     '.build',
@@ -185,7 +274,7 @@ function checkMacosSystemAudioHelper() {
 
 function getMacosCoreAudioTapHelperPath() {
   return path.join(
-    process.cwd(),
+    getRuntimeAssetRoot(),
     'tools',
     'macos-coreaudio-tap-helper',
     '.build',
@@ -269,6 +358,7 @@ function parseSystemAudioHelperStdout(data: Buffer) {
       });
     }
 
+    feedSystemAudioToAsr(payload, channels, sampleRate, frameCount);
     mainWindow?.webContents.send('system-audio-helper:chunk', {
       sequence: systemAudioHelperChunkSequence,
       version,
@@ -293,7 +383,7 @@ function startSystemAudioHelper() {
   systemAudioHelperStdoutBuffer = Buffer.alloc(0);
   systemAudioHelperChunkSequence = 0;
   const child = spawn(check.path, [], {
-    cwd: process.cwd(),
+    cwd: getRuntimeWorkingDirectory(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   systemAudioHelperProcess = child;
@@ -392,6 +482,7 @@ function parseCoreAudioTapHelperStdout(data: Buffer) {
       });
     }
 
+    feedSystemAudioToAsr(payload, channels, sampleRate, frameCount);
     mainWindow?.webContents.send('core-audio-tap-helper:chunk', {
       sequence: coreAudioTapHelperChunkSequence,
       version,
@@ -416,7 +507,7 @@ function startCoreAudioTapHelper() {
   coreAudioTapHelperStdoutBuffer = Buffer.alloc(0);
   coreAudioTapHelperChunkSequence = 0;
   const child = spawn(check.path, ['--stream'], {
-    cwd: process.cwd(),
+    cwd: getRuntimeWorkingDirectory(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   coreAudioTapHelperProcess = child;
@@ -517,9 +608,6 @@ function expandSessionOverlayToFullDisplay() {
   mainWindow.setMinimumSize(520, 300);
   mainWindow.setResizable(true);
   mainWindow.setBackgroundColor('#00000000');
-  setTimeout(() => {
-    mainWindow?.setBackgroundColor('#00000000');
-  }, 0);
   debugLog('window:mode', { mode: 'session', phase: 'expanded', bounds: mainWindow.getBounds() });
 }
 
@@ -775,6 +863,28 @@ function registerIpc() {
     return { ok: false };
   });
 
+  ipcMain.handle('window:minimize', () => {
+    if (!mainWindow) return { ok: false };
+    mainWindow.minimize();
+    return { ok: true };
+  });
+
+  ipcMain.handle('window:maximize-toggle', () => {
+    if (!mainWindow) return { ok: false, maximized: false };
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+      return { ok: true, maximized: false };
+    }
+    mainWindow.maximize();
+    return { ok: true, maximized: true };
+  });
+
+  ipcMain.handle('window:close', () => {
+    if (!mainWindow) return { ok: false };
+    mainWindow.close();
+    return { ok: true };
+  });
+
   ipcMain.on('window:session-overlay-expand', () => {
     if (!OPENWHISPR_OVERLAY_WINDOW || !mainWindow) return;
     if (currentWindowMode !== 'session') return;
@@ -800,6 +910,35 @@ function registerIpc() {
       return { ok: true };
     } catch {
       return { ok: false };
+    }
+  });
+
+  ipcMain.handle('audio:ensure-microphone-access', async () => {
+    if (process.platform !== 'darwin') {
+      return { ok: true, status: 'n/a' as const };
+    }
+    const before = systemPreferences.getMediaAccessStatus('microphone');
+    if (before === 'granted') {
+      return { ok: true, status: 'granted' as const };
+    }
+    if (before === 'denied' || before === 'restricted') {
+      await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');
+      return { ok: false, status: before };
+    }
+
+    const win = mainWindow;
+    const wasVisible = Boolean(win && !win.isDestroyed() && win.isVisible());
+    if (wasVisible) win?.hide();
+    try {
+      const granted = await systemPreferences.askForMediaAccess('microphone');
+      const after = systemPreferences.getMediaAccessStatus('microphone');
+      debugLog('media:ensure-microphone-access', { before, granted, after });
+      return { ok: granted && after === 'granted', status: after };
+    } finally {
+      if (wasVisible && win && !win.isDestroyed()) {
+        win.show();
+        win.focus();
+      }
     }
   });
 
@@ -863,7 +1002,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('files:save-wav', async (_event, payload: { bytes: Uint8Array; fileName?: string }) => {
-    const recordingsDir = path.join(process.cwd(), 'recordings');
+    const recordingsDir = path.join(getRuntimeDataRoot(), 'recordings');
     await fs.mkdir(recordingsDir, { recursive: true });
 
     const safeName = (payload.fileName || `audio-test-${new Date().toISOString()}.wav`)
@@ -878,6 +1017,42 @@ function registerIpc() {
       path: filePath,
       fileUrl: pathToFileURL(filePath).toString(),
     };
+  });
+
+  ipcMain.handle('asr:status', () => getAsrManager().status());
+
+  ipcMain.handle('asr:prepare', () => getAsrManager().prepare());
+
+  ipcMain.handle('asr:start', (_event, payload: {
+    sessionId: string;
+    generation: number;
+    language: AsrLanguageCode;
+    sources: { mic: boolean; system: boolean };
+  }) => {
+    return getAsrManager().start(payload);
+  });
+
+  ipcMain.handle('asr:stop', async (_event, payload?: { reason?: string }) => {
+    const drained = await getAsrManager().stop(payload?.reason ?? 'renderer-stop');
+    return { ok: true, drained, status: getAsrManager().status() };
+  });
+
+  // Fire-and-forget mono PCM from the renderer (mic). Typed arrays cross IPC via structured clone.
+  ipcMain.on('asr:push', (_event, payload: {
+    sessionId: string;
+    generation: number;
+    source: AsrSource;
+    sampleRate: number;
+    pcm: Float32Array | ArrayBuffer | Uint8Array;
+  }) => {
+    if (!asrManager) return;
+    const raw = payload.pcm;
+    const pcm = raw instanceof Float32Array
+      ? raw
+      : raw instanceof ArrayBuffer
+        ? new Float32Array(raw)
+        : new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+    asrManager.pushAudio(payload.sessionId, payload.generation, payload.source, pcm, payload.sampleRate);
   });
 
   ipcMain.handle('transcription:check-setup', () => {
@@ -911,7 +1086,7 @@ function registerIpc() {
     mode?: 'preview' | 'final' | 'benchmark';
     /** When set with mode preview/final, selects ggml model order for that ASR path (safeBaseline dual-model). */
     modelRole?: 'preview' | 'final';
-    language?: 'es' | 'auto';
+    language?: 'es' | 'en' | 'auto';
     /** When true: empty prompt, no session glossary, no transcription context pack (fidelity path). */
     verbatimOnly?: boolean;
     /** Preview only: `fast` uses small→base→turbo; `same-as-final` uses final model order (default). */
@@ -955,28 +1130,70 @@ function registerIpc() {
 }
 
 function getWhisperPaths() {
-  const root = process.cwd();
-  const whisperRoot = path.join(root, '.local', 'whisper.cpp');
-  const cliPath = process.platform === 'win32'
-    ? path.join(whisperRoot, 'build', 'bin', 'Release', 'whisper-cli.exe')
-    : path.join(whisperRoot, 'build', 'bin', 'whisper-cli');
-  const modelPath = path.join(root, '.local', 'models', 'ggml-base.bin');
-  const modelsDir = path.join(root, '.local', 'models');
+  const assetRoot = getRuntimeAssetRoot();
+  const dataRoot = getRuntimeDataRoot();
+  const localRoots = Array.from(new Set([dataRoot, assetRoot]));
+  const cliCandidates = localRoots.map((root) => {
+    const whisperRoot = path.join(root, '.local', 'whisper.cpp');
+    return process.platform === 'win32'
+      ? path.join(whisperRoot, 'build', 'bin', 'Release', 'whisper-cli.exe')
+      : path.join(whisperRoot, 'build', 'bin', 'whisper-cli');
+  });
+  const modelRoots = localRoots.map((root) => path.join(root, '.local', 'models'));
+  const cliPath = cliCandidates.find((candidate) => fsSync.existsSync(candidate)) ?? cliCandidates[0];
+  const modelsDir = modelRoots.find((candidate) => fsSync.existsSync(candidate)) ?? modelRoots[0];
+  const whisperRoot = path.dirname(path.dirname(path.dirname(cliPath)));
+  const modelPath = path.join(modelsDir, 'ggml-base.bin');
   return {
-    root,
+    root: dataRoot,
+    assetRoot,
+    dataRoot,
     whisperRoot,
     cliPath,
     modelPath,
     modelsDir,
-    tmpDir: path.join(root, 'recordings', 'tmp'),
+    modelRoots,
+    cliCandidates,
+    tmpDir: path.join(dataRoot, 'recordings', 'tmp'),
+  };
+}
+
+function getNemotronPaths() {
+  const dataRoot = getRuntimeDataRoot();
+  const scriptPath = path.join(getRuntimeAssetRoot(), 'scripts', 'asr_nemotron_worker.py');
+  const pythonPath = process.platform === 'win32'
+    ? path.join(dataRoot, '.venv-asr', 'Scripts', 'python.exe')
+    : path.join(dataRoot, '.venv-asr', 'bin', 'python');
+  return { pythonPath, scriptPath };
+}
+
+function getNemotronSetupStatus() {
+  const { pythonPath, scriptPath } = getNemotronPaths();
+  const supported = process.platform === 'darwin' && process.arch === 'arm64';
+  const pythonOk = fsSync.existsSync(pythonPath);
+  const scriptOk = fsSync.existsSync(scriptPath);
+  return {
+    ok: supported && pythonOk && scriptOk,
+    supported,
+    pythonPath,
+    scriptPath,
+    message: !supported
+      ? 'Nemotron MLX requiere un Mac con Apple Silicon.'
+      : !pythonOk
+        ? 'Nemotron no está instalado. Ejecuta npm run asr:setup:nemotron.'
+        : !scriptOk
+          ? 'No se encontró scripts/asr_nemotron_worker.py.'
+          : 'Nemotron Streaming 0.6B listo para preview en vivo.',
   };
 }
 
 function resolveWhisperModel(): { name: string; path: string } | null {
   const paths = getWhisperPaths();
-  for (const name of WHISPER_MODEL_ORDER) {
-    const modelPath = path.join(paths.modelsDir, `ggml-${name}.bin`);
-    if (fsSync.existsSync(modelPath)) return { name, path: modelPath };
+  for (const modelsDir of paths.modelRoots) {
+    for (const name of WHISPER_MODEL_ORDER) {
+      const modelPath = path.join(modelsDir, `ggml-${name}.bin`);
+      if (fsSync.existsSync(modelPath)) return { name, path: modelPath };
+    }
   }
   return null;
 }
@@ -984,6 +1201,7 @@ function resolveWhisperModel(): { name: string; path: string } | null {
 function getWhisperSetupStatus() {
   const paths = getWhisperPaths();
   const asrConfig = getAsrConfig();
+  const nemotron = getNemotronSetupStatus();
   const ffmpegOk = commandExists('ffmpeg');
   const cliOk = fsSync.existsSync(paths.cliPath);
   const candidates = WHISPER_MODEL_ORDER.map((name) => {
@@ -996,32 +1214,56 @@ function getWhisperSetupStatus() {
   });
   const resolved = resolveWhisperModel();
   const modelOk = Boolean(resolved);
-  const ok = ffmpegOk && cliOk && modelOk;
+  // whisper-cli transcribes the WAV directly; ffmpeg is not required at runtime.
+  const whisperOk = cliOk && modelOk;
   const missing = [
-    !ffmpegOk ? 'ffmpeg' : null,
     !cliOk ? 'whisper-cli' : null,
     !modelOk ? 'ggml-large-v3-turbo.bin' : null,
   ].filter(Boolean);
+  if (!ffmpegOk) {
+    debugLog('whisper:ffmpeg-missing', 'ffmpeg is not on PATH; transcription still runs on WAV input.');
+  }
+  const manager = getAsrManager();
+  const parakeetHelperConfigured = manager.helperConfigured;
+  const parakeetModelsPresent = manager.modelsPresent();
+  // Live transcription needs at least one engine: Parakeet (primary) or whisper.cpp (fallback, finals only).
+  const ok = parakeetHelperConfigured || whisperOk;
 
   return {
     ok,
+    whisperOk,
+    parakeetHelperConfigured,
+    parakeetModelsPresent,
+    parakeetHelperPath: getMacosAsrHelperPath(),
+    parakeetModelDir: getParakeetModelDir(),
+    asr: manager.status(),
     missing,
     cliPath: paths.cliPath,
     modelPath: resolved?.path ?? path.join(paths.modelsDir, 'ggml-large-v3-turbo.bin'),
     activeModelName: resolved?.name ?? null,
-    previewModelName: asrConfig.pipelineMode === 'moonshine-qwen-v2' && asrConfig.experimentalPreview && asrConfig.moonshineCmd ? 'moonshine' : null,
+    previewModelName: asrConfig.pipelineMode === 'nemotron-whisper' && nemotron.ok
+      ? 'nemotron-3.5-asr-streaming-0.6b-8bit'
+      : asrConfig.pipelineMode === 'moonshine-qwen-v2' && asrConfig.experimentalPreview && asrConfig.moonshineCmd
+        ? 'moonshine'
+        : null,
     finalModelName: asrConfig.finalEngine === 'qwen' && asrConfig.qwenCmd ? 'qwen3-asr' : (resolved?.name ?? null),
     modelCandidates: candidates,
     pipelineMode: asrConfig.pipelineMode,
     moonshineConfigured: Boolean(asrConfig.experimentalPreview && asrConfig.moonshineCmd),
+    nemotronConfigured: Boolean(asrConfig.experimentalPreview && nemotron.ok),
+    nemotronMessage: nemotron.message,
     qwenConfigured: Boolean(asrConfig.qwenCmd),
     experimentalPreview: asrConfig.experimentalPreview,
     finalEngine: asrConfig.finalEngine,
     refinementMode: asrConfig.refinementMode,
     refinerModel: POLISHER_MODEL,
-    message: ok
-      ? `Whisper listo (large-v3-turbo). Pipeline: ${asrConfig.pipelineMode}.`
-      : `Whisper no está listo. Ejecuta npm run whisper:setup:turbo. Falta: ${missing.join(', ')}`,
+    message: parakeetHelperConfigured
+      ? parakeetModelsPresent
+        ? `Parakeet TDT v3 listo${whisperOk ? ' · fallback Whisper Turbo disponible' : ' · sin fallback Whisper'}.`
+        : 'Parakeet listo para descargar el modelo en el primer uso (~600 MB).'
+      : whisperOk
+        ? 'Solo Whisper Turbo (sin preview en vivo). Ejecuta npm run asr:setup para activar Parakeet.'
+        : `Sin motor ASR. Ejecuta npm run asr:setup${missing.length ? ` (Whisper falta: ${missing.join(', ')})` : ''}.`,
   };
 }
 
@@ -1034,7 +1276,11 @@ function getAsrConfig(): {
   refinementMode: TranscriptRefinementMode;
 } {
   const requested = process.env.ASR_PIPELINE_MODE;
-  const pipelineMode: AsrPipelineMode = requested === 'moonshine-qwen-v2' ? 'moonshine-qwen-v2' : 'baseline-whisper';
+  const pipelineMode: AsrPipelineMode = requested === 'nemotron-whisper'
+    ? 'nemotron-whisper'
+    : requested === 'moonshine-qwen-v2'
+      ? 'moonshine-qwen-v2'
+      : 'baseline-whisper';
   const requestedFinalEngine = process.env.ASR_FINAL_ENGINE;
   const finalEngine: AsrFinalEngineMode = requestedFinalEngine === 'qwen' || requestedFinalEngine === 'compare'
     ? requestedFinalEngine
@@ -1043,9 +1289,15 @@ function getAsrConfig(): {
   const refinementMode: TranscriptRefinementMode = requestedRefinementMode === 'whisper-only' || requestedRefinementMode === 'whisper-qwen'
     ? requestedRefinementMode
     : 'off';
-  const defaultQwenCmd = fsSync.existsSync(path.join(process.cwd(), 'scripts', 'asr_qwen3_final.py'))
-    && fsSync.existsSync(path.join(process.cwd(), '.venv-qwen-asr', 'bin', 'python'))
-    ? DEFAULT_QWEN_ASR_CMD
+  const assetRoot = getRuntimeAssetRoot();
+  const dataRoot = getRuntimeDataRoot();
+  const qwenScriptPath = path.join(assetRoot, 'scripts', 'asr_qwen3_final.py');
+  const qwenPythonPath = process.platform === 'win32'
+    ? path.join(dataRoot, '.venv-qwen-asr', 'Scripts', 'python.exe')
+    : path.join(dataRoot, '.venv-qwen-asr', 'bin', 'python');
+  const defaultQwenCmd = fsSync.existsSync(qwenScriptPath)
+    && fsSync.existsSync(qwenPythonPath)
+    ? joinQuotedCommand(qwenPythonPath, qwenScriptPath)
     : null;
   return {
     pipelineMode,
@@ -1064,7 +1316,7 @@ function commandExists(command: string) {
 }
 
 function loadTranscriptionContextPack() {
-  const contextPath = path.join(process.cwd(), 'config', 'transcription-context.json');
+  const contextPath = path.join(getRuntimeAssetRoot(), 'config', 'transcription-context.json');
   try {
     const parsed = JSON.parse(fsSync.readFileSync(contextPath, 'utf8')) as Partial<TranscriptionContextPack>;
     return normalizeContextPack(parsed);
@@ -1316,7 +1568,7 @@ function sanitizeWhisperCliArgsForLog(args: string[]): string[] {
 }
 
 type WhisperInvocationDebug = {
-  language: 'es' | 'auto';
+  language: 'es' | 'en' | 'auto';
   promptLength: number;
   verbatimOnly: boolean;
   translateEnabled: false;
@@ -1330,6 +1582,186 @@ type ExternalAsrResult = {
   stderr: string;
   error?: string;
 };
+
+function settleNemotronRequest(message: {
+  type?: string;
+  id?: string;
+  text?: string;
+  durationMs?: number;
+  error?: string;
+  model?: string;
+}) {
+  if (message.type === 'ready') {
+    nemotronWorkerReady = true;
+    resolveNemotronWorkerReady?.();
+    resolveNemotronWorkerReady = null;
+    rejectNemotronWorkerReady = null;
+    debugLog('nemotron:ready', { model: message.model });
+    return;
+  }
+  if (message.type === 'fatal') {
+    rejectNemotronWorkerReady?.(new Error(message.error ?? 'Nemotron worker failed to start.'));
+    return;
+  }
+  if (!message.id) return;
+  const pending = nemotronPendingRequests.get(message.id);
+  if (!pending) return;
+  clearTimeout(pending.timeout);
+  nemotronPendingRequests.delete(message.id);
+  pending.resolve({
+    ok: message.type === 'result',
+    text: message.text ?? '',
+    durationMs: message.durationMs ?? (Date.now() - pending.startedAt),
+    stderr: '',
+    error: message.type === 'result' ? undefined : (message.error ?? 'Nemotron preview failed.'),
+  });
+}
+
+function handleNemotronStdout(chunk: Buffer) {
+  nemotronWorkerStdoutBuffer += chunk.toString('utf8');
+  const lines = nemotronWorkerStdoutBuffer.split('\n');
+  nemotronWorkerStdoutBuffer = lines.pop() ?? '';
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      settleNemotronRequest(JSON.parse(trimmed) as Parameters<typeof settleNemotronRequest>[0]);
+    } catch {
+      debugLog('nemotron:invalid-output', trimmed.slice(0, 500));
+    }
+  }
+}
+
+function stopNemotronWorker(reason: string) {
+  const worker = nemotronWorkerProcess;
+  nemotronWorkerProcess = null;
+  nemotronWorkerReady = false;
+  nemotronWorkerReadyPromise = null;
+  resolveNemotronWorkerReady = null;
+  rejectNemotronWorkerReady = null;
+  nemotronWorkerStdoutBuffer = '';
+  if (worker && !worker.killed) {
+    worker.stdin.write(`${JSON.stringify({ type: 'stop' })}\n`);
+    worker.kill('SIGTERM');
+  }
+  for (const [id, pending] of nemotronPendingRequests) {
+    clearTimeout(pending.timeout);
+    pending.resolve({
+      ok: false,
+      text: '',
+      durationMs: Date.now() - pending.startedAt,
+      stderr: '',
+      error: `Nemotron worker stopped (${reason}).`,
+    });
+    nemotronPendingRequests.delete(id);
+  }
+  debugLog('nemotron:stopped', { reason });
+}
+
+function startNemotronWorker(): Promise<void> {
+  if (nemotronWorkerReadyPromise) return nemotronWorkerReadyPromise;
+  const setup = getNemotronSetupStatus();
+  if (!setup.ok) return Promise.reject(new Error(setup.message));
+
+  nemotronWorkerReadyPromise = new Promise<void>((resolve, reject) => {
+    resolveNemotronWorkerReady = resolve;
+    rejectNemotronWorkerReady = reject;
+  });
+
+  const worker = spawn(setup.pythonPath, [setup.scriptPath], {
+    cwd: getRuntimeWorkingDirectory(),
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  nemotronWorkerProcess = worker;
+  worker.stdout.on('data', handleNemotronStdout);
+  worker.stderr.on('data', (chunk: Buffer) => {
+    const text = chunk.toString('utf8').trim();
+    if (text) debugLog('nemotron:stderr', text.slice(-2000));
+  });
+  worker.on('error', (error) => {
+    rejectNemotronWorkerReady?.(error);
+    stopNemotronWorker(`error: ${String(error)}`);
+  });
+  worker.on('exit', (code, signal) => {
+    if (nemotronWorkerProcess === worker) {
+      rejectNemotronWorkerReady?.(new Error(`Nemotron exited (${code ?? signal ?? 'unknown'}).`));
+      stopNemotronWorker(`exit: ${code ?? signal ?? 'unknown'}`);
+    }
+  });
+  debugLog('nemotron:starting', {
+    pythonPath: setup.pythonPath,
+    scriptPath: setup.scriptPath,
+  });
+  return nemotronWorkerReadyPromise;
+}
+
+async function runNemotronPreview(wavPath: string, language: 'es' | 'en' | 'auto'): Promise<ExternalAsrResult> {
+  const startedAt = Date.now();
+  if (!nemotronWorkerReady) {
+    void startNemotronWorker().catch((error) => {
+      debugLog('nemotron:start-error', String(error));
+    });
+    return {
+      ok: false,
+      text: '',
+      durationMs: Date.now() - startedAt,
+      stderr: '',
+      error: 'Nemotron se está cargando; el texto en vivo aparecerá en unos segundos.',
+    };
+  }
+  const worker = nemotronWorkerProcess;
+  if (!worker || worker.killed) {
+    return {
+      ok: false,
+      text: '',
+      durationMs: 0,
+      stderr: '',
+      error: 'Nemotron worker is not running.',
+    };
+  }
+
+  const id = `nemotron-${Date.now()}-${nemotronRequestSequence += 1}`;
+  return new Promise<ExternalAsrResult>((resolve) => {
+    const timeout = setTimeout(() => {
+      nemotronPendingRequests.delete(id);
+      resolve({
+        ok: false,
+        text: '',
+        durationMs: Date.now() - startedAt,
+        stderr: '',
+        error: 'Nemotron preview timed out.',
+      });
+    }, 30_000);
+    nemotronPendingRequests.set(id, { startedAt, resolve, timeout });
+    worker.stdin.write(`${JSON.stringify({ id, audioPath: wavPath, language })}\n`);
+  });
+}
+
+async function runNemotronFinal(wavPath: string, language: 'es' | 'en' | 'auto'): Promise<ExternalAsrResult> {
+  const startedAt = Date.now();
+  let startupTimeout: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      startNemotronWorker(),
+      new Promise<never>((_resolve, reject) => {
+        startupTimeout = setTimeout(() => reject(new Error('Nemotron startup timed out.')), 120_000);
+      }),
+    ]);
+    return runNemotronPreview(wavPath, language);
+  } catch (error) {
+    return {
+      ok: false,
+      text: '',
+      durationMs: Date.now() - startedAt,
+      stderr: '',
+      error: String(error),
+    };
+  } finally {
+    if (startupTimeout) clearTimeout(startupTimeout);
+  }
+}
 
 async function transcribeBlock(payload: {
   blockId: string;
@@ -1346,7 +1778,7 @@ async function transcribeBlock(payload: {
   promptMode?: WhisperPromptMode;
   mode?: 'preview' | 'final' | 'benchmark';
   modelRole?: 'preview' | 'final';
-  language?: 'es' | 'auto';
+  language?: 'es' | 'en' | 'auto';
   verbatimOnly?: boolean;
   previewModelPolicy?: 'same-as-final' | 'fast';
 }) {
@@ -1361,6 +1793,41 @@ async function transcribeBlock(payload: {
   const asrConfig = getAsrConfig();
 
   try {
+    if (asrConfig.pipelineMode === 'nemotron-whisper' && payload.mode === 'preview') {
+      const setup = getNemotronSetupStatus();
+      if (!asrConfig.experimentalPreview || !setup.ok) {
+        return {
+          ok: false,
+          blockId: payload.blockId,
+          durationMs: Date.now() - startedAt,
+          error: !asrConfig.experimentalPreview
+            ? 'Nemotron preview desactivado (ENABLE_EXPERIMENTAL_PREVIEW=false).'
+            : setup.message,
+          modelName: 'nemotron-3.5-asr-streaming-0.6b-8bit',
+        };
+      }
+      const external = await runNemotronPreview(wavPath, payload.language ?? 'auto');
+      debugLog('transcription:external-preview-result', {
+        blockId: payload.blockId,
+        engineUsed: 'nemotron-3.5-asr-streaming',
+        durationMs: external.durationMs,
+        ok: external.ok,
+        error: external.error,
+      });
+      return {
+        ok: external.ok,
+        blockId: payload.blockId,
+        durationMs: external.durationMs,
+        text: external.text,
+        error: external.error,
+        stderr: summarizeStderr(external.stderr),
+        modelName: 'nemotron-3.5-asr-streaming-0.6b-8bit',
+        modelPath: process.env.NEMOTRON_ASR_MODEL ?? 'mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit',
+        engineUsed: 'nemotron-3.5-asr-streaming',
+        fallbackUsed: false,
+      };
+    }
+
     if (asrConfig.pipelineMode === 'moonshine-qwen-v2' && payload.mode === 'preview') {
       if (!asrConfig.experimentalPreview || !asrConfig.moonshineCmd) {
         return {
@@ -1455,6 +1922,20 @@ async function transcribeBlock(payload: {
 
     const setup = getWhisperSetupStatus();
     if (!setup.ok) {
+      if (asrConfig.pipelineMode === 'nemotron-whisper' && getNemotronSetupStatus().ok) {
+        const fallback = await runNemotronFinal(wavPath, payload.language ?? 'auto');
+        return {
+          ok: fallback.ok,
+          blockId: payload.blockId,
+          durationMs: fallback.durationMs,
+          text: fallback.text,
+          error: fallback.error,
+          modelName: 'nemotron-3.5-asr-streaming-0.6b-8bit',
+          engineUsed: 'nemotron-3.5-asr-streaming',
+          fallbackUsed: true,
+          fallbackReason: setup.message,
+        };
+      }
       return {
         ok: false,
         blockId: payload.blockId,
@@ -1501,8 +1982,8 @@ async function transcribeBlock(payload: {
     '-nf',
     '-np',
   ];
-  if (language === 'es') {
-    args.push('-l', 'es');
+  if (language !== 'auto') {
+    args.push('-l', language);
   }
   // language === 'auto': omit -l (whisper.cpp default often biases to English). This app never passes --translate / translation task.
   if (transcriptionPrompt) {
@@ -1562,6 +2043,26 @@ async function transcribeBlock(payload: {
     });
 
     if (result.exitCode !== 0) {
+      if (asrConfig.pipelineMode === 'nemotron-whisper' && getNemotronSetupStatus().ok) {
+        const fallback = await runNemotronFinal(wavPath, language);
+        if (fallback.ok) {
+          return {
+            ok: true,
+            blockId: payload.blockId,
+            durationMs: Date.now() - startedAt,
+            text: fallback.text,
+            resolvedText: undefined,
+            replacements: [],
+            whisperPromptLength: transcriptionPrompt.length,
+            stderr: stderrSummary,
+            modelName: 'nemotron-3.5-asr-streaming-0.6b-8bit',
+            engineUsed: 'nemotron-3.5-asr-streaming',
+            fallbackUsed: true,
+            fallbackReason: stderrSummary || `whisper-cli exited with code ${result.exitCode}`,
+            whisperDebug,
+          };
+        }
+      }
       return {
         ok: false,
         blockId: payload.blockId,
@@ -1638,6 +2139,7 @@ function runExternalAsrCommand(commandLine: string, wavPath: string): Promise<Ex
   const startedAt = Date.now();
   return new Promise((resolve) => {
     const child = spawn(commandLine, [wavPath], {
+      cwd: getRuntimeWorkingDirectory(),
       windowsHide: true,
       env: process.env,
       shell: true,
@@ -1990,6 +2492,22 @@ app.whenReady().then(() => {
   createWindow();
   registerGlobalShortcuts();
 
+  try {
+    registerTelemetryIpc();
+  } catch (error) {
+    debugLog('telemetry:setup-failed', String(error));
+  }
+  try {
+    initUpdater(() => mainWindow);
+  } catch (error) {
+    debugLog('updater:setup-failed', String(error));
+  }
+  try {
+    registerSessionsIpc();
+  } catch (error) {
+    debugLog('db:setup-failed', String(error));
+  }
+
   screen.on('display-metrics-changed', () => {
     if (!mainWindow) return;
     if (currentWindowMode === 'session' && OPENWHISPR_OVERLAY_WINDOW) {
@@ -2011,6 +2529,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', () => {
+  void asrManager?.shutdown();
   stopSystemAudioHelper('app-will-quit');
+  stopNemotronWorker('app-will-quit');
   globalShortcut.unregisterAll();
 });

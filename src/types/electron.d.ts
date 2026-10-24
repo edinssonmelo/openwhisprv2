@@ -1,12 +1,50 @@
+import type { AsrLiveEvent, AsrSessionStatus } from '../transcription/types';
+
 export {};
 
 declare global {
+  /** Result of `transcription.checkSetup` (main: getWhisperSetupStatus). */
+  interface AsrSetupStatus {
+    /** At least one live engine (Parakeet helper or whisper.cpp) is available. */
+    ok: boolean;
+    whisperOk: boolean;
+    parakeetHelperConfigured: boolean;
+    parakeetModelsPresent: boolean;
+    parakeetHelperPath: string;
+    parakeetModelDir: string;
+    asr: AsrSessionStatus;
+    missing: string[];
+    cliPath: string;
+    modelPath: string;
+    message: string;
+    activeModelName?: string | null;
+    refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
+    refinerModel?: string;
+    modelCandidates?: Array<{
+      name: string;
+      path: string;
+      exists: boolean;
+    }>;
+  }
+
+  type UpdateStatus =
+    | { state: 'idle' }
+    | { state: 'checking' }
+    | { state: 'available'; version: string }
+    | { state: 'not-available'; version: string }
+    | { state: 'downloading'; percent: number }
+    | { state: 'ready'; version: string }
+    | { state: 'error'; message: string };
+
   interface Window {
     meetingAssistant: {
       /** True when Electron started with OPENWHISPR_OVERLAY_WINDOW=true (sync, for first-frame transparency). */
       overlayWindow: boolean;
       windowControls: {
         setAppMode: (mode: 'dashboard' | 'session-boot' | 'session') => Promise<{ ok: boolean }>;
+        minimize: () => Promise<{ ok: boolean }>;
+        toggleMaximize: () => Promise<{ ok: boolean; maximized: boolean }>;
+        close: () => Promise<{ ok: boolean }>;
         expandSessionOverlay: () => void;
       };
       clipboard: {
@@ -14,6 +52,26 @@ declare global {
       };
       overlay: {
         setPointerPassthrough: (ignore: boolean) => void;
+      };
+      updates: {
+        check: () => Promise<{ ok: boolean; reason?: string; message?: string }>;
+        getStatus: () => Promise<UpdateStatus>;
+        quitAndInstall: () => Promise<{ ok: boolean }>;
+        onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+      };
+      telemetry: {
+        getConsent: () => Promise<{ consent: boolean; installId: string; endpointConfigured: boolean }>;
+        setConsent: (consent: boolean) => Promise<{ ok: boolean; consent: boolean }>;
+        track: (event: string, props?: Record<string, unknown>) => Promise<{ ok: boolean }>;
+        getInstallId: () => Promise<string>;
+      };
+      feedback: {
+        submit: (payload: {
+          message: string;
+          email?: string;
+          includeLogs?: boolean;
+        }) => Promise<{ ok: boolean; reason?: string }>;
+        openExternal: () => Promise<{ ok: boolean }>;
       };
       platform: {
         getInfo: () => Promise<{
@@ -28,6 +86,7 @@ declare global {
         }>;
       };
       audio: {
+        ensureMicrophoneAccess: () => Promise<{ ok: boolean; status: string }>;
         getDesktopSources: () => Promise<{
           sources: Array<{
             id: string;
@@ -111,82 +170,31 @@ declare global {
         }>;
       };
       transcription: {
-        checkSetup: () => Promise<{
+        checkSetup: () => Promise<AsrSetupStatus>;
+      };
+      asr: {
+        status: () => Promise<AsrSessionStatus>;
+        prepare: () => Promise<AsrSessionStatus>;
+        start: (payload: {
+          sessionId: string;
+          generation: number;
+          language: 'es' | 'en' | 'auto';
+          sources: { mic: boolean; system: boolean };
+        }) => Promise<{ ok: boolean; status: AsrSessionStatus; error?: string }>;
+        stop: (reason?: string) => Promise<{
           ok: boolean;
-          missing: string[];
-          cliPath: string;
-          modelPath: string;
-          message: string;
-          activeModelName?: string | null;
-          previewModelName?: string | null;
-          finalModelName?: string | null;
-          pipelineMode?: 'baseline-whisper' | 'moonshine-qwen-v2';
-          moonshineConfigured?: boolean;
-          qwenConfigured?: boolean;
-          experimentalPreview?: boolean;
-          finalEngine?: 'whisper' | 'qwen' | 'compare';
-          refinementMode?: 'off' | 'whisper-only' | 'whisper-qwen';
-          refinerModel?: string;
-          modelCandidates?: Array<{
-            name: string;
-            path: string;
-            exists: boolean;
-          }>;
+          drained: Extract<AsrLiveEvent, { type: 'drained' }> | null;
+          status: AsrSessionStatus;
         }>;
-        transcribeBlock: (payload: {
-          blockId: string;
-          wavBytes: Uint8Array;
-          startMs: number;
-          endMs: number;
-          rms: number;
-          peak?: number;
-          sampleRate?: number;
-          sampleCount?: number;
-          whisperGain?: number;
-          source: 'mic' | 'system' | 'mixed';
-          glossary?: string;
-          promptMode?: 'empty' | 'minimal' | 'contextual';
-          mode?: 'preview' | 'final' | 'benchmark';
-          modelRole?: 'preview' | 'final';
-          language?: 'es' | 'auto';
-          verbatimOnly?: boolean;
-        }) => Promise<{
-          ok: boolean;
-          blockId: string;
-          text?: string;
-          resolvedText?: string;
-          replacements?: Array<{
-            original: string;
-            replacement: string;
-            confidence: number;
-            reason: string;
-          }>;
-          whisperPromptLength?: number;
-          error?: string;
-          durationMs: number;
-          stderr?: string;
-          modelName?: string;
-          modelPath?: string;
-          engineUsed?: 'whisper-large-v3-turbo' | 'moonshine' | 'qwen3-asr';
-          fallbackUsed?: boolean;
-          fallbackReason?: string;
-          whisperText?: string;
-          qwenText?: string;
-          whisperDurationMs?: number;
-          qwenDurationMs?: number;
-          qwenError?: string;
-          whisperDebug?: {
-            language: 'es' | 'auto';
-            promptLength: number;
-            verbatimOnly: boolean;
-            translateEnabled: false;
-            argsSanitized: string[];
-          };
-        }>;
-        cancelPending: () => Promise<{
-          ok: boolean;
-          cancelled: number;
-        }>;
+        push: (payload: {
+          sessionId: string;
+          generation: number;
+          source: 'mic' | 'system';
+          sampleRate: number;
+          pcm: Float32Array;
+        }) => void;
+        onEvent: (callback: (event: AsrLiveEvent) => void) => () => void;
+        onStatus: (callback: (status: AsrSessionStatus) => void) => () => void;
       };
       polisher: {
         check: () => Promise<{
@@ -229,6 +237,14 @@ declare global {
           error?: string;
           durationMs: number;
         }>;
+      };
+      db: {
+        listSessions: () => Promise<{ ok: boolean; sessions: Record<string, unknown>[]; error?: string }>;
+        upsertSession: (session: Record<string, unknown>) => Promise<{ ok: boolean; error?: string }>;
+        deleteSession: (id: string) => Promise<{ ok: boolean; error?: string }>;
+        migrateLegacySessions: (
+          sessions: Record<string, unknown>[],
+        ) => Promise<{ ok: boolean; migrated: number; error?: string }>;
       };
     };
   }

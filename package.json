@@ -1,44 +1,44 @@
 {
   "name": "local-meeting-assistant",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "private": true,
   "description": "Local-first Electron meeting assistant MVP focused on audio diagnostics.",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
-    "dev:v2:qwen": "ASR_PIPELINE_MODE=moonshine-qwen-v2 QWEN3_ASR_CMD='.venv-qwen-asr/bin/python scripts/asr_qwen3_final.py' QWEN3_ASR_MODEL='.local/qwen-asr/Qwen3-ASR-1.7B-8bit' QWEN3_ASR_LANGUAGE='Spanish' ENABLE_EXPERIMENTAL_PREVIEW=false npm run dev",
-    "dev:v2:whisper": "ASR_PIPELINE_MODE=moonshine-qwen-v2 ASR_FINAL_ENGINE=whisper TRANSCRIPT_REFINEMENT_MODE=off ENABLE_EXPERIMENTAL_PREVIEW=false npm run dev",
-    "dev:v2:whisper:overlay": "cross-env OPENWHISPR_OVERLAY_WINDOW=true npm run dev:v2:whisper",
-    "dev:whisper": "cross-env OPENWHISPR_OVERLAY_WINDOW=true npm run dev:v2:whisper",
-    "dev:whisper:window": "npm run dev:v2:whisper",
-    "dev:whisper:no-expand": "cross-env OPENWHISPR_OVERLAY_WINDOW=true VITE_OPENWHISPR_DISABLE_OVERLAY_EXPAND=true npm run dev:v2:whisper",
-    "dev:v2:compare": "ASR_PIPELINE_MODE=moonshine-qwen-v2 ASR_FINAL_ENGINE=compare TRANSCRIPT_REFINEMENT_MODE=off QWEN3_ASR_CMD='.venv-qwen-asr/bin/python scripts/asr_qwen3_final.py' QWEN3_ASR_MODEL='.local/qwen-asr/Qwen3-ASR-1.7B-8bit' QWEN3_ASR_LANGUAGE='Spanish' ENABLE_EXPERIMENTAL_PREVIEW=false npm run dev",
-    "dev:v2:refine": "ASR_PIPELINE_MODE=moonshine-qwen-v2 ASR_FINAL_ENGINE=compare TRANSCRIPT_REFINEMENT_MODE=whisper-qwen TRANSCRIPT_REFINER_MODEL=gemma3:4b QWEN3_ASR_CMD='.venv-qwen-asr/bin/python scripts/asr_qwen3_final.py' QWEN3_ASR_MODEL='.local/qwen-asr/Qwen3-ASR-1.7B-8bit' QWEN3_ASR_LANGUAGE='Spanish' ENABLE_EXPERIMENTAL_PREVIEW=false npm run dev",
-    "dev:renderer": "vite --host 127.0.0.1",
-    "dev:main": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
-    "dev:electron": "wait-on http://127.0.0.1:5173 dist-electron/main.js dist-electron/preload.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
-    "dev:overlay": "cross-env OPENWHISPR_OVERLAY_WINDOW=true npm run dev",
-    "build": "tsc -p tsconfig.electron.json && tsc -b && vite build",
-    "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -b --noEmit",
-    "test:transcript-store": "node scripts/test-transcript-store.mjs",
-    "qwen:check": "QWEN3_ASR_MODEL='.local/qwen-asr/Qwen3-ASR-1.7B-8bit' QWEN3_ASR_LANGUAGE='Spanish' .venv-qwen-asr/bin/python scripts/asr_qwen3_final.py",
+    "dev": "npm run dev:whisper",
+    "dev:whisper": "cross-env OPENWHISPR_OVERLAY_WINDOW=true TRANSCRIPT_REFINEMENT_MODE=off concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
+    "asr:build:helper": "cd tools/macos-asr-helper && swift build -c release",
+    "asr:setup": "node scripts/asr-setup.mjs",
+    "asr:check": "node scripts/asr-setup.mjs --check",
+    "asr:benchmark": "node scripts/asr-benchmark.mjs",
+    "asr:soak": "node scripts/asr-soak.mjs",
+    "test:asr": "node scripts/test-transcript-coordinator.mjs && node scripts/test-asr-session.mjs && node scripts/test-asr-e2e.mjs && node scripts/test-asr-helper-protocol.mjs",
     "whisper:setup": "node scripts/whisper-setup.mjs",
     "whisper:setup:turbo": "node scripts/whisper-setup-turbo.mjs",
     "whisper:check": "node scripts/whisper-check.mjs",
-    "whisper:benchmark": "node scripts/whisper-benchmark.mjs",
-    "polisher:setup": "node scripts/polisher-setup.mjs",
-    "build:macos-audio-helper": "cd tools/macos-system-audio-helper && swift build -c release",
-    "dev:macos-audio-helper": "cd tools/macos-system-audio-helper && swift run openwhispr-system-audio-helper",
-    "check:macos-audio-helper": "test -f tools/macos-system-audio-helper/.build/release/openwhispr-system-audio-helper",
-    "build:macos-coreaudio-tap-helper": "cd tools/macos-coreaudio-tap-helper && swift build -c release",
-    "dev:macos-coreaudio-tap-helper": "cd tools/macos-coreaudio-tap-helper && swift run openwhispr-coreaudio-tap-helper",
-    "check:macos-coreaudio-tap-helper": "test -f tools/macos-coreaudio-tap-helper/.build/release/openwhispr-coreaudio-tap-helper"
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:main": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
+    "dev:electron": "wait-on http://127.0.0.1:5173 dist-electron/main.js dist-electron/preload.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build": "tsc -p tsconfig.electron.json && tsc -b && vite build",
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -b --noEmit",
+    "landing:dev": "vite --config landing/vite.config.ts --host 0.0.0.0",
+    "landing:build": "vite build --config landing/vite.config.ts",
+    "landing:preview": "vite preview --config landing/vite.config.ts --host 0.0.0.0 --port 4321",
+    "landing:deploy": "rsync -avz package.json package-lock.json docker-compose.yml ai-server:/srv/apps/openwhispr/ && rsync -avz --delete --exclude dist --exclude node_modules --exclude .vite landing/ ai-server:/srv/apps/openwhispr/landing/ && ssh ai-server 'cd /srv/apps/openwhispr && docker compose -p openwhispr build landing && docker run --rm --entrypoint nginx openwhispr-landing:latest -t && docker compose -p openwhispr up -d'",
+    "dist:mac": "node scripts/build-beta.mjs",
+    "release:publish": "node scripts/publish-beta.mjs"
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.17.32",
     "@types/react": "^18.3.20",
     "@types/react-dom": "^18.3.6",
@@ -46,8 +46,106 @@
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
     "electron": "^30.5.1",
+    "electron-builder": "^24.13.3",
     "typescript": "^5.8.3",
     "vite": "^5.4.19",
     "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.openwhispr.desktop",
+    "productName": "Openwhispr",
+    "directories": {
+      "output": "release"
+    },
+    "publish": null,
+    "generateUpdatesFilesForAllChannels": true,
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "config",
+        "to": "app-assets/config",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "scripts",
+        "to": "app-assets/scripts",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "tools",
+        "to": "app-assets/tools",
+        "filter": [
+          "**/*",
+          "!**/.build/checkouts/**",
+          "!**/.build/artifacts/**",
+          "!**/.build/repositories/**",
+          "!**/.build/*/release/**/*.o",
+          "!**/.build/*/release/**/*.swiftmodule/**",
+          "!**/.build/*/release/**/*.build/**",
+          "!**/.build/*/release/ModuleCache/**",
+          "!**/.build/*/release/index/**",
+          "!**/.build/*/release/*.swiftdoc",
+          "!**/.build/*/release/*.swiftsourceinfo",
+          "!**/.build/*/release/*.abi.json",
+          "!**/.build/*/release/*.yaml",
+          "!**/.build/*/release/description.json",
+          "!**/.build/*/debug/**",
+          "!**/.build/debug/**",
+          "!**/.build/build.db",
+          "!**/.build/*.yaml",
+          "!**/.build/workspace-state.json"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/Openwhispr.icns"
+    },
+    "win": {
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

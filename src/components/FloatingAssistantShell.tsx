@@ -23,6 +23,9 @@ interface FloatingAssistantShellProps {
   overlayCollapsed: boolean;
   aiPanelOpen: boolean;
   transcriptText: string;
+  committedText?: string;
+  provisionalText?: string;
+  engineLabel?: string;
   refinedText: string;
   transcriptView: 'live' | 'refined';
   refinementAvailable: boolean;
@@ -70,6 +73,9 @@ export function FloatingAssistantShell({
   overlayCollapsed,
   aiPanelOpen,
   transcriptText,
+  committedText,
+  provisionalText,
+  engineLabel,
   refinedText,
   transcriptView,
   refinementAvailable,
@@ -165,7 +171,7 @@ export function FloatingAssistantShell({
       cancelled = true;
       if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     };
-  }, [overlayCollapsed, aiPanelOpen, booting]);
+  }, [overlayCollapsed, booting]);
 
   useLayoutEffect(() => {
     if (!settingsOpen) return;
@@ -267,6 +273,9 @@ export function FloatingAssistantShell({
                   <div className="session-frame-left session-frame-left--resizable">
                     <LiveTranscriptPanel
                       text={transcriptText}
+                      committedText={committedText}
+                      provisionalText={provisionalText}
+                      engineLabel={engineLabel}
                       refinedText={refinedText}
                       activeView={transcriptView}
                       onViewChange={onTranscriptViewChange}

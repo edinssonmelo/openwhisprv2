@@ -1,0 +1,28 @@
+# Despliegue de la landing de Openwhispr en ai-server.
+# Sigue el patron documentado en docs/server/architecture.md del repo de infra:
+# el producto trae su propio stack y se une a la red externa `net_internal`
+# donde Traefik (compose/proxy.yml en infra) descubre routers por labels.
+#
+# Uso en el servidor (ver docs/DEPLOY.md):
+#   docker compose -p openwhispr up -d --build
+
+services:
+  landing:
+    build:
+      context: .
+      dockerfile: landing/Dockerfile
+    container_name: openwhispr-landing
+    volumes:
+      - ./releases:/srv/releases:ro
+    restart: unless-stopped
+    networks:
+      - net_internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openwhispr.rule=Host(`openwhispr.rootoz.com`)"
+      - "traefik.http.routers.openwhispr.entrypoints=web"
+      - "traefik.http.services.openwhispr.loadbalancer.server.port=80"
+
+networks:
+  net_internal:
+    external: true

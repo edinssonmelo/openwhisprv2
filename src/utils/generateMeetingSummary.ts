@@ -82,3 +82,70 @@ export async function generateMeetingSummaryLine(args: {
     return fallback;
   }
 }
+
+// ── Meeting title generation ─────────────────────────────────────────────────
+
+function heuristicTitle(transcript: string, refined: string): string {
+  const src = refined.trim() || transcript.trim();
+  if (!src || src.length < 10) return '';
+  const firstLine = src
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 15);
+  if (!firstLine) return '';
+  const cleaned = firstLine.replace(/^[–\-*>\s]+/, '').trim();
+  return cleaned.length > 52 ? `${cleaned.slice(0, 50)}…` : cleaned;
+}
+
+/**
+ * Generates a short, descriptive meeting title (≤ 7 words).
+ * Uses the local polisher when available; heuristic fallback otherwise.
+ */
+export async function generateMeetingTitle(args: {
+  transcript: string;
+  refined: string;
+  summary?: string;
+  polisherOk: boolean;
+  polishSegment: PolishFn;
+}): Promise<string> {
+  const base = (args.summary || args.refined || args.transcript).trim();
+  const fallback = heuristicTitle(args.transcript, args.refined);
+  if (!base || !args.polisherOk || base.length < 40) return fallback;
+
+  const excerpt = base.slice(0, 2400);
+  const prompt = [
+    'Dado el siguiente fragmento de una reunión de trabajo, generá UN TÍTULO corto y descriptivo.',
+    'Reglas estrictas:',
+    '- Máximo 7 palabras.',
+    '- Sin comillas, sin punto al final, sin numeración, sin prefijos como "Título:".',
+    '- Capturá el tema principal o la decisión clave.',
+    '- Solo devolvé el título, sin ningún otro texto.',
+    '',
+    'Fragmento:',
+    excerpt,
+    '',
+    'Título:',
+  ].join('\n');
+
+  try {
+    const result = await args.polishSegment({
+      batchId: `meeting-title-${Date.now()}`,
+      rawSegments: [{ id: 'title-gen', startMs: 0, endMs: 1, text: excerpt, source: 'mixed', rms: 0.1 }],
+      context: '',
+      glossary: '',
+      prompt,
+      numPredict: 48,
+    });
+    const raw = (result.ok ? (result.text ?? '') : '').trim();
+    // Strip wrapping quotes, trailing dots, "Título:" prefix if model echoed it
+    const cleaned = raw
+      .replace(/^Título:\s*/i, '')
+      .replace(/^["""'']+|["""'']+$/g, '')
+      .replace(/\.+$/, '')
+      .trim();
+    if (cleaned.length < 3 || cleaned.length > 80) return fallback;
+    return cleaned;
+  } catch {
+    return fallback;
+  }
+}

@@ -45,6 +45,40 @@ export function SessionFloatingFrame({ collapsed, transcriptMinimized, children 
     sizeRef.current = { width: r.width, height: r.height };
   };
 
+  const measureBarScreenLeft = () => {
+    const barAnchor = columnsRef.current?.querySelector('[data-session-bar-anchor="true"]') as HTMLElement | null;
+    return barAnchor?.getBoundingClientRect().left ?? null;
+  };
+
+  const clampAndPersistPosition = (next: ControlBarPosition, width: number, height: number) => {
+    const clamped = clampControlBarPosition(next, width, height, CLAMP_MARGIN_SESSION_FRAME);
+    persistControlBarPosition(clamped, 'sessionFrame');
+    return clamped;
+  };
+
+  const preserveBarAnchorAfterLayoutChange = (previousBarLeft: number | null) => {
+    measureColumnsSize();
+    const { width, height } = sizeRef.current;
+    const nextBarLeft = measureBarScreenLeft();
+    if (previousBarLeft === null || nextBarLeft === null) {
+      setPosition((p) => {
+        const c = clampControlBarPosition(p, width, height, CLAMP_MARGIN_SESSION_FRAME);
+        if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
+        return c;
+      });
+      return;
+    }
+
+    const delta = previousBarLeft - nextBarLeft;
+    setPosition((p) => {
+      const next = Math.abs(delta) >= 1 ? { x: p.x + delta, y: p.y } : p;
+      const c = clampControlBarPosition(next, width, height, CLAMP_MARGIN_SESSION_FRAME);
+      if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
+      return c;
+    });
+    barScreenLeftRef.current = previousBarLeft;
+  };
+
   useLayoutEffect(() => {
     const el = columnsRef.current;
     if (!el) return;
@@ -74,9 +108,7 @@ export function SessionFloatingFrame({ collapsed, transcriptMinimized, children 
       if (Math.abs(delta) >= 1) {
         setPosition((p) => {
           const next = { x: p.x + delta, y: p.y };
-          const c = clampControlBarPosition(next, r.width, r.height, CLAMP_MARGIN_SESSION_FRAME);
-          if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
-          return c;
+          return clampAndPersistPosition(next, r.width, r.height);
         });
       }
     }
@@ -88,13 +120,7 @@ export function SessionFloatingFrame({ collapsed, transcriptMinimized, children 
 
   useEffect(() => {
     const onResize = () => {
-      measureColumnsSize();
-      const { width, height } = sizeRef.current;
-      setPosition((p) => {
-        const c = clampControlBarPosition(p, width, height, CLAMP_MARGIN_SESSION_FRAME);
-        if (c.x !== p.x || c.y !== p.y) persistControlBarPosition(c, 'sessionFrame');
-        return c;
-      });
+      preserveBarAnchorAfterLayoutChange(measureBarScreenLeft() ?? barScreenLeftRef.current);
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);

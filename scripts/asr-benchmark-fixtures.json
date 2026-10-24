@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "description": "Bilingual synthetic corpus for scripts/asr-benchmark.mjs. WAVs are generated locally with macOS `say` (16 kHz mono) into recordings/benchmarks/fixtures/ and never committed. `utterances` are separated by `pauseMs` of silence so VAD segmentation and lost-segment counting are deterministic.",
+  "voices": { "en": "Samantha", "es": "Mónica" },
+  "defaultPauseMs": 1500,
+  "fixtures": [
+    {
+      "id": "en-short-yes",
+      "language": "en",
+      "utterances": ["Yes, that works for me."]
+    },
+    {
+      "id": "en-short-question",
+      "language": "en",
+      "utterances": ["Can you share the dashboard link again?"]
+    },
+    {
+      "id": "en-meeting-roadmap",
+      "language": "en",
+      "utterances": [
+        "Let's start with the roadmap for the third quarter.",
+        "The API migration is about eighty percent done and we expect to finish it by the end of next week.",
+        "After that we can focus on the onboarding flow and the billing integration with Stripe."
+      ]
+    },
+    {
+      "id": "en-meeting-numbers",
+      "language": "en",
+      "utterances": [
+        "Revenue grew twelve percent compared to last quarter, reaching four point two million dollars.",
+        "We onboarded three hundred and fifteen new customers, mostly in Europe and Latin America.",
+        "Churn stayed below two percent, which is the best result we have had since twenty twenty three."
+      ]
+    },
+    {
+      "id": "en-meeting-tech",
+      "language": "en",
+      "utterances": [
+        "The GPU cluster is running the new inference pipeline with Nvidia H100 cards.",
+        "Latency dropped from nine hundred milliseconds to under three hundred after we enabled batching.",
+        "OpenAI and Anthropic both published updated model cards this week, so we should review them."
+      ]
+    },
+    {
+      "id": "es-short-si",
+      "language": "es",
+      "utterances": ["Sí, me parece bien."]
+    },
+    {
+      "id": "es-short-pregunta",
+      "language": "es",
+      "utterances": ["¿Puedes compartir el enlace del panel otra vez?"]
+    },
+    {
+      "id": "es-reunion-planificacion",
+      "language": "es",
+      "utterances": [
+        "Empecemos con la planificación del tercer trimestre.",
+        "La migración de la API está al ochenta por ciento y esperamos terminarla a finales de la próxima semana.",
+        "Después podremos centrarnos en el flujo de incorporación y en la integración de pagos con Stripe."
+      ]
+    },
+    {
+      "id": "es-reunion-cifras",
+      "language": "es",
+      "utterances": [
+        "Los ingresos crecieron un doce por ciento respecto al trimestre anterior, hasta cuatro coma dos millones de dólares.",
+        "Incorporamos trescientos quince clientes nuevos, sobre todo en Europa y América Latina.",
+        "La cancelación se mantuvo por debajo del dos por ciento, el mejor resultado desde dos mil veintitrés."
+      ]
+    },
+    {
+      "id": "es-reunion-tecnologia",
+      "language": "es",
+      "utterances": [
+        "El clúster de GPU ya ejecuta la nueva canalización de inferencia con tarjetas Nvidia H100.",
+        "La latencia bajó de novecientos milisegundos a menos de trescientos después de activar el procesamiento por lotes.",
+        "OpenAI y Anthropic publicaron fichas de modelo actualizadas esta semana, así que deberíamos revisarlas."
+      ]
+    }
+  ]
+}
